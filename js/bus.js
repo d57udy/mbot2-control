@@ -1,0 +1,173 @@
+// Transport-agnostic command bus with a safety layer.
+// Every producer (buttons, voice, later a relay or an LLM) submits the same
+// JSON command; only the bus talks to the robot driver.
+//
+// Command schema v1:
+//   { v: 1, id, ts, src: 'ui'|'voice'|'remote'|'agent', cmd, args, timeout_ms }
+// cmd / args:
+//   move     { dir: 'forward'|'backward', speed?, secs? }
+//   spin     { dir: 'left'|'right', speed?, secs? }
+//   turn     { deg }                     (+ right, - left; gyro turn)
+//   drive    { left, right }             wheel RPM, forward-positive, continuous;
+//                                        robot watchdog stops it 0.4 s after the
+//                                        last drive command, so resend to keep going
+//   stop     {}                          (jumps the queue)
+//   read     { sensor: 'battery'|'distance'|'floor', colors? }
+//   led      { r, g, b, id? }            back LED 1..5, or all
+//   leds     { colors: [[r,g,b] x5] }
+//   led_off / led_brightness { value } / led_effect { name }
+//   eyes     { left, right }             ultrasonic eye LEDs 0..100
+//   eye_led  { id: 1..8|'all', bri }     experimental per-LED form
+//   eyes_effect { name }
+//   floor_light { color }               quad RGB sensor fill light
+//   display  { text }
+//   beep     { freq?, secs? }
+// Result: { id, ok, value?, error? }
+
+export const LIMITS = {
+  maxSpeed: 100,     // RPM for timed moves, mbot2 tops out near 200
+  maxDriveRpm: 150,  // RPM for continuous joystick drive
+  maxSecs: 2,        // longest single timed move
+  maxTurnDeg: 360,
+  obstacleCm: 15,    // forward moves refused below this
+  distanceFreshMs: 1500,
+  defaultTimeoutMs: 2000,
+};
+
+// Names from research/04-leds-and-rgb-sensor.md; effects are whitelisted
+// because they are interpolated into Python source.
+export const LED_EFFECTS = ['rainbow', 'spoondrift', 'meteor_blue', 'meteor_green', 'flash_red', 'flash_orange', 'firefly'];
+export const EYE_EFFECTS = ['happy', 'new_happy', 'wink', 'naughty', 'aggrieved', 'raises_brow', 'look_left',
+  'look_right', 'eye_left', 'eye_right', 'thinking', 'dizzy', 'standby'];
+export const FLOOR_LIGHTS = ['off', 'white', 'red', 'green', 'blue'];
+
+const byte = (v) => Math.min(255, Math.max(0, Number(v) || 0)) | 0;
+
+let seq = 0;
+export function makeCommand(cmd, args = {}, src = 'ui', timeout_ms = LIMITS.defaultTimeoutMs) {
+  return { v: 1, id: `${src}-${Date.now().toString(36)}-${seq++}`, ts: Date.now(), src, cmd, args, timeout_ms };
+}
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Number(v)));
+
+export class CommandBus {
+  constructor({ log, onSensor }) {
+    this.log = log;
+    this.onSensor = onSensor;
+    this.robot = null;
+    this.settings = { speed: 50 };
+    this.guard = true;
+    this.lastDistance = { value: null, at: 0 };
+    this.listeners = new Set();
+  }
+
+  setRobot(robot) { this.robot = robot; }
+
+  onCommand(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+
+  // Returns a result object; never throws.
+  async submit(c) {
+    const r = await this.execute(c).then(
+      (value) => ({ id: c.id, ok: true, value }),
+      (e) => ({ id: c.id, ok: false, error: e.message }),
+    );
+    for (const fn of this.listeners) fn(c, r);
+    if (!r.ok && !/dropped by stop/.test(r.error)) this.log(`! ${c.cmd} (${c.src}): ${r.error}`);
+    return r;
+  }
+
+  stop(src = 'ui') { return this.submit(makeCommand('stop', {}, src)); }
+
+  async execute(c) {
+    const robot = this.robot;
+    if (!robot?.connected) throw new Error('robot not connected');
+    if (c.v !== 1) throw new Error(`unsupported schema version ${c.v}`);
+    if (c.cmd !== 'stop' && Date.now() - c.ts > (c.timeout_ms ?? LIMITS.defaultTimeoutMs)) {
+      throw new Error('expired');
+    }
+    const a = c.args ?? {};
+    const speed = clamp(a.speed ?? this.settings.speed, 1, LIMITS.maxSpeed);
+    const secs = clamp(a.secs ?? 0.5, 0.05, LIMITS.maxSecs);
+
+    switch (c.cmd) {
+      case 'stop':
+        return robot.stop();
+      case 'drive': {
+        let l = Math.round(clamp(a.left ?? 0, -LIMITS.maxDriveRpm, LIMITS.maxDriveRpm));
+        let r = Math.round(clamp(a.right ?? 0, -LIMITS.maxDriveRpm, LIMITS.maxDriveRpm));
+        if (l + r > 0 && this.obstacleAhead()) { l = 0; r = 0; }
+        return robot.drive(l, r);
+      }
+      case 'move':
+        if (a.dir === 'forward') this.checkObstacle();
+        return robot.move(a.dir === 'backward' ? 'backward' : 'forward', speed, secs);
+      case 'spin':
+        return robot.spin(a.dir === 'left' ? 'left' : 'right', speed, secs);
+      case 'turn': {
+        const deg = Math.round(clamp(a.deg ?? 90, -LIMITS.maxTurnDeg, LIMITS.maxTurnDeg));
+        return robot.turn(deg);
+      }
+      case 'read': {
+        if (a.sensor === 'battery') {
+          const v = await robot.battery();
+          this.onSensor?.('battery', v);
+          return v;
+        }
+        if (a.sensor === 'distance') {
+          const v = await robot.distance();
+          this.lastDistance = { value: Number(v), at: Date.now() };
+          this.onSensor?.('distance', v);
+          return v;
+        }
+        if (a.sensor === 'floor') {
+          const v = await robot.floor(!!a.colors);
+          this.onSensor?.('floor', v);
+          return v;
+        }
+        throw new Error(`unknown sensor ${a.sensor}`);
+      }
+      case 'led': {
+        const id = a.id == null || a.id === 'all' ? null : clamp(a.id, 1, 5) | 0;
+        return robot.led(byte(a.r), byte(a.g), byte(a.b), id);
+      }
+      case 'leds': {
+        const colors = (a.colors ?? []).slice(0, 5).map(([r, g, b]) => [byte(r), byte(g), byte(b)]);
+        if (colors.length !== 5) throw new Error('leds needs 5 colours');
+        return robot.ledAll(colors);
+      }
+      case 'led_off':
+        return robot.ledOff();
+      case 'led_brightness':
+        return robot.ledBrightness(clamp(a.value ?? 100, 0, 100) | 0);
+      case 'led_effect':
+        if (!LED_EFFECTS.includes(a.name)) throw new Error(`unknown led effect ${a.name}`);
+        return robot.ledEffect(a.name);
+      case 'eyes':
+        return robot.eyes(clamp(a.left ?? 0, 0, 100) | 0, clamp(a.right ?? 0, 0, 100) | 0);
+      case 'eye_led':
+        return robot.eyeLed(a.id === 'all' ? 'all' : clamp(a.id ?? 1, 1, 8) | 0, clamp(a.bri ?? 0, 0, 100) | 0);
+      case 'eyes_effect':
+        if (!EYE_EFFECTS.includes(a.name)) throw new Error(`unknown eye effect ${a.name}`);
+        return robot.eyesEffect(a.name);
+      case 'floor_light':
+        if (!FLOOR_LIGHTS.includes(a.color)) throw new Error(`unknown floor light ${a.color}`);
+        return robot.floorLight(a.color);
+      case 'display':
+        return robot.display(String(a.text ?? '').slice(0, 40));
+      case 'beep':
+        return robot.beep(clamp(a.freq ?? 700, 100, 4000) | 0, clamp(a.secs ?? 0.2, 0.05, 1));
+      default:
+        throw new Error(`unknown command ${c.cmd}`);
+    }
+  }
+
+  // Uses the most recent reading only if it is fresh; a stale reading never blocks.
+  obstacleAhead() {
+    const { value, at } = this.lastDistance;
+    return this.guard && value != null && Date.now() - at < LIMITS.distanceFreshMs && value < LIMITS.obstacleCm;
+  }
+
+  checkObstacle() {
+    if (this.obstacleAhead()) throw new Error(`obstacle at ${this.lastDistance.value} cm`);
+  }
+}

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#14181f">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'">
+  <title>mBot2 Control</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>mBot2</h1>
+    <span id="watchdog" class="pill" hidden></span>
+    <span id="status" class="pill" data-state="idle">nicht verbunden</span>
+  </header>
+
+  <main>
+    <section id="connect-row" class="row">
+      <button id="btn-connect" class="primary">Verbinden</button>
+      <button id="btn-reconnect" hidden>Neu verbinden</button>
+      <button id="btn-sim">Simulator</button>
+      <button id="btn-disconnect" hidden>Trennen</button>
+    </section>
+    <p id="support-warning" class="warn" hidden></p>
+
+    <section class="readouts">
+      <div><span class="label">Akku</span><span id="r-battery" class="value">–</span></div>
+      <div><span class="label">Abstand</span><span id="r-distance" class="value">–</span></div>
+      <div><span class="label">Max. Tempo</span><span id="r-speed" class="value">80</span></div>
+    </section>
+    <input id="speed" type="range" min="20" max="150" step="5" value="80" aria-label="Maximales Tempo (RPM)">
+
+    <canvas id="sim" width="600" height="400" hidden></canvas>
+
+    <div class="tabs" role="tablist" aria-label="Steuerung">
+      <button role="tab" data-mode="buttons" aria-selected="true">Tasten</button>
+      <button role="tab" data-mode="joystick" aria-selected="false">Joystick</button>
+    </div>
+
+    <section id="mode-buttons" class="pad" aria-label="Tastensteuerung">
+      <span></span>
+      <button class="dir" data-drive="forward" aria-label="vorwärts">▲</button>
+      <span></span>
+      <button class="dir" data-drive="left" aria-label="links drehen">⟲</button>
+      <button class="stop btn-stop" aria-label="Stopp">STOPP</button>
+      <button class="dir" data-drive="right" aria-label="rechts drehen">⟳</button>
+      <span></span>
+      <button class="dir" data-drive="backward" aria-label="zurück">▼</button>
+      <span></span>
+    </section>
+
+    <section id="mode-joystick" class="joy-wrap" hidden>
+      <div id="joystick" class="joystick" aria-label="Joystick"><div class="knob"></div></div>
+      <p class="wheels muted">L <span id="w-left">0</span> · R <span id="w-right">0</span> RPM</p>
+      <button class="stop btn-stop wide" aria-label="Stopp">STOPP</button>
+    </section>
+
+    <section class="voice">
+      <button id="btn-mic" class="mic" aria-pressed="false">🎤 Sprache an</button>
+      <select id="lang" aria-label="Sprache">
+        <option value="de-DE">Deutsch</option>
+        <option value="en-US">English</option>
+      </select>
+      <p id="transcript" class="transcript">Sag z.B. „vorwärts“, „links“, „rechts 45 Grad“, „zurück 2 Sekunden“, „Licht blau“, „stopp“.</p>
+      <p id="voice-state" class="muted"></p>
+    </section>
+
+    <details id="panel-lights">
+      <summary>Lichter</summary>
+      <h3>CyberPi LEDs (Rückseite)</h3>
+      <div class="led-row">
+        <input type="color" class="led-color" data-id="1" value="#ff0000" aria-label="LED 1">
+        <input type="color" class="led-color" data-id="2" value="#ff8000" aria-label="LED 2">
+        <input type="color" class="led-color" data-id="3" value="#ffff00" aria-label="LED 3">
+        <input type="color" class="led-color" data-id="4" value="#00ff00" aria-label="LED 4">
+        <input type="color" class="led-color" data-id="5" value="#0000ff" aria-label="LED 5">
+      </div>
+      <p class="muted small">Einzelne Farbe antippen ändert sofort diese LED.</p>
+      <div class="row">
+        <button id="btn-leds-apply">Alle 5 setzen</button>
+        <input type="color" id="led-all" value="#ffffff" aria-label="Eine Farbe für alle">
+        <button id="btn-leds-all">Alle gleich</button>
+        <button id="btn-leds-off">Aus</button>
+      </div>
+      <label>Helligkeit <input id="led-bri" type="range" min="0" max="100" value="100"></label>
+      <div class="row">
+        <select id="led-effect" aria-label="LED-Animation"></select>
+        <button id="btn-led-effect">Animation abspielen</button>
+      </div>
+
+      <h3>Ultraschall-Augen</h3>
+      <label>Linkes Auge <input id="eye-left" type="range" min="0" max="100" value="0"></label>
+      <label>Rechtes Auge <input id="eye-right" type="range" min="0" max="100" value="0"></label>
+      <div id="eye-effects" class="chips"></div>
+      <details class="nested">
+        <summary>Einzel-LEDs (experimentell)</summary>
+        <p class="muted small">Dokumentierte Form <code>set_bri(hell, id, 1)</code>, auf der aktuellen Firmware nicht bestätigt.</p>
+        <div id="eye-leds" class="eye-grid"></div>
+      </details>
+    </details>
+
+    <details id="panel-floor">
+      <summary>Bodensensor (Quad RGB)</summary>
+      <div class="row">
+        <label class="inline"><input id="floor-live" type="checkbox"> Live lesen</label>
+        <label class="inline"><input id="floor-colors" type="checkbox"> Farben erkennen</label>
+      </div>
+      <div class="probes" id="probes">
+        <div class="probe" data-i="0"><span class="pname">L2</span><span class="swatch"></span><span class="cname">–</span><span class="gray">–</span></div>
+        <div class="probe" data-i="1"><span class="pname">L1</span><span class="swatch"></span><span class="cname">–</span><span class="gray">–</span></div>
+        <div class="probe" data-i="2"><span class="pname">R1</span><span class="swatch"></span><span class="cname">–</span><span class="gray">–</span></div>
+        <div class="probe" data-i="3"><span class="pname">R2</span><span class="swatch"></span><span class="cname">–</span><span class="gray">–</span></div>
+      </div>
+      <div class="offset"><span class="label">Linien-Versatz</span><div class="track"><div id="offset-dot" class="dot"></div></div><span id="offset-val" class="muted">–</span></div>
+      <p class="muted small">Linienstatus (Bits L2 L1 R1 R2): <code id="line-sta">–</code>. Ob 1 „Linie“ oder „Hintergrund“ bedeutet, hängt von der Kalibrierung ab (Taste am Sensor doppelt drücken).</p>
+      <div class="row">
+        <label class="inline">Beleuchtung
+          <select id="floor-light">
+            <option value="off">aus</option><option value="white">weiß</option><option value="red">rot</option>
+            <option value="green">grün</option><option value="blue">blau</option>
+          </select>
+        </label>
+      </div>
+    </details>
+
+    <details>
+      <summary>Einstellungen</summary>
+      <label><input id="opt-all" type="checkbox"> Alle Bluetooth-Geräte zeigen (Diagnose)</label>
+      <label>Chunk-Größe (Bytes)
+        <select id="opt-chunk"><option>20</option><option>100</option><option>180</option></select>
+      </label>
+      <label><input id="opt-guard" type="checkbox" checked> Hindernis-Bremse (bremst ab 40 cm, Stopp bei 15 cm)</label>
+      <label><input id="opt-mirrored" type="checkbox" checked> Motoren gespiegelt (Standard mBot2)</label>
+      <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen</label>
+    </details>
+
+    <details>
+      <summary>Befehl senden (Test)</summary>
+      <p class="muted">JSON-Befehl, z.B. <code>{"cmd":"turn","args":{"deg":45}}</code>, oder Python mit <code>py:</code> Präfix, z.B. <code>py:cyberpi.get_firmware_version()</code></p>
+      <textarea id="cmd-input" rows="2" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="btn-send">Senden</button>
+        <button id="btn-diagnose">Diagnose (Firmware + APIs)</button>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Protokoll</summary>
+      <pre id="log"></pre>
+    </details>
+  </main>
+
+  <footer class="muted">
+    Protokoll nach <a href="https://github.com/DrorSh/mbot_python">DrorSh/mbot_python</a> (MIT).
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
