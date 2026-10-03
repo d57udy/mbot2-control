@@ -15,7 +15,7 @@ const decode = (frame) => {
 function fakeRobot(reply = () => undefined) {
   const logs = [];
   const sent = [];
-  const robot = new BleRobot({ log: (m) => logs.push(m), onStatus: () => {}, chunkSize: 4096, chunkDelayMs: 0 });
+  const robot = new BleRobot({ log: (m) => logs.push(m), onStatus: () => {}, chunkSize: 4096, chunkDelayMs: 0, helpers: true });
   robot.connected = true;
   robot.writeChar = {
     async writeValueWithoutResponse(bytes) {

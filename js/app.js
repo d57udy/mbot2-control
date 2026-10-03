@@ -60,6 +60,7 @@ function setStatus(state) {
   if (live) {
     wd.dataset.ok = String(!!robot.watchdog);
     wd.textContent = robot.watchdog ? 'Watchdog an' : 'kein Watchdog';
+    wd.hidden = robot.kind === 'sim';
     wd.title = robot.watchdog
       ? 'Der Roboter stoppt 0,4 s nach dem letzten Fahrbefehl von selbst.'
       : 'Bei Verbindungsabbruch während Joystick-Fahrt kann der Roboter weiterfahren.';
@@ -552,7 +553,7 @@ $('btn-send').onclick = async () => {
 
 // Link settings apply on the next connect; remembered per device.
 $('opt-delay').value = store.get('chunkDelay', '8');
-$('opt-helpers').checked = store.get('helpers', '1') === '1';
+$('opt-helpers').checked = store.get('helpers', '0') === '1';
 $('opt-delay').onchange = () => { store.set('chunkDelay', $('opt-delay').value); if (ble) ble.chunkDelayMs = Number($('opt-delay').value); };
 $('opt-helpers').onchange = () => { store.set('helpers', $('opt-helpers').checked ? '1' : '0'); log('Roboter-Helfer: wirkt beim nächsten Verbinden (Roboter vorher aus- und einschalten).'); };
 

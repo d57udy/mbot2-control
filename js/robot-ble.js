@@ -81,7 +81,9 @@ const safeName = (n) => { if (!/^[a-z_]+$/.test(n)) throw new Error(`bad effect 
 
 export class BleRobot {
   // helpers: install the robot-side watchdog and eye helper (exec of ~400 byte scripts).
-  constructor({ log, onStatus, chunkSize = 20, chunkDelayMs = 8, debugAllDevices = false, helpers = true }) {
+  // helpers default off: on 44.01.013 importing modules from Live Mode reboots the robot
+  // (research/07-hardware-session.md), so the watchdog and eye helper cannot be installed.
+  constructor({ log, onStatus, chunkSize = 20, chunkDelayMs = 8, debugAllDevices = false, helpers = false }) {
     this.helpers = helpers;
     this.kind = 'ble';
     this.log = log;
@@ -150,7 +152,7 @@ export class BleRobot {
     this.connected = true;
     await this.handshake();
     if (this.helpers) await this.installWatchdog();
-    else this.log('Robot helpers off: no watchdog, eye effects use direct calls.');
+    if (!this.connected) throw new Error('Verbindung beim Einrichten verloren');
     this.onStatus('connected');
   }
 
