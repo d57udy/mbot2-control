@@ -103,8 +103,18 @@
         </select>
         <button id="btn-scan">Scannen</button>
         <button id="btn-explore">Erkunden</button>
+        <button id="btn-home">Nach Hause</button>
       </div>
-      <canvas id="radar" width="480" height="480"></canvas>
+      <canvas id="map" width="640" height="640" aria-label="Karte, antippen um dorthin zu fahren"></canvas>
+      <p id="map-text" class="muted small">Karte: noch leer. Scannen füllt sie; auf die Karte tippen fährt dorthin.</p>
+      <div class="row">
+        <label class="inline"><input id="opt-yaw" type="checkbox"> Kompass-Korrektur (Gyro)</label>
+        <button id="btn-map-clear" class="small-btn">Karte löschen</button>
+      </div>
+      <details class="nested">
+        <summary>Letzter Scan (Radar)</summary>
+        <canvas id="radar" width="480" height="480"></canvas>
+      </details>
       <p id="scan-text" class="muted small">Noch kein Scan. Der Roboter dreht sich einmal im Kreis und misst in jede Richtung den Abstand.</p>
       <div id="scan-openings" class="chips"></div>
     </details>

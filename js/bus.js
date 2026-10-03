@@ -13,7 +13,7 @@
 //                                        robot watchdog stops it 0.4 s after the
 //                                        last drive command, so resend to keep going
 //   stop     {}                          (jumps the queue)
-//   read     { sensor: 'battery'|'distance'|'floor', colors? }
+//   read     { sensor: 'battery'|'distance'|'floor'|'yaw', colors? }  yaw: gyro heading in degrees
 //   led      { r, g, b, id? }            back LED 1..5, or all
 //   leds     { colors: [[r,g,b] x5] }
 //   led_off / led_brightness { value } / led_effect { name }
@@ -167,7 +167,7 @@ export class CommandBus {
         return robot.straight(cm, { wait: !!a.wait, speed });
       }
       case 'read': {
-        if (!['battery', 'distance', 'floor'].includes(a.sensor)) throw new Error(`unknown sensor ${a.sensor}`);
+        if (!['battery', 'distance', 'floor', 'yaw'].includes(a.sensor)) throw new Error(`unknown sensor ${a.sensor}`);
         if (this.sensorsQuiet()) {
           return a.sensor === 'distance' ? this.lastDistance.value : (this.lastReads[a.sensor] ?? null);
         }
@@ -175,6 +175,12 @@ export class CommandBus {
           const v = await robot.battery();
           this.lastReads.battery = v;
           this.onSensor?.('battery', v);
+          return v;
+        }
+        if (a.sensor === 'yaw') {
+          if (!robot.yaw) throw new Error('yaw not supported');
+          const v = Number(await robot.yaw());
+          this.lastReads.yaw = v;
           return v;
         }
         if (a.sensor === 'distance') {

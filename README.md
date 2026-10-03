@@ -2,7 +2,7 @@
 
 Drive a Makeblock mBot2 from a phone browser over Web Bluetooth, with German or English voice commands. Static site, intended for GitHub Pages. No code is uploaded to the robot; the page uses CyberPi's Live Mode protocol.
 
-Status: v0.3. Basic Bluetooth driving confirmed on a real mBot2. Joystick, watchdog, lights, floor sensor, environment scan and AI conversation are tested with unit and simulator integration tests; hardware acceptance tests are in `docs/UAT-v0.3.md`.
+Status: v0.4 (mapping and navigation, simulator-tested; UAT in `docs/UAT-v0.4.md`). v0.3: Basic Bluetooth driving confirmed on a real mBot2. Joystick, watchdog, lights, floor sensor, environment scan and AI conversation are tested with unit and simulator integration tests; hardware acceptance tests are in `docs/UAT-v0.3.md`.
 
 ## Use
 
@@ -13,7 +13,7 @@ Status: v0.3. Basic Bluetooth driving confirmed on a real mBot2. Joystick, watch
 5. Or tap **Sprache an** and speak: "vorwärts", "zurück 2 Sekunden", "links", "rechts 45 Grad", "dreh dich um", "Licht blau", "schneller", "stopp".
 6. **Lichter**: colours for the five CyberPi LEDs on the back, brightness, animations, and the ultrasonic sensor's blue "eye" LEDs (per eye, emotion presets, experimental per-LED).
 7. **Bodensensor**: live readout of the Quad RGB sensor (four probes L2 L1 R1 R2: gray value, detected colour, line status, line offset) and its fill light.
-8. **Umgebung scannen**: the robot turns in 8/12/16 steps and measures the distance in each direction. A radar plot shows the result; tap an open direction to drive there, or **Erkunden** to scan and move up to three times.
+8. **Umgebung scannen**: the robot turns in 8/12/16 steps and measures the distance in each direction. Scans build a **map** (5 cm grid, free/obstacle/unknown) that persists while you drive; the robot's position is tracked from its turns and moves. **Tap the map** to drive there around obstacles (route planning with short legs, rescans and replanning), **Erkunden** explores unknown areas, **Nach Hause** returns to the start. **Karte löschen** makes the current position the new start.
 9. **Gespräch (KI)**: paste an Anthropic API key under Einstellungen → KI, switch the voice mode to "Gespräch (KI)" and talk normally. Claude answers aloud, shows emotions on the eyes and LEDs, and can move, turn, scan and read sensors through the same safety layer as the buttons. Saying "stopp" stops the robot, the speech and the AI immediately.
 
 **Simulator** runs everything without a robot.
@@ -30,7 +30,8 @@ Status: v0.3. Basic Bluetooth driving confirmed on a real mBot2. Joystick, watch
 | `js/drive.js` | Continuous drive: arcade mixing, expo, ramping, obstacle slow-down, 20 Hz stream |
 | `js/joystick.js` | Touch joystick component |
 | `js/voice.js` | Speech recognition wrapper and command parser |
-| `js/scan.js`, `js/radar.js` | Environment scan, open-direction finder, navigation, radar plot |
+| `js/scan.js`, `js/radar.js` | Environment scan, open-direction finder, radar plot |
+| `js/pose.js`, `js/gridmap.js`, `js/planner.js`, `js/navigate.js`, `js/mapview.js` | Position tracking, occupancy map, A* route planning, navigator (go to, explore, go home), map drawing |
 | `js/tools.js`, `js/agent.js`, `js/tts.js` | LLM tool definitions and executor, Claude tool-use loop, speech output |
 | `js/sim-view.js` | Simulator drawing (room, obstacles, scan rays) |
 | `js/app.js` | Wiring, hold-to-drive, page lifecycle safety |

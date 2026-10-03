@@ -18,6 +18,7 @@ test('all generated scripts fit MAX_SCRIPT', async () => {
     return [];
   };
   r.run = async (s) => { seen.push(s); };
+  r.queryUntilDone = async (s) => { seen.push(s); return { done: true, value: null, ms: 1 }; };
   await r.installWatchdog();
   await r.ensureEyeHelper();
   await r.floor(true);

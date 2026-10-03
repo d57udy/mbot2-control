@@ -3,9 +3,13 @@ import { SimRobot, SIM_ROOM, SIM_OBSTACLES } from './robot-sim.js';
 import { drawSim } from './sim-view.js';
 import { scan, findOpenings, describeScan, driveToward, explore } from './scan.js';
 import { drawRadar } from './radar.js';
+import { GridMap } from './gridmap.js';
+import { PoseTracker } from './pose.js';
+import { Navigator } from './navigate.js';
+import { drawMap, fitView, screenToWorld } from './mapview.js';
 import { CommandBus, makeCommand, LIMITS, LED_EFFECTS, EYE_EFFECTS } from './bus.js';
 import { VoiceListener, parseUtterance, isStop, isStrictStop } from './voice.js';
-import { TOOLS, createToolExecutor } from './tools.js';
+import { toolsFor, createToolExecutor } from './tools.js';
 import { ConversationAgent, MODELS, DEFAULT_MODEL } from './agent.js';
 import tts from './tts.js';
 import { Joystick } from './joystick.js';
@@ -101,6 +105,7 @@ async function connectBle(reuse) {
     bus.setRobot(robot);
     applyWheelSettings();
     await robot.connect();
+    resetMap();
     bus.submit(makeCommand('read', { sensor: 'battery' }));
     probeEyes();
   } catch (e) {
@@ -114,6 +119,7 @@ async function connectSim() {
   robot = new SimRobot({ log, onStatus: setStatus, onChange: redrawSim });
   bus.setRobot(robot);
   await robot.connect();
+  resetMap();
   redrawSim();
   bus.submit(makeCommand('read', { sensor: 'battery' }));
 }
@@ -461,6 +467,7 @@ function getAgent() {
   if (!aiKey) throw new Error('Kein API-Schlüssel (Einstellungen → KI).');
   if (agent && agent.lang === $('lang').value) return agent;
   const executor = createToolExecutor({
+    navigator: nav,
     bus, makeCommand, scan, findOpenings, describeScan, driveToward,
     onEmotion: (e) => chatLine('tool', `😶 ${EMOTION_DE[e] ?? e}`),
     onScan: (points) => {
@@ -473,7 +480,7 @@ function getAgent() {
   agent = new ConversationAgent({
     apiKey: aiKey,
     model: $('ai-model').value,
-    tools: TOOLS,
+    tools: toolsFor({ navigation: true }),
     executor,
     lang: $('lang').value,
     onEvent: (e) => {
@@ -638,7 +645,7 @@ async function runScanTask(fn) {
   if (scanAbort) { log('! Scan läuft bereits'); return null; }
   stream.halt();
   scanAbort = new AbortController();
-  $('btn-scan').disabled = $('btn-explore').disabled = true;
+  $('btn-scan').disabled = $('btn-explore').disabled = $('btn-home').disabled = true;
   try {
     return await fn(scanAbort.signal);
   } catch (e) {
@@ -646,37 +653,114 @@ async function runScanTask(fn) {
     return null;
   } finally {
     scanAbort = null;
-    $('btn-scan').disabled = $('btn-explore').disabled = false;
+    $('btn-scan').disabled = $('btn-explore').disabled = $('btn-home').disabled = false;
   }
 }
 
 async function doScan(steps, signal) {
-  const pose = robot.kind === 'sim' ? { x: robot.state.x, y: robot.state.y, heading: robot.state.heading } : null;
-  const points = [];
-  const result = await scan(bus, {
-    steps,
-    signal,
-    makeCommand: bus.stamped(),
-    onPoint: (p) => { points.push(p); drawRadar($('radar'), points); },
-  });
-  if (pose) { lastScan = { ...pose, points: result.points }; redrawSim(); }
+  const simPose = robot.kind === 'sim' ? { x: robot.state.x, y: robot.state.y, heading: robot.state.heading } : null;
+  nav.steps = steps;
+  const result = await nav.scanHere({ signal });
+  if (!result?.points) { log(`! Scan: ${result?.note ?? 'fehlgeschlagen'}`); return result; }
+  if (simPose) { lastScan = { ...simPose, points: result.points }; redrawSim(); }
   showScan(result.points);
   log(`Scan: ${describeScan(result.points)}`);
   return result;
 }
 
+// --- map and navigation --------------------------------------------------------
+
+const map = new GridMap({ cellCm: 5, sizeCm: 800 });
+const tracker = new PoseTracker();
+tracker.attach(bus); // turn/straight from any source (buttons, AI, navigator) update the pose
+let mapView = null;
+let mapScan = null; // { pose, points } of the last scan, drawn on the map
+
+const nav = new Navigator({
+  bus, map, pose: tracker, scan,
+  useYaw: false,
+  onEvent: (e) => {
+    if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
+    if (e.type === 'leg') log(`Navigation: ${e.turnDeg ?? 0}° drehen, ${e.cm ?? '?'} cm fahren`);
+    if (e.type === 'blocked') log(`Navigation: Hindernis${e.note ? ` (${e.note})` : ''}, neuer Plan`);
+    if (e.type === 'arrived') log('Navigation: angekommen');
+    if (e.type === 'error') log(`! Navigation: ${e.note ?? e.message ?? ''}`);
+    redrawMap();
+    redrawSim();
+  },
+});
+window.mbot.map = map;
+window.mbot.tracker = tracker;
+window.mbot.nav = nav;
+
+// Joystick and button driving stream wheel speeds; integrate them into the pose.
+let lastDrive = null; // { l, r, at }
+bus.onCommand((c, r) => {
+  if (!r.ok) return;
+  const now = performance.now();
+  if (lastDrive) tracker.applyDrive(lastDrive.l, lastDrive.r, Math.min(0.3, (now - lastDrive.at) / 1000));
+  lastDrive = c.cmd === 'drive' && (c.args.left || c.args.right) ? { l: c.args.left, r: c.args.right, at: now } : null;
+  if (c.cmd === 'drive' || c.cmd === 'turn' || c.cmd === 'straight' || c.cmd === 'stop') scheduleMapDraw();
+});
+
+let mapDrawPending = false;
+function scheduleMapDraw() {
+  if (mapDrawPending) return;
+  mapDrawPending = true;
+  requestAnimationFrame(() => { mapDrawPending = false; redrawMap(); });
+}
+
+function redrawMap() {
+  const canvas = $('map');
+  if (!canvas || !$('panel-scan').open) return;
+  const pose = tracker.pose;
+  mapView = fitView(canvas, map, pose);
+  drawMap(canvas, map, pose, {
+    view: mapView,
+    trail: tracker.trail,
+    path: nav.lastPath,
+    goal: nav.goal,
+    frontiers: map.frontiers({ minCells: 4 }),
+    lastScan: mapScan,
+  });
+  $('map-text').textContent = map.bounds ? map.describe(pose) : 'Karte: noch leer. Scannen füllt sie; auf die Karte tippen fährt dorthin.';
+}
+$('panel-scan').addEventListener('toggle', redrawMap);
+
+function resetMap() {
+  map.clear();
+  tracker.reset();
+  nav.lastPath = null;
+  nav.goal = null;
+  mapScan = null;
+  lastDrive = null;
+  redrawMap();
+}
+$('btn-map-clear').onclick = () => { resetMap(); log('Karte gelöscht; die aktuelle Position ist der neue Start.'); };
+$('opt-yaw').onchange = () => { nav.useYaw = $('opt-yaw').checked; };
+
+function navResult(label, r) {
+  if (!r) return;
+  log(`${label}: ${r.ok ? (r.reached === false ? 'nicht ganz erreicht' : 'fertig') : `abgebrochen${r.note ? ` (${r.note})` : ''}`}`);
+  redrawMap();
+  redrawSim();
+}
+
+$('map').addEventListener('pointerup', (e) => {
+  if (!mapView) return;
+  const goal = screenToWorld($('map'), mapView, e.clientX, e.clientY);
+  goal.x = Math.round(goal.x); goal.y = Math.round(goal.y);
+  log(`Ziel: ${goal.x} cm rechts, ${goal.y} cm vorne (vom Start)`);
+  runScanTask(async (signal) => navResult('Fahrt zum Ziel', await nav.goTo(goal, { signal })));
+});
+
 $('btn-scan').onclick = () => runScanTask((signal) => doScan(Number($('scan-steps').value), signal));
 $('btn-explore').onclick = () => runScanTask(async (signal) => {
-  const r = await explore(bus, { maxMoves: 3, signal, makeCommand: bus.stamped(), onEvent: (e) => {
-    redrawSim();
-    log(e.opening
-      ? `Erkunden ${e.move}: Richtung ${e.opening.angle}°, ${e.ok ? `${e.droveCm} cm gefahren` : e.error ?? e.note}`
-      : `Erkunden ${e.move}: ${e.note}`);
-  } });
-  log(`Erkunden fertig: ${r.moves} Fahrten`);
-  lastScan = null;
-  redrawSim();
+  nav.steps = Number($('scan-steps').value);
+  const r = await nav.explore({ signal, maxMoves: 6 });
+  navResult(`Erkunden (${r?.moves ?? 0} Fahrten, ${r?.frontiersLeft ?? '?'} offene Bereiche)`, r);
 });
+$('btn-home').onclick = () => runScanTask(async (signal) => navResult('Nach Hause', await nav.goHome({ signal })));
 
 checkSupport();
 setSpeed(Number(store.get('speed', 60)));

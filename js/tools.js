@@ -9,6 +9,7 @@ const SAFE_CM = 20; // never plan to end closer than this to an obstacle
 const obj = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 
 const BLIND_CM = 30; // max forward move when the distance is unknown
+const MAP_LIMIT_CM = 400; // navigation goals stay within this box around the start
 
 export const EMOTIONS = {
   happy: { eyes: 'happy', led: [255, 180, 0], tone: [880, 0.15] },
@@ -56,7 +57,7 @@ export const TOOLS = [
   { name: 'stop', description: 'Stop all motors immediately.', input_schema: obj() },
   {
     name: 'scan_surroundings',
-    description: 'Rotate in place in steps, measure distance at each heading, return to the start heading. Returns points [angle deg, cm] (angle clockwise from current front, 0 = ahead) and open directions. Takes several seconds.',
+    description: 'Rotate in place in steps, measure distance at each heading, return to the start heading. Returns points [angle deg, cm] (angle clockwise from current front, 0 = ahead) and open directions. Also updates the map when mapping is on. Takes several seconds.',
     input_schema: obj({ steps: { type: 'integer', enum: [8, 12, 16], description: 'Headings to sample, default 12.' } }),
   },
   {
@@ -96,7 +97,29 @@ export const TOOLS = [
     description: 'Show short text (max 40 characters) on the CyberPi display.',
     input_schema: obj({ text: { type: 'string', maxLength: 40 } }, ['text']),
   },
+  {
+    name: 'navigate_to',
+    description: 'Drive to a point on the map, planning around known obstacles and rescanning on the way. x_cm right, y_cm forward of where the map was started (0, 0 = start). Blocks until done.',
+    input_schema: obj({
+      x_cm: { type: 'number', minimum: -MAP_LIMIT_CM, maximum: MAP_LIMIT_CM },
+      y_cm: { type: 'number', minimum: -MAP_LIMIT_CM, maximum: MAP_LIMIT_CM },
+    }, ['x_cm', 'y_cm']),
+  },
+  {
+    name: 'explore_room',
+    description: 'Explore unknown space: scan, drive to the nearest unexplored edge of the map, repeat. max_moves 1..8, default 4. Takes a while.',
+    input_schema: obj({ max_moves: { type: 'integer', minimum: 1, maximum: 8 } }),
+  },
+  { name: 'go_home', description: 'Drive back to the start point (0, 0) and face the start direction.', input_schema: obj() },
+  { name: 'describe_map', description: 'Current position, heading and a short summary of the map (known area, obstacles, unexplored edges).', input_schema: obj() },
 ];
+
+const NAV_TOOLS = new Set(['navigate_to', 'explore_room', 'go_home', 'describe_map']);
+
+// Tools to offer the model: the navigation tools only when a navigator is wired.
+export function toolsFor({ navigation = false } = {}) {
+  return navigation ? TOOLS : TOOLS.filter((t) => !NAV_TOOLS.has(t.name));
+}
 
 const num = (v) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -119,8 +142,13 @@ const cleanText = (t) => String(t ?? '').replace(/[\u0000-\u001f\u007f"'\\`]/g, 
 const wrap = (a) => ((((a + 180) % 360) + 360) % 360) - 180;
 
 const fail = (error) => ({ ok: false, error });
+const NO_NAV = 'navigation not available';
 
-export function createToolExecutor({ bus, makeCommand, scan, findOpenings, describeScan, driveToward, onEmotion, onScan }) {
+const roundPose = (p) => (p && finite(p.x) && finite(p.y)
+  ? { x: Math.round(p.x), y: Math.round(p.y), heading: Math.round(finite(p.heading) ? p.heading : 0) }
+  : undefined);
+
+export function createToolExecutor({ bus, makeCommand, scan, findOpenings, describeScan, driveToward, onEmotion, onScan, navigator }) {
   let lastScan = null; // { points, openings }, cleared by any movement
 
   // Each tool call stamps its commands with the bus stop generation, so a
@@ -179,10 +207,10 @@ export function createToolExecutor({ bus, makeCommand, scan, findOpenings, descr
     },
 
     async scan_surroundings({ steps } = {}, { signal } = {}) {
-      if (!scan) return fail('scan not available');
+      if (!scan && !navigator) return fail('scan not available');
       const n = [8, 12, 16].includes(num(steps)) ? num(steps) : 12;
       lastScan = null;
-      const res = await scan(bus, { steps: n, signal, makeCommand: mk });
+      const res = navigator ? await navigator.scanHere({ signal, steps: n }) : await scan(bus, { steps: n, signal, makeCommand: mk });
       const points = (res?.points ?? []).map((p) => ({ angle: Math.round(p.angle), cm: finite(p.cm) ? Math.round(p.cm) : null }));
       const openings = findOpenings ? findOpenings(points, { minCm: 50 }) : [];
       lastScan = { points, openings };
@@ -295,7 +323,49 @@ export function createToolExecutor({ bus, makeCommand, scan, findOpenings, descr
       const r = await submit('display', { text: t });
       return r.ok ? { ok: true, shown: t } : fail(r.error);
     },
+
+    async navigate_to({ x_cm, y_cm }, { signal } = {}) {
+      if (!navigator) return fail(NO_NAV);
+      const x = num(x_cm), y = num(y_cm);
+      if (!finite(x) || !finite(y)) return fail('x_cm and y_cm must be numbers');
+      const goal = { x: Math.round(clamp(x, -MAP_LIMIT_CM, MAP_LIMIT_CM)), y: Math.round(clamp(y, -MAP_LIMIT_CM, MAP_LIMIT_CM)) };
+      lastScan = null;
+      return navResult(await navigator.goTo(goal, { signal }), { goal });
+    },
+
+    async explore_room({ max_moves } = {}, { signal } = {}) {
+      if (!navigator) return fail(NO_NAV);
+      const m = num(max_moves);
+      const maxMoves = finite(m) ? Math.round(clamp(m, 1, 8)) : 4;
+      lastScan = null;
+      const res = await navigator.explore({ signal, maxMoves });
+      return navResult(res, { moves: res?.moves, frontiers_left: res?.frontiersLeft });
+    },
+
+    async go_home(_, { signal } = {}) {
+      if (!navigator) return fail(NO_NAV);
+      lastScan = null;
+      return navResult(await navigator.goHome({ signal }));
+    },
+
+    async describe_map() {
+      if (!navigator) return fail(NO_NAV);
+      return { ok: true, map: String(navigator.describe() ?? '') };
+    },
   };
+
+  // Compact result for navigation tasks: ok, rounded pose, note.
+  function navResult(res, extra = {}) {
+    const pose = roundPose(res?.pose ?? navigator.pose?.pose ?? navigator.pose);
+    const out = { ok: res?.ok !== false };
+    if (!out.ok) out.error = res?.error ?? res?.note ?? 'navigation failed';
+    if (res && 'reached' in res) out.reached = !!res.reached;
+    for (const [k, v] of Object.entries(extra)) if (v !== undefined) out[k] = v;
+    if (finite(res?.legs)) out.legs = res.legs;
+    if (pose) out.pose = pose;
+    if (res?.note && res.note !== out.error) out.note = String(res.note);
+    return out;
+  }
 
   return {
     get lastScan() { return lastScan; },

@@ -369,6 +369,9 @@ export class BleRobot {
 
   battery() { return this.query('cyberpi.get_battery()'); }
 
+  // Gyro heading in degrees from the CyberPi IMU (sign and range UNVERIFIED on hardware).
+  yaw() { return this.query('cyberpi.get_yaw()'); }
+
   distance() { return this.query('cyberpi.ultrasonic2.get(1)'); }
 
   // --- lights and floor sensor (research/04-leds-and-rgb-sensor.md) ---

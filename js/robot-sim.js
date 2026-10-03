@@ -84,6 +84,7 @@ export class SimRobot {
       x: 150, y: 100, heading: -90, leds: Array.from({ length: 5 }, () => [0, 0, 0]),
       eyes: [0, 0], floorLight: 'off', label: '',
     };
+    this.startHeading = this.state.heading;
     this.motion = null; // {vLin cm/s, vAng deg/s, until}
     this.connected = false;
     this.watchdog = true;
@@ -181,6 +182,12 @@ export class SimRobot {
   }
 
   async battery() { return 87; }
+
+  // Heading relative to the heading at construction, clockwise positive, -180..180.
+  async yaw() {
+    const d = ((this.state.heading - this.startHeading) % 360 + 540) % 360 - 180;
+    return Math.round(d * 10) / 10;
+  }
 
   // Ultrasonic: nearest echo within a narrow cone from the sensor at the
   // front, against walls and obstacles; 300 means nothing in range.
