@@ -164,3 +164,9 @@ details label input[type="range"] { flex: 1; max-width: 70%; }
 #radar { max-width: 360px; justify-self: center; display: block; margin: 8px auto; }
 details input[type="password"] { flex: 1; font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+
+/* --- speed ----------------------------------------------------------- */
+.speed { display: grid; gap: 6px; }
+.speed-presets { margin: 0; }
+.speed-presets button { flex: 1; }
+.speed-presets button.on { background: var(--accent); border-color: var(--accent); color: #fff; }

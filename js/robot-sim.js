@@ -154,16 +154,16 @@ export class SimRobot {
     return this.go(0, (dir === 'left' ? -1 : 1) * speed * 2, secs, `spin ${dir}(${speed},${secs})`);
   }
 
-  async turn(deg, { wait = false } = {}) {
-    const secs = Math.abs(deg) / 180;
-    await this.go(0, Math.sign(deg) * 180, secs, `turn(${deg})`);
+  async turn(deg, { wait = false, speed = 50 } = {}) {
+    const secs = (Math.abs(deg) / 180) * (50 / speed);
+    await this.go(0, (Math.sign(deg) * Math.abs(deg)) / secs, secs, `turn(${deg},${speed})`);
     if (wait) await this.settle(secs);
   }
 
-  async straight(cm, { wait = false } = {}) {
-    const v = 17 * Math.sign(cm); // about 50 RPM
-    const secs = Math.abs(cm) / 17;
-    await this.go(v, 0, secs, `straight(${cm})`);
+  async straight(cm, { wait = false, speed = 50 } = {}) {
+    const v = (speed / 60) * WHEEL_CM * Math.sign(cm);
+    const secs = Math.abs(cm) / Math.abs(v || 1);
+    await this.go(v, 0, secs, `straight(${cm},${speed})`);
     if (wait) await this.settle(secs);
   }
 

@@ -28,11 +28,19 @@
     <section class="readouts">
       <div><span class="label">Akku</span><span id="r-battery" class="value">–</span></div>
       <div><span class="label">Abstand</span><span id="r-distance" class="value">–</span></div>
-      <div><span class="label">Max. Tempo</span><span id="r-speed" class="value">80</span></div>
+      <div><span class="label">Tempo (RPM)</span><span id="r-speed" class="value">60</span></div>
     </section>
-    <input id="speed" type="range" min="20" max="150" step="5" value="80" aria-label="Maximales Tempo (RPM)">
 
     <canvas id="sim" width="600" height="400" hidden></canvas>
+
+    <section class="speed" aria-label="Tempo">
+      <div class="chips speed-presets">
+        <button data-speed="30">🐢 Langsam</button>
+        <button data-speed="60">Normal</button>
+        <button data-speed="100">🐇 Schnell</button>
+      </div>
+      <input id="speed" type="range" min="10" max="150" step="5" value="60" aria-label="Tempo (RPM)">
+    </section>
 
     <div class="tabs" role="tablist" aria-label="Steuerung">
       <button role="tab" data-mode="buttons" aria-selected="true">Tasten</button>

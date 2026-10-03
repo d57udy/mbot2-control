@@ -201,14 +201,18 @@ async function pollSensors() {
 // --- driving -----------------------------------------------------------
 
 const speedEl = $('speed');
+// One speed for everything: joystick/buttons (max RPM), and turns, straight
+// moves, scans and AI moves (bus.settings.speed, capped at LIMITS.maxSpeed).
 function setSpeed(v) {
-  const s = Math.max(20, Math.min(LIMITS.maxDriveRpm, v));
+  const s = Math.max(10, Math.min(LIMITS.maxDriveRpm, Math.round(v)));
   speedEl.value = s;
   bus.settings.speed = Math.min(s, LIMITS.maxSpeed);
   $('r-speed').textContent = s;
+  document.querySelectorAll('[data-speed]').forEach((b) => b.classList.toggle('on', Number(b.dataset.speed) === s));
   store.set('speed', s);
 }
 speedEl.oninput = () => setSpeed(Number(speedEl.value));
+document.querySelectorAll('[data-speed]').forEach((b) => { b.onclick = () => setSpeed(Number(b.dataset.speed)); });
 
 function emergencyStop(src = 'ui') {
   stream.halt();
@@ -675,7 +679,7 @@ $('btn-explore').onclick = () => runScanTask(async (signal) => {
 });
 
 checkSupport();
-setSpeed(Number(store.get('speed', 80)));
+setSpeed(Number(store.get('speed', 60)));
 setMode(store.get('mode', 'buttons'));
 setVoiceMode(voiceMode);
 log('Bereit. Roboter einschalten, Startbildschirm, kein Programm aktiv, nicht mit mBlock verbunden.');

@@ -7,8 +7,8 @@
 // cmd / args:
 //   move     { dir: 'forward'|'backward', speed?, secs? }
 //   spin     { dir: 'left'|'right', speed?, secs? }
-//   turn     { deg, wait? }              (+ right, - left; gyro turn; wait = resolve when done)
-//   straight { cm, wait? }               gyro-straight distance, negative = backward
+//   turn     { deg, wait?, speed? }            (+ right, - left; gyro turn; wait = resolve when done)
+//   straight { cm, wait?, speed? }             gyro-straight distance, negative = backward
 //   drive    { left, right }             wheel RPM, forward-positive, continuous;
 //                                        robot watchdog stops it 0.4 s after the
 //                                        last drive command, so resend to keep going
@@ -151,7 +151,7 @@ export class CommandBus {
         return robot.spin(a.dir === 'left' ? 'left' : 'right', speed, secs);
       case 'turn': {
         const deg = Math.round(clamp(a.deg ?? 90, -LIMITS.maxTurnDeg, LIMITS.maxTurnDeg));
-        return robot.turn(deg, { wait: !!a.wait });
+        return robot.turn(deg, { wait: !!a.wait, speed });
       }
       case 'straight': {
         let cm = Math.round(clamp(a.cm ?? 0, -LIMITS.maxStraightCm, LIMITS.maxStraightCm));
@@ -164,7 +164,7 @@ export class CommandBus {
             if (cm <= 0) throw new Error(`obstacle at ${value} cm`);
           }
         }
-        return robot.straight(cm, { wait: !!a.wait });
+        return robot.straight(cm, { wait: !!a.wait, speed });
       }
       case 'read': {
         if (!['battery', 'distance', 'floor'].includes(a.sensor)) throw new Error(`unknown sensor ${a.sensor}`);

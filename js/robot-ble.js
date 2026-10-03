@@ -334,15 +334,16 @@ export class BleRobot {
 
   // wait: send with reply so the promise resolves when the robot has finished
   // the (blocking) gyro turn. Used by scans and the AI agent.
-  turn(deg, { wait = false } = {}) {
-    const s = `mbot2.turn(${deg})`;
-    return wait ? this.query(s, 2000 + Math.abs(deg) * 30) : this.run(s);
+  // speed: wheel RPM (Makeblock signature turn(angle, speed=50)).
+  turn(deg, { wait = false, speed = 50 } = {}) {
+    const s = `mbot2.turn(${deg},${speed})`;
+    return wait ? this.query(s, 2000 + Math.abs(deg) * 30 * (50 / speed)) : this.run(s);
   }
 
   // Drive straight for cm (negative = backward), gyro-corrected on the robot.
-  straight(cm, { wait = false } = {}) {
-    const s = `mbot2.straight(${cm})`;
-    return wait ? this.query(s, 2000 + Math.abs(cm) * 150) : this.run(s);
+  straight(cm, { wait = false, speed = 50 } = {}) {
+    const s = `mbot2.straight(${cm},${speed})`;
+    return wait ? this.query(s, 2000 + Math.abs(cm) * 150 * (50 / speed)) : this.run(s);
   }
 
   // Immediate mode first so it skips anything the robot is still executing,

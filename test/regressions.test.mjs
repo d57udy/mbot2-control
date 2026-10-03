@@ -95,3 +95,14 @@ test('a stalled Claude request times out with a clear error', async () => {
   await assert.rejects(agent.send('hallo'), /Zeitüberschreitung/);
   assert.equal(agent.busy, false);
 });
+
+test('turn and straight carry the chosen speed', async () => {
+  const sent = [];
+  const fake = { connected: true, turn: async (d, o) => sent.push(['turn', d, o.speed]), straight: async (c, o) => sent.push(['straight', c, o.speed]) };
+  const bus = new CommandBus({ log: stub });
+  bus.setRobot(fake);
+  bus.settings.speed = 30;
+  await bus.submit(makeCommand('turn', { deg: 90 }));
+  await bus.submit(makeCommand('straight', { cm: 20, speed: 80 }));
+  assert.deepEqual(sent, [['turn', 90, 30], ['straight', 20, 80]]);
+});
