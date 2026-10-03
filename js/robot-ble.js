@@ -72,6 +72,10 @@ const EYE_HELPER_SRC = [
 // the others take (index=1). Only used when the helper could not be installed.
 export const EYE_EFFECT_NEEDS_BRI = new Set(['happy', 'wink', 'naughty', 'aggrieved', 'look_left', 'look_right',
   'eye_left', 'eye_right']);
+// Measured on firmware 44.01.013: 200-byte scripts work, 300-byte scripts are
+// silently dropped. Longer code goes through execLong; long replies through queryLong.
+export const MAX_SCRIPT = 200;
+const byteLen = (s) => new TextEncoder().encode(s).length;
 const EFFECT_DEFAULT_MS = 6000; // generous: the reply ends the quiet period early
 const safeName = (n) => { if (!/^[a-z_]+$/.test(n)) throw new Error(`bad effect name ${n}`); return n; };
 
@@ -183,10 +187,18 @@ export class BleRobot {
     report(`Test: Chunk ${this.chunkSize} B, Pause ${this.chunkDelayMs} ms, Helfer ${this.helpers ? 'an' : 'aus'}`);
     for (let i = 1; i <= 3; i++) await t(`kurz ${i}`, 'cyberpi.get_bri()');
     await t('Abstand', 'cyberpi.ultrasonic2.get(1)');
-    for (const n of [60, 120, 200, 300, 450]) {
-      const ok = await t(`${n} Bytes`, `len("${'x'.repeat(n - 7)}")`, 6000);
-      const alive = await t(`  danach kurz`, 'cyberpi.get_bri()');
-      if (!ok || !alive) { report(`→ Abbruch bei ${n} Bytes`); break; }
+    this.maxScript = 1000; // the test probes past the normal limit on purpose
+    try {
+      for (const n of [120, 200, 220, 240, 250, 260, 280]) {
+        const ok = await t(`Anfrage ${n} Bytes`, `len("${'x'.repeat(n - 7)}")`, 4000);
+        await t('  danach kurz', 'cyberpi.get_bri()');
+        if (!ok) { report(`→ Anfragen: Grenze zwischen vorherigem Wert und ${n} Bytes`); break; }
+      }
+    } finally { this.maxScript = undefined; }
+    for (const n of [100, 200, 300, 500]) {
+      const ok = await t(`Antwort ${n} Zeichen`, `"x"*${n}`, 5000);
+      await t('  danach kurz', 'cyberpi.get_bri()', 6000);
+      if (!ok) { report(`→ Antworten: Grenze unter ${n} Zeichen`); break; }
     }
     await t('Firmware', 'cyberpi.get_firmware_version()');
     await t('_thread vorhanden', "__import__('_thread').get_ident()>0");
@@ -196,7 +208,7 @@ export class BleRobot {
   async installWatchdog() {
     this.watchdog = false;
     try {
-      await this.query(`exec(${py(WATCHDOG_SRC)})`, 3000);
+      await this.execLong(WATCHDOG_SRC);
       const [wr, hasD] = await this.query("[mbot2._wr,hasattr(mbot2,'_d')]", 1500);
       this.watchdog = wr === 1 && hasD === true;
     } catch (e) {
@@ -262,6 +274,11 @@ export class BleRobot {
     this.pumping = false;
   }
 
+  checkSize(script) {
+    const max = this.maxScript ?? MAX_SCRIPT;
+    if (byteLen(script) > max) throw new Error(`script too long for the robot (${byteLen(script)} > ${max} bytes)`);
+  }
+
   nextIdx() {
     const i = this.idx;
     this.idx = (this.idx % 0xfffe) + 1;
@@ -270,6 +287,7 @@ export class BleRobot {
 
   run(script, opts = {}) {
     return this.enqueue(() => {
+      this.checkSize(script);
       const frame = buildScriptFrame(script, this.nextIdx(), MODE_NO_REPLY);
       if (!opts.quiet) this.log(`> ${script}`, toHex(frame));
       return this.writeRaw(frame);
@@ -279,6 +297,7 @@ export class BleRobot {
   query(script, timeoutMs = 1500) {
     return new Promise((resolve, reject) => {
       this.enqueue(async () => {
+        this.checkSize(script);
         const idx = this.nextIdx();
         const timer = setTimeout(() => {
           this.pending.delete(idx);
@@ -382,6 +401,7 @@ export class BleRobot {
       const t0 = Date.now();
       this.enqueue(async () => {
         const idx = this.nextIdx();
+        this.checkSize(script);
         const entry = {
           resolve: (value) => resolve({ done: true, value, ms: Date.now() - t0 }),
           reject,
@@ -409,7 +429,7 @@ export class BleRobot {
     this.eyeHelper = false;
     this.eyeModeLogged = null;
     try {
-      await this.query(`exec(${py(EYE_HELPER_SRC)})`, 3000);
+      await this.execLong(EYE_HELPER_SRC);
       const [fx, eyes] = await this.query("[hasattr(mbot2,'_fx'),hasattr(mbot2,'_eyes')]", 1500);
       this.eyeHelper = fx === true && eyes === true;
     } catch (e) {
@@ -471,19 +491,52 @@ export class BleRobot {
   // make the sensor switch its fill light, so they are optional.
   async floor(withColors) {
     const q = 'cyberpi.quad_rgb_sensor';
-    const parts = ['q.get_line_sta(1)', 'q.get_offset_track(1)', '[q.get_gray(i) for i in (4,3,2,1)]'];
-    if (withColors) {
-      parts.push('[q.get_color_sta(i) for i in (4,3,2,1)]',
-        '[[q.get_red(i),q.get_green(i),q.get_blue(i)] for i in (4,3,2,1)]');
-    }
-    const v = await this.query(`(lambda q:[${parts.join(',')}])(${q})`, 2500);
+    // two queries with colours: one combined script would exceed MAX_SCRIPT
+    const v = await this.query(`(lambda q:[q.get_line_sta(1),q.get_offset_track(1),[q.get_gray(i) for i in (4,3,2,1)]])(${q})`, 2500);
     if (!Array.isArray(v)) throw new Error(`unexpected floor reply: ${JSON.stringify(v)}`);
-    const [line, offset, gray, names, rgb] = v;
-    return { line, offset, gray, names: names ?? null, rgb: rgb ?? null };
+    const [line, offset, gray] = v;
+    let names = null, rgb = null;
+    if (withColors) {
+      const c = await this.query(`(lambda q:[[q.get_color_sta(i) for i in (4,3,2,1)],[[q.get_red(i),q.get_green(i),q.get_blue(i)] for i in (4,3,2,1)]])(${q})`, 2500);
+      if (Array.isArray(c)) [names, rgb] = c;
+    }
+    return { line, offset, gray, names, rgb };
   }
 
-  diagnose() {
-    return this.query('[cyberpi.get_firmware_version(),dir(cyberpi.led),dir(cyberpi.ultrasonic2),dir(cyberpi.quad_rgb_sensor),dir(mbot2)]', 5000);
+  async diagnose() {
+    const out = [await this.query('cyberpi.get_firmware_version()', 3000)];
+    for (const obj of ['cyberpi.led', 'cyberpi.ultrasonic2', 'cyberpi.quad_rgb_sensor', 'mbot2']) {
+      out.push(await this.queryLong(`dir(${obj})`));
+    }
+    return out;
+  }
+
+  // Runs code longer than MAX_SCRIPT: the source is assembled in pieces in
+  // mbot2._s on the robot (memory only), then executed.
+  async execLong(src, timeoutMs = 3000) {
+    const piece = (p) => `setattr(mbot2,'_s',mbot2._s+${py(p)})`;
+    const pieces = [];
+    let cur = '';
+    for (const ch of src) {
+      if (byteLen(piece(cur + ch)) > MAX_SCRIPT) { pieces.push(cur); cur = ch; } else cur += ch;
+    }
+    if (cur) pieces.push(cur);
+    await this.query("setattr(mbot2,'_s','')", 1500);
+    for (const p of pieces) await this.query(piece(p), 1500);
+    const r = await this.query('exec(mbot2._s)', timeoutMs);
+    this.run("setattr(mbot2,'_s','')", { quiet: true }).catch(() => {});
+    return r;
+  }
+
+  // Reads a long result in 150-character slices of its str() form.
+  async queryLong(expr, slice = 150) {
+    let text = '';
+    for (let i = 0; i < 40; i++) {
+      const part = await this.query(`str(${expr})[${i * slice}:${(i + 1) * slice}]`, 2000);
+      text += part ?? '';
+      if (!part || part.length < slice) break;
+    }
+    return text;
   }
 
   display(text) { return this.run(`cyberpi.display.show_label(${py(text)},24,"center")`); }

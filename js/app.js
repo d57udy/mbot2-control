@@ -23,6 +23,7 @@ const store = {
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
+  console.log(`[mbot] ${t} ${msg}${detail ? ` | ${detail}` : ''}`); // readable by browser automation
   logEl.textContent = `${t} ${msg}${detail ? `\n      ${detail}` : ''}\n${logEl.textContent}`.slice(0, 20000);
 }
 

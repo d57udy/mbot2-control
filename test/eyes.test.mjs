@@ -32,7 +32,7 @@ function fakeRobot(reply = () => undefined) {
 
 // Robot with the helper installed (hasattr check answers [true, true]).
 const helperReply = (onFx) => (s) => {
-  if (s.startsWith('exec(')) return null;
+  if (s.startsWith('exec(') || s.startsWith('setattr(mbot2')) return null;
   if (s.startsWith('[hasattr(mbot2')) return [true, true];
   if (s.startsWith('mbot2._eyes')) return 'list';
   if (s.startsWith('mbot2._fx')) return onFx(s);
@@ -52,11 +52,14 @@ test('eye effect uses the helper and returns the measured run time', async () =>
   const fx = sent.find((f) => f.script.startsWith('mbot2._fx'));
   assert.equal(fx.script, 'mbot2._fx("happy")');
   assert.equal(fx.mode, 1, 'effects are sent with reply so errors come back');
-  assert.ok(sent[0].script.includes('except TypeError:f(b)'), 'helper retries with a brightness argument');
+  // the helper is uploaded in pieces (each under MAX_SCRIPT) and then executed
+  const src = sent.filter((f) => f.script.startsWith("setattr(mbot2,'_s',mbot2._s+"))
+    .map((f) => JSON.parse(f.script.slice("setattr(mbot2,'_s',mbot2._s+".length, -1))).join('');
+  assert.ok(src.includes('except TypeError:f(b)'), 'helper retries with a brightness argument');
   assert.equal(robot.effectEstimateMs('happy'), 2700);
   // second call does not reinstall the helper
   await robot.eyesEffect('dizzy');
-  assert.equal(sent.filter((f) => f.script.startsWith('exec(')).length, 1);
+  assert.equal(sent.filter((f) => f.script === 'exec(mbot2._s)').length, 1);
 });
 
 test('helper errors surface as exceptions', async () => {
@@ -70,7 +73,7 @@ test('without helper, direct calls pass brightness where the firmware needs it',
   const { robot, sent } = fakeRobot((s) => (s.includes('_effect(') ? null : undefined));
   // helper install times out (no reply); shorten by stubbing query for the install
   const q = robot.query.bind(robot);
-  robot.query = (s, t) => (s.startsWith('exec(') ? Promise.reject(new Error('timeout')) : q(s, t));
+  robot.query = (s, t) => (s.startsWith('exec(') || s.startsWith('setattr(mbot2') ? Promise.reject(new Error('timeout')) : q(s, t));
   await robot.eyesEffect('happy');
   await robot.eyesEffect('thinking');
   const scripts = sent.map((f) => f.script);
