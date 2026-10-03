@@ -1,12 +1,16 @@
 import { BleRobot } from './robot-ble.js';
 import { SimRobot, SIM_ROOM, SIM_OBSTACLES } from './robot-sim.js';
 import { drawSim } from './sim-view.js';
-import { scan, findOpenings, describeScan, driveToward, explore } from './scan.js';
+import { scan, findOpenings, describeScan, driveToward, sweepScan, resampleSweep } from './scan.js';
+import { relocalize } from './localize.js';
 import { drawRadar } from './radar.js';
 import { GridMap } from './gridmap.js';
 import { PoseTracker } from './pose.js';
 import { Navigator } from './navigate.js';
+import { makeBleSampler, makeSimSampler, BLE_SENSORS } from './motion.js';
 import { drawMap, fitView, screenToWorld } from './mapview.js';
+import { attachMapControls } from './mapcontrols.js';
+import { saveMap, listMaps, loadMap, deleteMap, exportMap, importMap } from './mapstore.js';
 import { CommandBus, makeCommand, LIMITS, LED_EFFECTS, EYE_EFFECTS } from './bus.js';
 import { VoiceListener, parseUtterance, isStop, isStrictStop } from './voice.js';
 import { toolsFor, createToolExecutor } from './tools.js';
@@ -656,6 +660,13 @@ function showScan(points) {
   return openings;
 }
 
+// Navigation on a freshly loaded map needs the robot's position first.
+function needsLocation() {
+  if (!relocalizePending) return false;
+  log('Erst „Scannen“: der Roboter muss sich auf der geladenen Karte finden.');
+  return true;
+}
+
 // Scans and explores share one AbortController so STOPP cancels them.
 async function runScanTask(fn) {
   if (!robot?.connected) { log('! nicht verbunden'); return null; }
@@ -674,9 +685,51 @@ async function runScanTask(fn) {
   }
 }
 
-async function doScan(steps, signal) {
+// Scan mode from the select: 'sweep' (continuous) or a step count.
+function applyScanMode() {
+  const v = $('scan-steps').value;
+  nav.scanMode = v === 'sweep' ? 'sweep' : 'step';
+  if (v !== 'sweep') nav.steps = Number(v);
+}
+
+// After loading a map the robot's position on it is unknown: scan without
+// adding to the map, search the whole map for the best fit, and only accept a
+// confident match. Until then the map stays untouched.
+async function relocateOnMap(signal) {
+  applyScanMode();
+  const mk = bus.stamped();
+  let points, turned = 0;
+  if (nav.scanMode === 'sweep' && nav.sample) {
+    const r = await sweepScan(bus, { sample: nav.sample, makeCommand: mk, signal });
+    points = resampleSweep(r.points, 5);
+    turned = r.turnedDeg ?? 0;
+  } else {
+    points = (await scan(bus, { steps: nav.steps, signal, makeCommand: mk })).points;
+  }
+  const beams = points.filter((p) => p.cm != null && p.cm > 2 && p.cm < 300);
+  const t0 = performance.now();
+  const res = beams.length >= 6 ? relocalize(map, resampleSweep(beams, 10)) : null;
+  const ms = Math.round(performance.now() - t0);
+  if (!res?.pose || res.confidence < 0.4) {
+    log(`! Position auf der Karte nicht sicher gefunden (Sicherheit ${res ? Math.round(res.confidence * 100) : 0} %, ${ms} ms). Etwas verschieben und erneut scannen.`);
+    showScan(points);
+    return null;
+  }
+  tracker.reset(res.pose);
+  map.integrateScan(res.pose, points, { beamDeg: 16, maxRangeCm: 250, freeBeamDeg: 16 });
+  tracker.applyTurn(turned);
+  relocalizePending = false;
+  mapScan = { pose: res.pose, points };
+  log(`Auf der Karte gefunden: ${Math.round(res.pose.x)} cm rechts, ${Math.round(res.pose.y)} cm vorne, ${Math.round(res.pose.heading)}° (Sicherheit ${Math.round(res.confidence * 100)} %, ${ms} ms)`);
+  showScan(points);
+  redrawMap();
+  return res;
+}
+
+async function doScan(signal) {
+  if (relocalizePending) return relocateOnMap(signal);
   const simPose = robot.kind === 'sim' ? { x: robot.state.x, y: robot.state.y, heading: robot.state.heading } : null;
-  nav.steps = steps;
+  applyScanMode();
   const result = await nav.scanHere({ signal });
   if (!result?.points) { log(`! Scan: ${result?.note ?? 'fehlgeschlagen'}`); return result; }
   if (simPose) { lastScan = { ...simPose, points: result.points }; redrawSim(); }
@@ -715,6 +768,7 @@ let lastDrive = null; // { l, r, at }
 bus.onCommand((c, r) => {
   if (!r.ok) return;
   const now = performance.now();
+  if (c.args?.leg) { lastDrive = null; scheduleMapDraw(); return; } // navigator legs: the navigator updates the pose
   if (lastDrive) tracker.applyDrive(lastDrive.l, lastDrive.r, Math.min(0.3, (now - lastDrive.at) / 1000));
   lastDrive = c.cmd === 'drive' && (c.args.left || c.args.right) ? { l: c.args.left, r: c.args.right, at: now } : null;
   if (c.cmd === 'drive' || c.cmd === 'turn' || c.cmd === 'straight' || c.cmd === 'stop') scheduleMapDraw();
@@ -731,7 +785,7 @@ function redrawMap() {
   const canvas = $('map');
   if (!canvas || !$('panel-scan').open) return;
   const pose = tracker.pose;
-  mapView = fitView(canvas, map, pose);
+  mapView = mapControls.viewFor(pose);
   drawMap(canvas, map, pose, {
     view: mapView,
     trail: tracker.trail,
@@ -744,7 +798,16 @@ function redrawMap() {
 }
 $('panel-scan').addEventListener('toggle', redrawMap);
 
+// Sensor sampler for navigation legs (crash detection) and sweeps.
+function attachSampler() {
+  if (!robot) { nav.sample = undefined; return; }
+  nav.sample = robot.kind === 'sim'
+    ? makeSimSampler(robot)
+    : makeBleSampler(robot, BLE_SENSORS, { log });
+}
+
 function resetMap() {
+  attachSampler();
   map.clear();
   tracker.reset();
   nav.lastPath = null;
@@ -763,21 +826,96 @@ function navResult(label, r) {
   redrawSim();
 }
 
-$('map').addEventListener('pointerup', (e) => {
-  if (!mapView) return;
-  const goal = screenToWorld($('map'), mapView, e.clientX, e.clientY);
-  goal.x = Math.round(goal.x); goal.y = Math.round(goal.y);
-  log(`Ziel: ${goal.x} cm rechts, ${goal.y} cm vorne (vom Start)`);
-  runScanTask(async (signal) => navResult('Fahrt zum Ziel', await nav.goTo(goal, { signal })));
+// Zoom (wheel, pinch), pan (drag), tap = drive there. Auto-fit until the user zooms or pans.
+const mapControls = attachMapControls($('map'), {
+  getView: () => mapView,
+  setView: (v) => { mapView = v; },
+  onChange: scheduleMapDraw,
+  fit: () => fitView($('map'), map, tracker.pose),
+  onTap: (x, y) => {
+    if (!mapView) return;
+    const goal = screenToWorld($('map'), mapView, x, y);
+    goal.x = Math.round(goal.x); goal.y = Math.round(goal.y);
+    if (needsLocation()) return;
+    log(`Ziel: ${goal.x} cm rechts, ${goal.y} cm vorne (vom Start)`);
+    runScanTask(async (signal) => navResult('Fahrt zum Ziel', await nav.goTo(goal, { signal })));
+  },
 });
+$('btn-map-fit').onclick = () => { mapControls.fit(); scheduleMapDraw(); };
+$('opt-follow').onchange = (e) => { mapControls.setFollow(e.target.checked); scheduleMapDraw(); };
 
-$('btn-scan').onclick = () => runScanTask((signal) => doScan(Number($('scan-steps').value), signal));
-$('btn-explore').onclick = () => runScanTask(async (signal) => {
-  nav.steps = Number($('scan-steps').value);
+// --- map storage -----------------------------------------------------------
+
+let relocalizePending = false; // after loading a map, the next scan finds the robot on it
+
+function refreshMapList() {
+  const sel = $('map-list');
+  sel.textContent = '';
+  for (const m of listMaps()) sel.add(new Option(`${m.name} (${m.knownM2?.toFixed?.(1) ?? '?'} m²)`, m.name));
+  sel.disabled = !sel.options.length;
+}
+
+function adoptMap(loaded, label) {
+  if (loaded.map.cellCm !== map.cellCm || loaded.map.sizeCm !== map.sizeCm) {
+    log(`! ${label}: Kartenformat passt nicht (${loaded.map.cellCm} cm Raster)`);
+    return;
+  }
+  map.L.set(loaded.map.L);
+  map.touch();
+  tracker.reset();
+  nav.lastPath = null;
+  nav.goal = null;
+  mapScan = null;
+  relocalizePending = true;
+  mapControls.fit();
+  redrawMap();
+  log(`${label}. Position auf der Karte unbekannt: bitte „Scannen“, dann sucht sich der Roboter darauf.`);
+}
+
+$('btn-map-save').onclick = () => {
+  const name = $('map-name').value.trim() || `Karte ${new Date().toLocaleString('de-DE')}`;
+  const r = saveMap(name, map, { pose: tracker.pose });
+  log(r.ok ? `Karte „${name}“ gespeichert (${Math.round(r.bytes / 1024)} kB)` : `! ${r.error}`);
+  refreshMapList();
+};
+$('btn-map-load').onclick = () => {
+  const name = $('map-list').value;
+  const r = name && loadMap(name);
+  if (r) adoptMap(r, `Karte „${name}“ geladen`); else log('! Keine Karte ausgewählt');
+};
+$('btn-map-del').onclick = () => {
+  const name = $('map-list').value;
+  if (name) { deleteMap(name); log(`Karte „${name}“ gelöscht`); refreshMapList(); }
+};
+$('btn-map-export').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(exportMap(map, { pose: tracker.pose }));
+  a.download = `mbot2-karte-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+$('map-import').onchange = async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try { adoptMap(await importMap(file), `Karte „${file.name}“ importiert`); } catch (err) { log(`! ${err.message}`); }
+  e.target.value = '';
+};
+refreshMapList();
+
+$('scan-steps').onchange = applyScanMode; // also used by map taps, Nach Hause and AI tools
+applyScanMode();
+$('btn-scan').onclick = () => runScanTask((signal) => doScan(signal));
+$('btn-explore').onclick = () => !needsLocation() && runScanTask(async (signal) => {
+  applyScanMode();
   const r = await nav.explore({ signal, maxMoves: 6 });
   navResult(`Erkunden (${r?.moves ?? 0} Fahrten, ${r?.frontiersLeft ?? '?'} offene Bereiche)`, r);
 });
-$('btn-home').onclick = () => runScanTask(async (signal) => navResult('Nach Hause', await nav.goHome({ signal })));
+$('btn-home').onclick = () => !needsLocation() && runScanTask(async (signal) => navResult('Nach Hause', await nav.goHome({ signal })));
+
+// Installable app (PWA); not on localhost so development always loads fresh files.
+if ('serviceWorker' in navigator && !/^(localhost|127\.)/.test(location.hostname)) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 
 checkSupport();
 setSpeed(Number(store.get('speed', 60)));

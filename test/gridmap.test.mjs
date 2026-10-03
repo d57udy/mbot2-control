@@ -67,14 +67,61 @@ test('gridmap: repeated evidence clamps, free evidence erodes a false hit', () =
   assert.equal(m.cell(0, 66), 'free');
 });
 
-test('gridmap: freeBeamDeg widens only the free cone, with a shorter reach', () => {
+test('gridmap: freeBeamDeg widens only the free cone, weaker and with a shorter reach', () => {
   const m = new GridMap({});
   m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 16, freeBeamDeg: 30 });
   const at = (deg, r) => m.cell(Math.sin((deg * Math.PI) / 180) * r, 6 + Math.cos((deg * Math.PI) / 180) * r);
+  // not looked at: one pass leaves it unknown, a second pass makes it free
+  assert.equal(at(13, 50), 'unknown');
+  assert.ok(m.L[m.index(Math.sin((13 * Math.PI) / 180) * 50, 6 + Math.cos((13 * Math.PI) / 180) * 50)] < 0);
+  m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 16, freeBeamDeg: 30, robotRadiusCm: 0 });
   assert.equal(at(13, 50), 'free');
   assert.equal(at(13, 90), 'unknown');           // beyond 0.7 of the range
   assert.notEqual(at(13, 100), 'occupied');
   assert.equal(at(0, 100), 'occupied');
+});
+
+test('gridmap: hit evidence survives free cones that only graze it', () => {
+  // a thin leg 60 cm ahead, seen once by the beam centre
+  const m = new GridMap({});
+  m.integrateScan(O, [{ angle: 0, cm: 60 }], { beamDeg: 16, robotRadiusCm: 0 });
+  const k = m.index(0, 66);
+  assert.equal(m.stateOf(k), 'occupied');
+  // later scans from the side: widened gap fillers and beam edges pass over it many times
+  const side = { x: -50, y: 66, heading: 90 };
+  for (let i = 0; i < 10; i++) {
+    m.integrateScan(side, [{ angle: 12, cm: 200 }, { angle: -12, cm: 200 }], { beamDeg: 16, freeBeamDeg: 30, robotRadiusCm: 0 });
+  }
+  for (let i = 0; i < 3; i++) m.integrateScan(side, [{ angle: 6, cm: 200 }], { beamDeg: 16, robotRadiusCm: 0 });
+  assert.equal(m.stateOf(k), 'occupied');
+  // the core of a beam through it does clear it (the obstacle moved away)
+  for (let i = 0; i < 3; i++) m.integrateScan(side, [{ angle: 0, cm: 200 }], { beamDeg: 16, robotRadiusCm: 0 });
+  assert.equal(m.stateOf(k), 'free');
+  // the robot footprint erodes hit evidence only slowly (pose errors)
+  const m2 = new GridMap({});
+  m2.L[m2.index(3, 3)] = 1.2;
+  m2.markFree(0, 0, 9);
+  assert.equal(m2.cell(3, 3), 'occupied');
+});
+
+test('gridmap: distance field matches brute force and is cached', () => {
+  const m = new GridMap({ sizeCm: 200 });
+  const occ = [[-50, 20], [30, -60], [70, 70], [-95, -95]];
+  for (const [x, y] of occ) m.L[m.index(x, y)] = 2;
+  m.L[m.index(10, 10)] = 0.3;  // suspect only
+  m.touch();
+  const df = m.distanceField();
+  for (let k = 0; k < m.L.length; k += 7) {
+    const c = m.centre(k);
+    const want = Math.min(...occ.map(([x, y]) => { const o = m.centre(m.index(x, y)); return Math.hypot(o.x - c.x, o.y - c.y); }));
+    assert.ok(Math.abs(df[k] - want) < 1e-3, `${k}: ${df[k]} vs ${want}`);
+  }
+  assert.equal(m.distanceField(), df);
+  assert.equal(m.clearance(10, 10, 0.15), 0);
+  assert.ok(m.clearance(10, 10) > 30);
+  assert.equal(new GridMap({ sizeCm: 100 }).distanceField()[0], Infinity);
+  m.touch();
+  assert.notEqual(m.distanceField(), df);
 });
 
 test('gridmap: inflation and traversability', () => {

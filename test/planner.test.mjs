@@ -3,6 +3,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GridMap } from '../js/gridmap.js';
 import { planPath, simplifyPath, pathToMoves, lineOfSight } from '../js/planner.js';
+import { SimRobot, SIM_OBSTACLES, SIM_ROBOT } from '../js/robot-sim.js';
+import { CommandBus } from '../js/bus.js';
+import { Navigator } from '../js/navigate.js';
+import { PoseTracker } from '../js/pose.js';
+import { scan } from '../js/scan.js';
 
 // Known free square of +-half cm with optional occupied rectangles.
 function room({ half = 150, walls = [] } = {}) {
@@ -109,4 +114,112 @@ test('pathToMoves: turns, splits, ends at the waypoints', () => {
   // the start waypoint and tiny segments are skipped
   assert.deepEqual(pathToMoves(pose, [{ x: 0, y: 0 }, { x: 0.3, y: 0.3 }]), []);
   assert.deepEqual(pathToMoves(pose, null), []);
+});
+
+test('planner: keeps distance where there is room, still fits through a gap', () => {
+  // a post at (0, 50): the path may pass it but prefers more than the inflation
+  const m = room({ walls: [{ x0: -3, x1: 3, y0: 47, y1: 53 }] });
+  const p = simplifyPath(planPath(m, { x: 0, y: 0 }, { x: 0, y: 100 }), m);
+  let min = Infinity;
+  for (let i = 1; i < p.length; i++) {
+    for (let t = 0; t <= 1; t += 0.02) min = Math.min(min, m.clearance(p[i - 1].x + (p[i].x - p[i - 1].x) * t, p[i - 1].y + (p[i].y - p[i - 1].y) * t));
+  }
+  assert.ok(min > 20, `clearance ${min}`);
+  // a 45 cm gap between two walls is still passable with inflation 14
+  const g = room({ walls: [{ x0: -150, x1: -25, y0: 45, y1: 55 }, { x0: 25, x1: 150, y0: 45, y1: 55 }] });
+  assert.ok(planPath(g, { x: 0, y: 0 }, { x: 0, y: 100 }));
+});
+
+test('planner: escaping the inflated start never moves closer to the obstacle', () => {
+  // start 10 cm left of a post; the goal lies beyond the post
+  const m = room({ walls: [{ x0: 8, x1: 12, y0: -2, y1: 2 }] });
+  const start = { x: 0, y: 0 };
+  const p = planPath(m, start, { x: 60, y: 0 });
+  assert.ok(p);
+  const c0 = m.clearance(start.x, start.y);
+  for (const q of p.slice(1)) assert.ok(m.clearance(q.x, q.y) >= c0 - 1e-6, `(${q.x}, ${q.y}) at ${m.clearance(q.x, q.y)}`);
+});
+
+test('planner: weak hit evidence is avoided when there is room', () => {
+  const m = room();
+  for (let x = -20; x <= 20; x += 5) m.L[m.index(x, 50)] = 0.3;   // below the occupied threshold
+  m.touch();
+  assert.equal(m.cell(0, 50), 'unknown');
+  const p = planPath(m, { x: 0, y: 0 }, { x: 0, y: 100 });
+  assert.ok(p.every((q) => Math.hypot(q.x, q.y - 50) > 14 || Math.abs(q.x) > 20), 'goes around the suspect arc');
+});
+
+// Home bug (v0.5 owner report): scans from later poses erased the thin table
+// leg and the home path ran through it. Sim frame: map x = sim x - 150,
+// map y = 100 - sim y, map heading = sim heading + 90.
+async function simScan(sim, p, n = 12) {
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const a = (i * 360) / n;
+    Object.assign(sim.state, { x: p.x + 150, y: 100 - p.y, heading: p.heading + a - 90 });
+    pts.push({ angle: a > 180 ? a - 360 : a, cm: await sim.distance() });
+  }
+  return pts;
+}
+
+// Smallest distance from a polyline (map frame) to the sim obstacles' surfaces.
+function trueClearance(path, obstacles) {
+  let min = Infinity;
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1], b = path[i], L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    for (let t = 0; t <= L; t += 1) {
+      const sx = a.x + ((b.x - a.x) * t) / L + 150, sy = 100 - (a.y + ((b.y - a.y) * t) / L);
+      for (const o of obstacles) {
+        const d = o.kind === 'circle' ? Math.hypot(sx - o.x, sy - o.y) - o.r
+          : Math.hypot(sx - Math.min(o.x + o.w, Math.max(o.x, sx)), sy - Math.min(o.y + o.h, Math.max(o.y, sy)));
+        min = Math.min(min, d);
+      }
+    }
+  }
+  return min;
+}
+
+test('planner: home path keeps clear of the table leg after scans from other poses', async () => {
+  const sim = new SimRobot({ log: () => {}, onStatus: () => {} });
+  const m = new GridMap({});
+  const opts = { beamDeg: 16, freeBeamDeg: 30 };
+  // the poses of the reproduction: start, past the leg, beyond it
+  for (const p of [{ x: 0, y: 0, heading: 0 }, { x: 24, y: 24, heading: 45 }, { x: 33, y: 48, heading: 21 }, { x: 86, y: 67, heading: 70 }]) {
+    m.integrateScan(p, await simScan(sim, p), opts);
+  }
+  const leg = { x: 215 - 150, y: 100 - 55 };
+  assert.ok(m.clearance(leg.x, leg.y) <= 10, `the leg is still in the map (${m.clearance(leg.x, leg.y)})`);
+  const p = simplifyPath(planPath(m, { x: 112, y: 78 }, { x: 0, y: 0 }, { inflateCm: 14 }), m, { inflateCm: 14 });
+  assert.ok(p);
+  const c = trueClearance(p, SIM_OBSTACLES);
+  assert.ok(c > SIM_ROBOT.radiusCm + 3, `home path ${c.toFixed(1)} cm from an obstacle`);
+});
+
+// legMode 'straight': blocking legs, independent of the drive-leg crash detection
+test('planner: scan, drive past the leg and go home in the sim without coming close', async () => {
+  const sim = new SimRobot({ log: () => {}, onStatus: () => {}, timeScale: 80 });
+  const bus = new CommandBus({ log: () => {} });
+  bus.setRobot(sim);
+  await sim.connect();
+  let minClear = Infinity;
+  sim.onChange = (s) => { minClear = Math.min(minClear, trueClearance([{ x: s.x - 150, y: 100 - s.y }, { x: s.x - 150, y: 100 - s.y }], SIM_OBSTACLES)); };
+  const map = new GridMap({});
+  const plans = [];
+  const nav = new Navigator({ bus, map, pose: new PoseTracker(), scan, settleMs: 0, legMode: 'straight', steps: 8,
+    onEvent: (e) => { if (e.type === 'plan') plans.push(e.path); } });
+  try {
+    await nav.scanHere({});
+    const r = await nav.goTo({ x: 110, y: 75 });
+    assert.equal(r.ok, true, r.note);
+    const before = plans.length;
+    const h = await nav.goHome({});
+    assert.equal(h.ok, true, h.note);
+    for (const path of plans.slice(before)) {
+      const c = trueClearance(path, SIM_OBSTACLES);
+      assert.ok(c > SIM_ROBOT.radiusCm, `home plan ${c.toFixed(1)} cm from an obstacle`);
+    }
+    assert.ok(minClear > SIM_ROBOT.radiusCm + 1, `came within ${minClear.toFixed(1)} cm`);
+  } finally {
+    await sim.disconnect();
+  }
 });

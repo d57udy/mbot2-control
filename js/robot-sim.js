@@ -11,6 +11,9 @@ const RADIUS_CM = 9;        // collision circle around the robot centre
 const SENSOR_CM = 6;        // ultrasonic sits this far ahead of the centre
 const RANGE = { min: 3, max: 300 };
 const BEAM_DEG = [-8, -4, 0, 4, 8]; // the ultrasonic cone, nearest echo wins
+const DEG_PER_CM = 360 / WHEEL_CM; // wheel angle per cm of wheel travel
+const IMPACT_S = 0.25;      // how long a collision shows on the accelerometer
+const G = 9.8;
 
 // Furniture so scans have something to find. Boxes are axis-aligned.
 const OBSTACLES = [
@@ -19,6 +22,7 @@ const OBSTACLES = [
   { kind: 'circle', x: 215, y: 55, r: 4, label: 'table leg' },
   { kind: 'circle', x: 70, y: 150, r: 15, label: 'pouf' },
 ];
+// An obstacle with low: true blocks the robot but is below the ultrasonic beam.
 
 // Distance along a unit ray to the first hit, or Infinity.
 function rayBox(ox, oy, dx, dy, b) {
@@ -72,7 +76,9 @@ export function collides(x, y, room = ROOM, obstacles = OBSTACLES, r = RADIUS_CM
 
 export class SimRobot {
   // timeScale > 1 runs motion faster than real time (tests).
-  constructor({ log, onStatus, onChange, timeScale = 1, obstacles = OBSTACLES, room = ROOM }) {
+  // encScale: per-wheel encoder scale [left, right], e.g. [1.03, 1] to emulate
+  // a slipping or worn wheel for odometry fusion tests.
+  constructor({ log, onStatus, onChange, timeScale = 1, obstacles = OBSTACLES, room = ROOM, encScale = [1, 1] }) {
     this.kind = 'sim';
     this.timeScale = timeScale;
     this.obstacles = obstacles;
@@ -85,6 +91,9 @@ export class SimRobot {
       eyes: [0, 0], floorLight: 'off', label: '',
     };
     this.startHeading = this.state.heading;
+    this.enc = [0, 0];      // cumulative wheel angles in degrees, forward-positive
+    this.encScale = encScale;
+    this.impact = null;     // { at: sim seconds, ms2 } of the last collision
     this.motion = null; // {vLin cm/s, vAng deg/s, until}
     this.connected = false;
     this.watchdog = true;
@@ -121,17 +130,31 @@ export class SimRobot {
     const n = Math.max(1, Math.ceil(Math.abs(m.vLin * dt)));
     for (let i = 0; i < n; i++) {
       s.heading += (m.vAng * dt) / n;
+      this.turnWheels(0, (m.vAng * dt) / n);
       const rad = (s.heading * Math.PI) / 180;
       const x = s.x + (Math.cos(rad) * m.vLin * dt) / n, y = s.y + (Math.sin(rad) * m.vLin * dt) / n;
       if (m.vLin && collides(x, y, this.room, this.obstacles) && !collides(s.x, s.y, this.room, this.obstacles)) {
-        // stop at contact, but still finish the rotation part of this step
+        // stop at contact, but still finish the rotation part of this step;
+        // the wheels stall and the accelerometer sees the impact
         s.heading += (m.vAng * dt * (n - i - 1)) / n;
+        this.turnWheels(0, (m.vAng * dt * (n - i - 1)) / n);
+        this.impact = { at: this.simSecs(), ms2: Math.max(8, Math.abs(m.vLin) / 100 / 0.02) };
         this.motion = null;
         break;
       }
+      this.turnWheels((m.vLin * dt) / n, 0);
       s.x = x; s.y = y;
     }
     this.onChange?.(s);
+  }
+
+  simSecs() { return (performance.now() * this.timeScale) / 1000; }
+
+  // Wheel travel for cm forward and deg of clockwise rotation.
+  turnWheels(cm, deg) {
+    const arc = ((deg * Math.PI) / 180) * (TRACK_CM / 2);
+    this.enc[0] += (cm + arc) * DEG_PER_CM * this.encScale[0];
+    this.enc[1] += (cm - arc) * DEG_PER_CM * this.encScale[1];
   }
 
   go(vLin, vAng, secs, label) {
@@ -168,11 +191,14 @@ export class SimRobot {
     if (wait) await this.settle(secs);
   }
 
-  // Differential drive; the 0.4 s timeout mirrors the robot-side watchdog.
+  // Differential drive; the timeout mirrors the robot-side watchdog. It is
+  // 0.4 s of wall-clock time at any timeScale: the page resends drive frames
+  // on a wall-clock rhythm, and a window in simulated time (5 ms at
+  // timeScale 80) would stall the wheels between frames under test load.
   drive(left, right) {
     const vl = (left / 60) * WHEEL_CM, vr = (right / 60) * WHEEL_CM;
     const vAng = ((vl - vr) / TRACK_CM) * (180 / Math.PI);
-    return this.go((vl + vr) / 2, vAng, left || right ? 0.4 : 0);
+    return this.go((vl + vr) / 2, vAng, left || right ? 0.4 * this.timeScale : 0);
   }
 
   stop() {
@@ -184,7 +210,9 @@ export class SimRobot {
   async battery() { return 87; }
 
   // Heading relative to the heading at construction, clockwise positive, -180..180.
-  async yaw() {
+  async yaw() { return this.yawNow(); }
+
+  yawNow() {
     const d = ((this.state.heading - this.startHeading) % 360 + 540) % 360 - 180;
     return Math.round(d * 10) / 10;
   }
@@ -193,11 +221,34 @@ export class SimRobot {
   // front, against walls and obstacles; 300 means nothing in range.
   async distance() {
     if (this.timer) this.tick();
+    return this.distanceNow();
+  }
+
+  distanceNow() {
     const { x, y, heading } = this.state;
     const rad = (heading * Math.PI) / 180;
     const ox = x + Math.cos(rad) * SENSOR_CM, oy = y + Math.sin(rad) * SENSOR_CM;
-    const t = Math.min(...BEAM_DEG.map((d) => raycast(ox, oy, heading + d, this.room, this.obstacles)));
+    const seen = this.obstacles.filter((o) => !o.low);
+    const t = Math.min(...BEAM_DEG.map((d) => raycast(ox, oy, heading + d, this.room, seen)));
     return Math.round(Math.min(RANGE.max, Math.max(RANGE.min, t)) * 10) / 10;
+  }
+
+  // Everything the motion sampler reads in one poll (js/motion.js): wheel
+  // angles in degrees (forward-positive), acceleration in m/s² with gravity
+  // on -z and a spike along -x for IMPACT_S after a collision, yaw, shake.
+  sensorSample() {
+    if (this.timer) this.tick();
+    const now = this.simSecs();
+    const hit = this.impact && now - this.impact.at < IMPACT_S ? this.impact.ms2 : 0;
+    return {
+      t: now * 1000,
+      distanceCm: this.distanceNow(),
+      encL: Math.round(this.enc[0] * 10) / 10,
+      encR: Math.round(this.enc[1] * 10) / 10,
+      acc: { x: -hit, y: 0, z: -G },
+      yaw: this.yawNow(),
+      shake: hit ? Math.min(100, hit * 5) : 0,
+    };
   }
 
   changed() { this.onChange?.(this.state); return Promise.resolve(); }

@@ -195,7 +195,9 @@ export class BleRobot {
     await t('acc x,y,z', "[cyberpi.get_acc('x'),cyberpi.get_acc('y'),cyberpi.get_acc('z')]");
     await t('gyro x,y,z', "[cyberpi.get_gyro('x'),cyberpi.get_gyro('y'),cyberpi.get_gyro('z')]");
     await t('rotation z', "cyberpi.get_rotation('z')");
+    await t('Encoder Winkel EM1,EM2', '[mbot2.EM_get_angle("EM1"),mbot2.EM_get_angle("EM2")]');
     await t('Encoder Winkel 1,2', '[mbot2.EM_get_angle(1),mbot2.EM_get_angle(2)]');
+    await t('Shake', 'cyberpi.get_shakeval()');
     await t('Encoder Tempo 1,2', '[mbot2.EM_get_speed(1),mbot2.EM_get_speed(2)]');
     await t('Abstand + yaw', '[cyberpi.ultrasonic2.get(1),cyberpi.get_yaw()]');
     report('Sensor-Test fertig. Bitte den Roboter jetzt von Hand etwa 90° im Uhrzeigersinn drehen und den Test erneut starten.');

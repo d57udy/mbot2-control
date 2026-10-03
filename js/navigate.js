@@ -4,12 +4,39 @@
 // Pose updates: if the PoseTracker is attached to this bus (pose.bus === bus)
 // its listener applies every successful turn/straight and the Navigator does
 // not; otherwise the Navigator applies its own moves. Either way each move is
-// applied exactly once.
+// applied exactly once. Straight legs are driven with streamed `drive`
+// commands (js/motion.js, args.leg = true) that the tracker does not see, so
+// the Navigator always applies the measured leg distance itself; the app must
+// skip its own drive integration for commands with args.leg.
+//
+// Crashes and stalls mark the contact in the map, flag the pose as uncertain,
+// rescan and relocalize. Every scan with a known map is matched against it
+// first (js/localize.js, loaded lazily; skipped if missing) and integrated at
+// the corrected pose.
 
 import { makeCommand } from './bus.js';
-import { planPath, simplifyPath, pathToMoves } from './planner.js';
+import { planPath, simplifyPath, pathToMoves, DEFAULT_INFLATE_CM } from './planner.js';
+import { driveLeg } from './motion.js';
+import { sweepScan, resampleSweep } from './scan.js';
 
 const NO_ECHO_CM = 300;
+const FRONT_CM = 10;       // robot centre to front bumper
+const CONTACT_HALF_CM = 8; // half width of the marked contact
+const CONTACT_L = 4;       // log-odds added per contact cell (clamped by the map)
+const MAX_CRASHES = 4;
+
+let localizer; // undefined = not tried, null = unavailable
+async function loadLocalizer() {
+  if (localizer === undefined) {
+    try {
+      const m = await import('./localize.js');
+      localizer = typeof m.matchScan === 'function' ? m : null;
+    } catch {
+      localizer = null;
+    }
+  }
+  return localizer;
+}
 
 function abortError(msg = 'navigation aborted') {
   const e = new Error(msg);
@@ -24,12 +51,26 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const pathLen = (p) => p.slice(1).reduce((s, q, i) => s + dist(p[i], q), 0);
 
 export class Navigator {
-  constructor({ bus, map, pose, scan, onEvent, steps = 12, safetyCm = 20, inflateCm = 14, maxLegCm = 40,
-    legsPerScan = 2, settleMs, useYaw = false, beamDeg = 16, maxRangeCm = 250 }) {
+  constructor({ bus, map, pose, scan, onEvent, steps = 12, safetyCm = 20, inflateCm = DEFAULT_INFLATE_CM, maxLegCm = 40,
+    legsPerScan = 2, settleMs, useYaw = false, beamDeg = 16, maxRangeCm = 250,
+    sampler, sample = sampler, legMode = sample ? 'drive' : 'straight', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.7, stopAtCm = 15 }) {
+    // sampler (alias sample): js/motion.js sampler for legs and sweeps; with one,
+    // scans default to 'sweep' = continuous rotation, else 'step' = stop-and-measure
+    this.scanMode = scanMode;
+    this.sweepDegS = sweepDegS;
     Object.assign(this, { bus, map, pose, scanFn: scan, onEvent, steps, safetyCm, inflateCm, maxLegCm, legsPerScan, settleMs, useYaw, beamDeg, maxRangeCm });
+    // legMode 'drive': driveLeg with sensor polling (default with a sampler);
+    // 'straight': blocking gyro straight (default without one, because a
+    // time-based leg estimate is worse than the robot's own straight())
+    // localizer: a { matchScan, fusePose } object instead of ./localize.js (tests).
+    // odomWeight: trust in odometry for routine scans; after a crash it drops to 0.1.
+    // stopAtCm: in-leg ultrasonic stop; below safetyCm, which already shortens the leg.
+    Object.assign(this, { legMode, legRpm, sample, motionOpts, localize, localizer, minMatchConfidence, odomWeight, stopAtCm });
     this.lastPath = null;
     this.goal = null;
     this.busy = false;
+    this.poseUncertain = false;
+    this.contacts = []; // map points where the robot hit something; kept occupied
   }
 
   emit(ev) { try { this.onEvent?.(ev); } catch { /* UI errors must not break navigation */ } }
@@ -82,9 +123,12 @@ export class Navigator {
 
   // Integrates each point as it arrives so the map view updates live.
   async doScan(mk, signal) {
-    const at = this.pose.pose;
+    if (this.scanMode === 'sweep' && this.sample) return this.doSweep(mk, signal);
+    let at = this.pose.pose;
     const opts = { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, freeBeamDeg: Math.max(this.beamDeg, 360 / this.steps) };
-    const onPoint = (p) => this.map.integrateScan(at, [p], opts);
+    // with a known map, match first and integrate at the corrected pose
+    const loc = this.localize && this.mapKnown() ? (this.localizer ?? await loadLocalizer()) : null;
+    const onPoint = loc ? null : (p) => this.map.integrateScan(at, [p], opts);
     let res;
     try {
       res = await this.scanFn(this.bus, { steps: this.steps, signal, makeCommand: mk, onPoint, settleMs: this.settleMs });
@@ -93,12 +137,113 @@ export class Navigator {
       if (/cancelled by stop/.test(e?.message ?? '')) throw new Cancelled(e.message);
       throw e;
     }
+    if (loc) {
+      at = this.relocalize(loc, at, res.points) ?? at;
+      this.map.integrateScan(at, res.points, opts);
+    }
+    this.markContacts();
     // scan() turns a full circle; with steps that do not divide 360 the bus
     // rounds each turn, so apply the residue when the tracker is not attached
     if (this.selfPose) this.pose.applyTurn(Math.round(360 / this.steps) * this.steps - 360);
     this.scannedAt = at;
     this.emit({ type: 'scan', pose: at, points: res.points });
     return { ok: true, points: res.points };
+  }
+
+  // Continuous rotation scan: dense points relative to the heading at the start.
+  // The sweep uses drive frames, which no pose listener counts, so its net
+  // rotation (turnedDeg) is applied here in every wiring.
+  async doSweep(mk, signal) {
+    let at = this.pose.pose;
+    const loc = this.localize && this.mapKnown() ? (this.localizer ?? await loadLocalizer()) : null;
+    let res;
+    try {
+      res = await sweepScan(this.bus, { sample: this.sample, makeCommand: mk, signal, speedDegS: this.sweepDegS });
+    } catch (e) {
+      // a bus stop surfaces as AbortError from sweepScan; only the signal is a real abort
+      if (e?.name === 'AbortError' && !signal?.aborted) throw new Cancelled(e.message);
+      if (e?.name === 'AbortError') throw e;
+      if (/cancelled by stop/.test(e?.message ?? '')) throw new Cancelled(e.message);
+      throw e;
+    }
+    const mapPoints = resampleSweep(res.points, 5);
+    if (loc) at = this.relocalize(loc, at, resampleSweep(res.points, 10)) ?? at;
+    this.map.integrateScan(at, mapPoints, { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, freeBeamDeg: this.beamDeg });
+    this.markContacts();
+    this.pose.applyTurn(res.turnedDeg ?? 0); // relocalize() already moved the estimate if it matched
+    this.scannedAt = at;
+    this.emit({ type: 'scan', pose: at, points: mapPoints, method: 'sweep', samples: res.samples });
+    return { ok: true, points: mapPoints, method: 'sweep' };
+  }
+
+  mapKnown() { return (this.map.stats?.().knownM2 ?? 0) > 0.3; }
+
+  // Scan matching around the odometry pose (wider when uncertain), fused with
+  // odometry. Returns the new pose, or null if nothing was applied.
+  relocalize(loc, guess, points) {
+    const beams = (points ?? []).filter((p) => p.cm != null && p.cm > 0 && p.cm < NO_ECHO_CM);
+    if (beams.length < 4) return null;
+    try {
+      const wide = this.poseUncertain;
+      const m = loc.matchScan(this.map, guess, beams, wide ? { xyWindowCm: 60, angWindowDeg: 30 } : {});
+      if (!m?.pose) return null;
+      const minConfidence = this.minMatchConfidence;
+      const fused = loc.fusePose
+        ? loc.fusePose(guess, m, { odomWeight: wide ? 0.1 : this.odomWeight, ...(minConfidence != null ? { minConfidence } : {}) })
+        : { pose: m.pose, source: (m.confidence ?? 0) >= (minConfidence ?? 0.5) ? 'scan' : 'odom' };
+      const p = fused?.pose;
+      if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return null;
+      const correction = { dx: p.x - guess.x, dy: p.y - guess.y, dHeading: normDeg((p.heading ?? guess.heading) - guess.heading) };
+      const used = fused.source !== 'odom';
+      if (used) {
+        this.setPose({ x: p.x, y: p.y, heading: p.heading ?? guess.heading });
+        this.poseUncertain = false;
+      }
+      this.emit({ type: 'localized', correction, confidence: m.confidence, source: fused.source ?? (used ? 'scan' : 'odom'), pose: this.pose.pose });
+      return used ? this.pose.pose : null;
+    } catch (e) {
+      this.emit({ type: 'localized', error: e?.message ?? String(e), confidence: 0, source: 'odom' });
+      return null;
+    }
+  }
+
+  // Moves the estimate without resetting the trail; keeps later gyro
+  // corrections consistent with the new heading.
+  setPose({ x, y, heading }) {
+    const t = this.pose;
+    const dh = normDeg(heading - t.heading);
+    t.x = x; t.y = y; t.heading = normDeg(heading);
+    if (t.yawRef != null) t.yawRef = normDeg(t.yawRef - dh);
+    t.mark?.();
+  }
+
+  // Marks a contact in front of the robot (after any back-off) and remembers
+  // it, because the ultrasonic may not see what was hit and free cones from
+  // later scans would erase it.
+  addContact(aheadCm) {
+    const { x, y, heading } = this.pose.pose;
+    const h = (heading * Math.PI) / 180, fx = Math.sin(h), fy = Math.cos(h);
+    const step = this.map.cellCm / 2;
+    for (let l = -CONTACT_HALF_CM; l <= CONTACT_HALF_CM + 1e-9; l += step) {
+      this.contacts.push({ x: x + fx * aheadCm + fy * l, y: y + fy * aheadCm - fx * l });
+    }
+    this.markContacts();
+  }
+
+  markContacts() {
+    if (!this.contacts.length) return;
+    const m = this.map;
+    if (typeof m.add === 'function' && typeof m.index === 'function') {
+      for (const c of this.contacts) { const k = m.index(c.x, c.y); if (k >= 0) m.add(k, CONTACT_L); }
+      m.touch?.();
+    } else {
+      // fallback: a narrow beam at each contact point
+      for (const c of this.contacts) {
+        const p = this.pose.pose;
+        const ang = normDeg((Math.atan2(c.x - p.x, c.y - p.y) * 180) / Math.PI - p.heading);
+        m.integrateScan(p, [{ angle: ang, cm: Math.hypot(c.x - p.x, c.y - p.y) }], { beamDeg: 4, sensorOffsetCm: 0, robotRadiusCm: 0 });
+      }
+    }
   }
 
   // Forward reading at the current heading, integrated into the map.
@@ -133,6 +278,35 @@ export class Navigator {
     return true;
   }
 
+  // One straight leg. Returns the driveLeg result (reason, droveCm, ...).
+  async leg(mk, signal, cm) {
+    if (this.legMode === 'straight') {
+      const ok = await this.straight(mk, signal, cm);
+      return { ok, reason: ok ? 'done' : 'error', droveCm: ok ? cm : 0, note: ok ? undefined : 'straight failed' };
+    }
+    this.checkAbort(signal);
+    const r = await driveLeg(this.bus, {
+      cm, speed: this.legRpm, makeCommand: mk, signal, sample: this.sample, stopAtCm: this.stopAtCm, opts: this.motionOpts,
+    });
+    // the drive commands are not seen by the tracker: apply the measured leg here
+    if (r.droveCm) {
+      const dh = r.encHeading ?? 0;
+      if (dh) this.pose.applyTurn(dh / 2);
+      this.pose.applyStraight(r.droveCm);
+      if (dh) this.pose.applyTurn(dh / 2);
+    }
+    if (r.reason === 'aborted') {
+      this.checkAbort(signal);
+      throw new Cancelled(r.note ?? 'cancelled by stop');
+    }
+    const last = r.samples?.at(-1);
+    if (last?.distanceCm != null) {
+      this.map.integrateScan(this.pose.pose, [{ angle: 0, cm: last.distanceCm }], { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm });
+    }
+    if (r.reason !== 'error') await this.correctYaw(mk, signal);
+    return r;
+  }
+
   // Enough known cells within 40 cm to plan the first leg?
   knowsSurroundings() {
     const { x, y } = this.pose.pose;
@@ -161,6 +335,7 @@ export class Navigator {
   }
 
   plan(goal) {
+    this.markContacts();
     const opts = { inflateCm: this.inflateCm, allowUnknown: true };
     const raw = planPath(this.map, this.pose.pose, goal, opts);
     return raw ? simplifyPath(raw, this.map, opts) : null;
@@ -174,7 +349,7 @@ export class Navigator {
     goal = { x: Number(goal.x), y: Number(goal.y) };
     if (!Number.isFinite(goal.x) || !Number.isFinite(goal.y)) return { ok: false, reached: false, pose: this.pose.pose, legs: 0, note: 'invalid goal' };
     this.goal = goal;
-    let legs = 0, sinceScan = 0, blocked = 0, scannedHere = false;
+    let legs = 0, sinceScan = 0, blocked = 0, crashes = 0, scannedHere = false;
     const done = (ok, reached, note) => {
       const r = { ok, reached, pose: this.pose.pose, legs, note };
       if (reached) this.emit({ type: 'arrived', ...r, goal });
@@ -216,11 +391,23 @@ export class Navigator {
         this.emit({ type: 'replan', reason: 'blocked' });
         continue;
       }
-      if (!(await this.straight(mk, signal, cm))) return done(false, false, 'straight failed');
+      const lr = await this.leg(mk, signal, cm);
+      if (lr.reason === 'error') return done(false, false, `straight failed: ${lr.note ?? ''}`.trim());
       legs++;
       sinceScan++;
       scannedHere = false;
-      this.emit({ type: 'leg', leg: legs, turnDeg: m.turnDeg, cm, readingCm: reading, pose: this.pose.pose });
+      this.emit({ type: 'leg', leg: legs, turnDeg: m.turnDeg, cm, droveCm: lr.droveCm, reason: lr.reason, readingCm: reading, pose: this.pose.pose });
+      if (lr.reason === 'crash' || lr.reason === 'stall') {
+        crashes++;
+        this.addContact((lr.backedCm ?? 0) + FRONT_CM);
+        this.poseUncertain = true;
+        this.emit({ type: 'crash', reason: lr.detail ?? lr.reason, droveCm: lr.droveCm, backedCm: lr.backedCm, pose: this.pose.pose });
+        if (crashes >= MAX_CRASHES) return done(false, false, `gave up after ${crashes} collisions`);
+        this.emit({ type: 'replan', reason: 'crash' });
+        await rescan();
+        continue;
+      }
+      if (lr.reason === 'obstacle') this.emit({ type: 'blocked', readingCm: lr.samples?.at(-1)?.distanceCm, pose: this.pose.pose });
       if (sinceScan >= this.legsPerScan && dist(this.pose.pose, goal) > tolCm) await rescan();
     }
     const d = dist(this.pose.pose, goal);

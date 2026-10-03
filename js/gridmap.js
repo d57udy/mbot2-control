@@ -7,14 +7,44 @@
 // falls off toward the beam edges: the centre becomes occupied after one scan,
 // the edges need confirmation, and free cones from other poses erode the
 // false part of the arc. Planning inflates obstacles on top of that.
+//
+// Occupied evidence is protected: thin obstacles (a table leg) are seen by
+// one beam of one scan and missed by the neighbours, so free evidence on a
+// cell that already holds hit evidence (L > 0) only counts from the core of
+// a real beam at short range. The widened gap filler (freeBeamDeg) never
+// erodes it, the beam edges only weakly, and long ranges less than short ones.
 
 const L_FREE = -0.7;
 const L_OCC = 1.2;
 const L_MIN = -4;
 const L_MAX = 4;
-const L_THRESH = 0.5;   // |log-odds| above this is known (p < 0.38 or p > 0.62)
+export const L_THRESH = 0.5;   // |log-odds| above this is known (p < 0.38 or p > 0.62)
+export const L_SUSPECT = 0.15; // weak hit evidence (arc edges, eroded hits); the planner avoids it
 const EDGE_OCC = 0.35;  // occupied weight at the beam edge relative to the centre
+const WIDE_FREE = 0.5;  // free weight of rays outside the real beam
 const WIDE_REACH = 0.7; // free reach of rays outside the real beam, as a fraction of the range
+const EDGE_FREE_ON_HIT = 0.3;  // free weight of the beam edge on a cell with hit evidence
+const SURE_FREE_CM = 80;       // core free evidence on hit cells is full up to this range
+const FAR_FREE_ON_HIT = 0.3;   // ... and falls to this fraction at maxRange
+
+// 1D squared distance transform of f (0 at sites, large elsewhere) into d.
+function edt1d(f, n, d, v, z) {
+  let k = 0;
+  v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+  for (let q = 1; q < n; q++) {
+    const at = (p) => ((f[q] + q * q) - (f[p] + p * p)) / (2 * q - 2 * p);
+    let s = at(v[k]);
+    while (s <= z[k]) s = at(v[--k]);   // z[0] = -Infinity ends the loop
+    k++;
+    v[k] = q; z[k] = s; z[k + 1] = Infinity;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    const p = v[k];
+    d[q] = (q - p) * (q - p) + f[p];
+  }
+}
 
 const rad = (d) => (d * Math.PI) / 180;
 const deg = (r) => (r * 180) / Math.PI;
@@ -70,7 +100,8 @@ export class GridMap {
       for (let i = ci - r; i <= ci + r; i++) {
         if (!this.inside(i, j)) continue;
         const k = j * this.n + i, c = this.centre(k);
-        if (Math.hypot(c.x - x, c.y - y) <= rCm) this.add(k, 2 * L_FREE);
+        // a pose error must not wipe a known obstacle in one go
+        if (Math.hypot(c.x - x, c.y - y) <= rCm) this.add(k, (this.L[k] > 0 ? 0.5 : 2) * L_FREE);
       }
     }
     this.touch();
@@ -80,9 +111,10 @@ export class GridMap {
   // robot turns in place while scanning, so the sensor sits sensorOffsetCm
   // along each beam's direction. freeBeamDeg (default beamDeg) widens only the
   // free cone, e.g. to cover the gaps between coarse scan steps. The widened
-  // part says less: it counts 0.75 (still free after one pass) and reaches
-  // only WIDE_REACH of the range, so a wall seen at a slant whose perpendicular
-  // lies in the widened part is not cleared through.
+  // part was not looked at, so it says less: it counts WIDE_FREE (unknown
+  // after one pass, free after two overlapping ones) and reaches only
+  // WIDE_REACH of the range, so a wall seen at a slant or a box between two
+  // scan directions is not cleared through.
   integrateScan(pose, points, { sensorOffsetCm = 6, beamDeg = 16, maxRangeCm = 250, freeBeamDeg = beamDeg, robotRadiusCm = 9 } = {}) {
     const halfOcc = beamDeg / 2, halfFree = Math.max(freeBeamDeg, beamDeg) / 2;
     for (const p of points ?? []) {
@@ -93,7 +125,8 @@ export class GridMap {
       const sy = pose.y + sensorOffsetCm * Math.cos(rad(dir));
       const hit = cm < maxRangeCm;
       const range = hit ? cm : maxRangeCm;
-      const free = new Map(), occ = new Map();
+      // free: weight on cells without hit evidence; keep: weight on cells with it
+      const free = new Map(), keep = new Map(), occ = new Map();
       // enough rays that neighbours are at most one cell apart at full range
       const nRays = Math.max(3, Math.ceil(rad(2 * halfFree) * range / this.cellCm) + 1);
       for (let r = 0; r < nRays; r++) {
@@ -101,11 +134,18 @@ export class GridMap {
         const a = rad(dir + off);
         const dx = Math.sin(a), dy = Math.cos(a);
         const inBeam = Math.abs(off) <= halfOcc + 1e-9;
-        const wFree = inBeam ? 1 : 0.75;
+        const inCore = Math.abs(off) <= halfOcc / 2 + 1e-9;
+        const wFree = inBeam ? 1 : WIDE_FREE;
+        const wKeep = inCore ? 1 : inBeam ? EDGE_FREE_ON_HIT : 0;
         const freeTo = (hit ? range - this.cellCm : range) * (inBeam ? 1 : WIDE_REACH);
         for (let t = 0; t <= freeTo; t += this.cellCm / 2) {
           const k = this.index(sx + dx * t, sy + dy * t);
-          if (k >= 0 && !(free.get(k) >= wFree)) free.set(k, wFree);
+          if (k < 0) continue;
+          if (!(free.get(k) >= wFree)) free.set(k, wFree);
+          const far = t <= SURE_FREE_CM ? 1
+            : Math.max(FAR_FREE_ON_HIT, 1 - ((1 - FAR_FREE_ON_HIT) * (t - SURE_FREE_CM)) / Math.max(1, maxRangeCm - SURE_FREE_CM));
+          const wk = wKeep * far;
+          if (!(keep.get(k) >= wk)) keep.set(k, wk);
         }
         if (hit && inBeam) {
           const w = 1 - (1 - EDGE_OCC) * (halfOcc ? Math.abs(off) / halfOcc : 0);
@@ -114,11 +154,41 @@ export class GridMap {
         }
       }
       for (const k of occ.keys()) free.delete(k);
-      for (const [k, w] of free) this.add(k, L_FREE * w);
+      for (const [k, w] of free) this.add(k, L_FREE * (this.L[k] > 0 ? keep.get(k) : w));
       for (const [k, w] of occ) this.add(k, L_OCC * w);
     }
     if (robotRadiusCm > 0) this.markFree(pose.x, pose.y, robotRadiusCm);
     else this.touch();
+  }
+
+  // Float32Array: distance in cm from each cell centre to the nearest cell
+  // centre with log-odds above threshold (Infinity if there is none). Exact
+  // Euclidean distance transform (Felzenszwalb), cached per map version.
+  distanceField(threshold = L_THRESH) {
+    const key = `df${threshold}`;
+    let d = this.cache.get(key);
+    if (d) return d;
+    const n = this.n, INF = 1e20;
+    const g = new Float64Array(n * n);
+    for (let k = 0; k < g.length; k++) g[k] = this.L[k] > threshold ? 0 : INF;
+    const f = new Float64Array(n), out = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+    const pass = (get, set) => {
+      for (let q = 0; q < n; q++) f[q] = get(q);
+      edt1d(f, n, out, v, z);
+      for (let q = 0; q < n; q++) set(q, out[q]);
+    };
+    for (let i = 0; i < n; i++) pass((q) => g[q * n + i], (q, x) => { g[q * n + i] = x; });
+    for (let j = 0; j < n; j++) pass((q) => g[j * n + q], (q, x) => { g[j * n + q] = x; });
+    d = new Float32Array(n * n);
+    for (let k = 0; k < d.length; k++) d[k] = g[k] >= INF / 2 ? Infinity : Math.sqrt(g[k]) * this.cellCm;
+    this.cache.set(key, d);
+    return d;
+  }
+
+  // Distance in cm from (x, y) to the nearest occupied cell centre.
+  clearance(x, y, threshold = L_THRESH) {
+    const k = this.index(x, y);
+    return k < 0 ? 0 : this.distanceField(threshold)[k];
   }
 
   // Uint8Array, 1 = an occupied cell lies within inflateCm (cached per version).
@@ -126,17 +196,9 @@ export class GridMap {
     const key = `inf${inflateCm}`;
     let m = this.cache.get(key);
     if (m) return m;
-    const n = this.n, r = Math.ceil(inflateCm / this.cellCm);
-    const offs = [];
-    for (let dj = -r; dj <= r; dj++) {
-      for (let di = -r; di <= r; di++) if (Math.hypot(di, dj) * this.cellCm <= inflateCm) offs.push([di, dj]);
-    }
-    m = new Uint8Array(n * n);
-    for (let k = 0; k < this.L.length; k++) {
-      if (this.L[k] <= L_THRESH) continue;
-      const i = k % n, j = (k - i) / n;
-      for (const [di, dj] of offs) if (this.inside(i + di, j + dj)) m[(j + dj) * n + i + di] = 1;
-    }
+    const d = this.distanceField();
+    m = new Uint8Array(this.n * this.n);
+    for (let k = 0; k < m.length; k++) if (d[k] <= inflateCm + 1e-6) m[k] = 1;
     this.cache.set(key, m);
     return m;
   }

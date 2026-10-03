@@ -1,7 +1,10 @@
 // Run with: npm test
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { scan, findOpenings, describeScan, driveToward, explore, normAngle } from '../js/scan.js';
+import {
+  scan, findOpenings, describeScan, driveToward, explore, normAngle,
+  sweepScan, resampleSweep, spinRpmForRate, encoderRotationDeg,
+} from '../js/scan.js';
 import { SimRobot, SIM_ROOM, SIM_OBSTACLES, raycast, collides } from '../js/robot-sim.js';
 import { CommandBus, makeCommand } from '../js/bus.js';
 
@@ -136,6 +139,16 @@ test('findOpenings: prefers wide and deep openings', () => {
   assert.equal(o[0].angle, -90);
 });
 
+test('describeScan: dense sweeps are summarised as at most 12 directions', () => {
+  const dense = Array.from({ length: 120 }, (_, i) => ({ angle: normAngle(i * 3), cm: i * 3 === 90 ? 25 : 150 }));
+  const s = describeScan(dense);
+  const dirs = s.match(/: (.*?)\. Nearest/)[1].split(' ');
+  assert.equal(dirs.length, 12);
+  assert.ok(s.length < 400, `length ${s.length}`);
+  assert.match(s, /90:25/);
+  assert.match(s, /Nearest 25cm at 90°/);
+});
+
 test('describeScan: compact and explicit', () => {
   const p = pts([85, 40, 120, 300, 80, 20, null, 60, 20, 20, 20, 20]);
   const s = describeScan(p);
@@ -240,4 +253,246 @@ test('integration: scan with SimRobot + CommandBus finds the pouf ahead and the 
   } finally {
     await sim.disconnect();
   }
+});
+
+// --- continuous sweep ----------------------------------------------------
+
+test('spin and encoder geometry', () => {
+  // 45 deg/s: rim speed = 2 pi 6 cm / 8 s = 4.71 cm/s, i.e. 13.85 RPM on a 6.5 cm wheel
+  assert.ok(Math.abs(spinRpmForRate(45) - 13.846) < 0.01);
+  // one full robot turn: each wheel rolls pi * 12 cm = 664.6 degrees of wheel rotation
+  const wheelDeg = (Math.PI * 12) / (Math.PI * 6.5) * 360;
+  assert.ok(Math.abs(encoderRotationDeg(wheelDeg, -wheelDeg) - 360) < 1e-9);
+});
+
+const pos360 = (a) => ((a % 360) + 360) % 360;
+// Ramp room: the distance encodes the true direction (50 cm at 0°, 229.5 cm at 359°).
+const rampRoom = (h) => 50 + pos360(h) / 2;
+const truthOf = (cm) => (cm - 50) * 2;
+
+// A robot spinning in real time `scale` times faster than commanded, with a
+// sampler that reads distance `latencyMs` before the yaw.
+function sweepWorld({ scale = 40, latencyMs = 0, yawSign = 1, yawOffset = 170, yaw = true, enc = false,
+  room = rampRoom, periodMs = 5, failSampleAt = -1, failDriveAt = -1, onSample } = {}) {
+  const w = { log: [{ t: performance.now(), heading: 0, rate: 0 }], drives: [], stops: 0, events: [], samples: 0 };
+  w.heading = (t) => {
+    let e = w.log[0];
+    for (const x of w.log) if (x.t <= t) e = x;
+    return e.heading + (e.rate * Math.max(0, t - e.t)) / 1000;
+  };
+  const setRate = (rate) => {
+    const t = performance.now();
+    w.log.push({ t, heading: w.heading(t), rate });
+  };
+  w.bus = {
+    submit: async (c) => {
+      if (c.cmd === 'drive') {
+        if (w.drives.length === failDriveAt) return { ok: false, error: 'cancelled by stop' };
+        w.drives.push(c.args);
+        w.events.push('drive');
+        const rpm = (c.args.left - c.args.right) / 2;
+        setRate(((rpm * 360 * 6.5) / (60 * 12)) * scale);
+      } else if (c.cmd === 'stop') {
+        w.stops++; w.events.push('stop'); setRate(0);
+      }
+      return { ok: true };
+    },
+    stop: async () => { w.stops++; w.events.push('stop'); setRate(0); return { ok: true }; },
+  };
+  w.sample = async () => {
+    await new Promise((r) => setTimeout(r, periodMs));
+    if (w.samples++ === failSampleAt) throw new Error('link lost');
+    onSample?.(w);
+    const t = performance.now();
+    const h = w.heading(t);
+    const s = { t, distanceCm: Math.round(room(w.heading(t - latencyMs)) * 10) / 10 };
+    if (yaw) s.yaw = normAngle(yawSign * h + yawOffset);
+    if (enc) {
+      const wheel = (h * 12) / 6.5;
+      Object.assign(s, { encL: 1000 + wheel, encR: -500 - wheel });
+    }
+    return s;
+  };
+  return w;
+}
+
+const angleErrors = (points) => points
+  .filter((p) => { const tr = truthOf(p.cm); return tr > 6 && tr < 354; })
+  .map((p) => Math.abs(normAngle(p.angle - truthOf(p.cm))));
+
+test('sweepScan: yaw with latency compensation, wrap at ±180, full coverage, stops', async () => {
+  const w = sweepWorld({ latencyMs: 20 });
+  const seen = [];
+  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 20, onPoint: (p) => seen.push(p) });
+  assert.equal(r.method, 'sweep');
+  assert.equal(r.rotationSource, 'yaw');
+  assert.equal(r.yawSign, 1);
+  assert.equal(r.coverageDeg, 360);
+  assert.ok(Math.abs(r.totalTurnDeg - w.heading(performance.now())) < 2, `turned ${r.totalTurnDeg}`);
+  assert.equal(r.turnedDeg, normAngle(r.totalTurnDeg));
+  assert.ok(r.turnedDeg >= 15 && r.turnedDeg < 60, `net ${r.turnedDeg}`);
+  assert.ok(w.drives.every((d) => d.leg === true));
+  assert.ok(r.points.length >= 40, `points ${r.points.length}`);
+  assert.ok(seen.length >= r.points.length);
+  const err = angleErrors(r.points);
+  assert.ok(Math.max(...err) <= 3, `max error ${Math.max(...err)}`);
+  // sorted, normalised, distinct
+  for (let i = 1; i < r.points.length; i++) assert.ok(r.points[i].angle > r.points[i - 1].angle);
+  assert.ok(r.points.every((p) => p.angle > -180 && p.angle <= 180));
+  // clockwise spin: left forward, right backward; ends with a stop and no drive after it
+  assert.ok(w.drives.every((d) => d.left > 0 && d.right === -d.left));
+  assert.equal(w.events.at(-1), 'stop');
+  assert.equal(w.stops, 1);
+});
+
+test('sweepScan: without compensation the same latency shifts the angles', async () => {
+  const w = sweepWorld({ latencyMs: 20 });
+  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
+  const err = angleErrors(r.points);
+  const mean = err.reduce((a, b) => a + b, 0) / err.length;
+  assert.ok(mean > 5, `mean error ${mean}`);
+});
+
+test('sweepScan: detects a reversed gyro sign', async () => {
+  const w = sweepWorld({ yawSign: -1, yawOffset: -100 });
+  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
+  assert.equal(r.yawSign, -1);
+  assert.ok(r.totalTurnDeg >= 380, `turned ${r.totalTurnDeg}`);
+  assert.equal(r.coverageDeg, 360);
+  const err = angleErrors(r.points);
+  assert.ok(Math.max(...err) <= 3, `max error ${Math.max(...err)}`);
+});
+
+test('sweepScan: counterclockwise with negative speed', async () => {
+  const w = sweepWorld({ yawSign: -1 });
+  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, speedDegS: -45 });
+  assert.ok(w.drives.every((d) => d.left < 0 && d.right === -d.left));
+  assert.equal(r.yawSign, -1);
+  assert.ok(r.totalTurnDeg <= -380, `turned ${r.totalTurnDeg}`);
+  assert.ok(r.turnedDeg < 0 && r.turnedDeg > -60, `net ${r.turnedDeg}`);
+  const err = angleErrors(r.points);
+  assert.ok(Math.max(...err) <= 3, `max error ${Math.max(...err)}`);
+});
+
+test('sweepScan: falls back to encoders, then to commanded rate x time', async () => {
+  let w = sweepWorld({ yaw: false, enc: true });
+  let r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
+  assert.equal(r.rotationSource, 'encoder');
+  assert.equal(r.coverageDeg, 360);
+  let err = angleErrors(r.points);
+  assert.ok(Math.max(...err) <= 3, `encoder max error ${Math.max(...err)}`);
+
+  // time: tell the sweep a track width that matches the faster test world
+  w = sweepWorld({ yaw: false, scale: 6 });
+  r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, trackCm: 2, speedDegS: 600 });
+  assert.equal(r.rotationSource, 'time');
+  assert.equal(r.coverageDeg, 360);
+  err = angleErrors(r.points);
+  const mean = err.reduce((a, b) => a + b, 0) / err.length;
+  assert.ok(mean <= 6, `time mean error ${mean}`); // coarse: command delays are not modelled
+  assert.equal(w.events.at(-1), 'stop');
+});
+
+test('sweepScan: drops invalid readings, keeps no-echo, merges duplicates', async () => {
+  const room = (h) => (pos360(h) < 90 ? 1 : pos360(h) < 180 ? 300 : 120);
+  const w = sweepWorld({ room });
+  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, mergeDeg: 5 });
+  assert.ok(r.points.every((p) => p.cm > 2));
+  assert.ok(!r.points.some((p) => p.angle > 3 && p.angle < 87), 'invalid sector dropped');
+  assert.ok(r.points.some((p) => p.cm === 300));
+  for (let i = 1; i < r.points.length; i++) assert.ok(r.points[i].angle - r.points[i - 1].angle >= 2.5);
+});
+
+test('sweepScan: abort stops the robot and throws AbortError', async () => {
+  const ac = new AbortController();
+  const w = sweepWorld({ onSample: (x) => { if (x.samples === 10) ac.abort(); } });
+  await assert.rejects(sweepScan(w.bus, { sample: w.sample, signal: ac.signal }), { name: 'AbortError' });
+  assert.ok(w.stops >= 1);
+  assert.equal(w.events.at(-1), 'stop');
+
+  const pre = new AbortController(); pre.abort();
+  const w2 = sweepWorld();
+  await assert.rejects(sweepScan(w2.bus, { sample: w2.sample, signal: pre.signal }), { name: 'AbortError' });
+  assert.equal(w2.samples, 0);
+  assert.equal(w2.events.at(-1), 'stop');
+});
+
+test('sweepScan: a failing sample, a bus stop or a timeout still stops the robot', async () => {
+  let w = sweepWorld({ failSampleAt: 5 });
+  await assert.rejects(sweepScan(w.bus, { sample: w.sample }), /link lost/);
+  assert.equal(w.events.at(-1), 'stop');
+
+  w = sweepWorld({ failDriveAt: 2, periodMs: 40 });
+  await assert.rejects(sweepScan(w.bus, { sample: w.sample, keepaliveMs: 30 }), { name: 'AbortError' });
+  assert.equal(w.events.at(-1), 'stop');
+
+  w = sweepWorld();
+  const hang = () => new Promise(() => {});
+  await assert.rejects(sweepScan(w.bus, { sample: hang, sampleTimeoutMs: 50 }), /sample timeout/);
+  assert.equal(w.events.at(-1), 'stop');
+
+  w = sweepWorld({ scale: 1 });
+  const r = await sweepScan(w.bus, { sample: w.sample, maxDurationMs: 150 });
+  assert.ok(r.coverageDeg < 360, `coverage ${r.coverageDeg}`);
+  assert.equal(w.events.at(-1), 'stop');
+  assert.equal(w.stops, 1);
+});
+
+test('resampleSweep: even bins, nearest echo per bin, null for empty bins', () => {
+  const pts = [
+    { angle: 0.8, cm: 80 }, { angle: -1.2, cm: 60 }, { angle: 4, cm: 100 },
+    { angle: 179, cm: 40 }, { angle: -179.5, cm: 30 }, { angle: 90, cm: null },
+  ];
+  const b = resampleSweep(pts, 3);
+  assert.equal(b.length, 120);
+  assert.deepEqual(b.slice(0, 3).map((p) => p.angle), [0, 3, 6]);
+  assert.equal(b.find((p) => p.angle === 0).cm, 60);
+  assert.equal(b.find((p) => p.angle === 3).cm, 100);
+  assert.equal(b.find((p) => p.angle === 180).cm, 30);
+  assert.equal(b.find((p) => p.angle === 90).cm, null);
+  assert.equal(resampleSweep([], 30).length, 12);
+});
+
+test('findOpenings: dense uneven sweep points', () => {
+  // open from 60 to 120 degrees, readings every 2.5 to 4.5 degrees
+  const pts = [];
+  for (let a = 0, i = 0; a < 360; a += i++ % 2 ? 2.5 : 4.5) pts.push({ angle: normAngle(a), cm: a >= 60 && a <= 120 ? 200 : 30 });
+  const o = findOpenings(pts);
+  assert.equal(o.length, 1);
+  assert.ok(Math.abs(o[0].angle - 90) <= 3, `angle ${o[0].angle}`);
+  assert.ok(Math.abs(o[0].widthDeg - 63) <= 5, `width ${o[0].widthDeg}`);
+});
+
+test('integration: sweepScan with SimRobot and the motion sampler', async (t) => {
+  const motion = await import('../js/motion.js').catch(() => null);
+  if (!motion?.makeSimSampler || typeof SimRobot.prototype.sensorSample !== 'function') {
+    t.skip('js/motion.js makeSimSampler or SimRobot.sensorSample not available yet');
+    return;
+  }
+  const sim = new SimRobot({ log: stub, onStatus: stub, timeScale: 25 });
+  const bus = new CommandBus({ log() {} });
+  bus.setRobot(sim);
+  await sim.connect();
+  try {
+    // facing left (-x) toward the pouf, chair behind (as in the step scan test)
+    Object.assign(sim.state, { x: 120, y: 150, heading: 180 });
+    const r = await sweepScan(bus, { sample: motion.makeSimSampler(sim), makeCommand: bus.stamped() });
+    assert.equal(r.rotationSource, 'yaw');
+    assert.ok(r.coverageDeg >= 359, `coverage ${r.coverageDeg}`);
+    const near = (a) => Math.min(...r.points.filter((p) => Math.abs(normAngle(p.angle - a)) <= 6).map((p) => p.cm));
+    assert.ok(Math.abs(near(0) - 29) < 4, `front ${near(0)}`);
+    assert.ok(Math.abs(near(180) - 102) < 6, `back ${near(180)}`);
+    assert.ok(Math.abs(near(-90) - 44) < 5, `left ${near(-90)}`);
+    assert.ok(near(90) > 90, `right ${near(90)}`);
+  } finally {
+    await sim.disconnect();
+  }
+});
+
+test('findOpenings ignores empty readings inside an open area', () => {
+  const pts = [];
+  for (let a = -180; a < 180; a += 5) pts.push({ angle: a, cm: a % 20 === 0 ? null : 120 });
+  const o = findOpenings(pts);
+  assert.equal(o.length, 1);
+  assert.equal(o[0].widthDeg, 360);
 });

@@ -170,4 +170,7 @@ details input[type="password"] { flex: 1; font: inherit; color: var(--text); bac
 .speed-presets { margin: 0; }
 .speed-presets button { flex: 1; }
 .speed-presets button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
-#map { width: 100%; max-width: 480px; aspect-ratio: 1; display: block; margin: 8px auto; touch-action: manipulation; cursor: crosshair; }
+#map { width: 100%; max-width: 480px; aspect-ratio: 1; display: block; margin: 8px auto; touch-action: none; cursor: grab; }
+#map-name { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.file-btn { border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; cursor: pointer; }
+.file-btn input { display: none; }

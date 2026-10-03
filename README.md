@@ -1,8 +1,10 @@
 # mBot2 Control
 
+**Open the app: https://d57udy.github.io/mbot2-control/** (Chrome on Android or desktop)
+
 Drive a Makeblock mBot2 from a phone browser over Web Bluetooth, with German or English voice commands. Static site, intended for GitHub Pages. No code is uploaded to the robot; the page uses CyberPi's Live Mode protocol.
 
-Status: v0.4 (mapping and navigation, simulator-tested; UAT in `docs/UAT-v0.4.md`). v0.3: Basic Bluetooth driving confirmed on a real mBot2. Joystick, watchdog, lights, floor sensor, environment scan and AI conversation are tested with unit and simulator integration tests; hardware acceptance tests are in `docs/UAT-v0.3.md`.
+Status: v0.5 (continuous scans, crash detection, scan matching, saved maps, installable app; simulator-tested, UAT in `docs/UAT-v0.5.md`). Earlier: Basic Bluetooth driving confirmed on a real mBot2. Joystick, watchdog, lights, floor sensor, environment scan and AI conversation are tested with unit and simulator integration tests; hardware acceptance tests are in `docs/UAT-v0.3.md`.
 
 ## Use
 
@@ -18,6 +20,16 @@ Status: v0.4 (mapping and navigation, simulator-tested; UAT in `docs/UAT-v0.4.md
 
 **Simulator** runs everything without a robot.
 
+**Map controls**: drag to pan, pinch or mouse wheel to zoom, tap to set a goal. Maps can be saved on the device, exported as a JSON file and imported again.
+
+## Install on Android
+
+1. Open https://d57udy.github.io/mbot2-control/ in Chrome.
+2. Chrome menu (three dots) → **Install app** (or **Add to Home screen**).
+3. Start mBot2 from the home screen icon. It opens full screen without the browser bar, and Bluetooth works the same as in the browser tab. The app files are cached, so it starts without network; the AI conversation still needs internet.
+
+Updates arrive when the app is opened online after a new version is published.
+
 ## Layout
 
 | Path | Purpose |
@@ -32,6 +44,9 @@ Status: v0.4 (mapping and navigation, simulator-tested; UAT in `docs/UAT-v0.4.md
 | `js/voice.js` | Speech recognition wrapper and command parser |
 | `js/scan.js`, `js/radar.js` | Environment scan, open-direction finder, radar plot |
 | `js/pose.js`, `js/gridmap.js`, `js/planner.js`, `js/navigate.js`, `js/mapview.js` | Position tracking, occupancy map, A* route planning, navigator (go to, explore, go home), map drawing |
+| `js/mapcontrols.js` | Map zoom, pan, pinch, tap, fit and follow |
+| `js/mapstore.js` | Save, load, export and import maps (localStorage, JSON) |
+| `manifest.webmanifest`, `sw.js`, `icons/` | Installable app (PWA): manifest, offline cache, icons |
 | `js/tools.js`, `js/agent.js`, `js/tts.js` | LLM tool definitions and executor, Claude tool-use loop, speech output |
 | `js/sim-view.js` | Simulator drawing (room, obstacles, scan rays) |
 | `js/app.js` | Wiring, hold-to-drive, page lifecycle safety |
@@ -44,6 +59,8 @@ Status: v0.4 (mapping and navigation, simulator-tested; UAT in `docs/UAT-v0.4.md
 python3 -m http.server 8765    # then open http://localhost:8765 (localhost counts as secure)
 npm test                        # unit + simulator integration tests (Node 20+)
 ```
+
+The service worker (offline cache) is not registered on localhost, so local edits show up on reload. Bump `VERSION` in `sw.js` with every deploy.
 
 From the browser console: `mbot.bus.submit(mbot.makeCommand('turn', {deg: 90}))` or `mbot.say('vorwärts')`.
 
