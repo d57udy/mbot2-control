@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#14181f">
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'">
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.anthropic.com">
   <title>mBot2 Control</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -58,6 +58,10 @@
     </section>
 
     <section class="voice">
+      <div class="tabs voice-mode" role="tablist" aria-label="Sprachmodus">
+        <button role="tab" data-voice="commands" aria-selected="true">Befehle</button>
+        <button role="tab" data-voice="chat" aria-selected="false">Gespräch (KI)</button>
+      </div>
       <button id="btn-mic" class="mic" aria-pressed="false">🎤 Sprache an</button>
       <select id="lang" aria-label="Sprache">
         <option value="de-DE">Deutsch</option>
@@ -66,6 +70,36 @@
       <p id="transcript" class="transcript">Sag z.B. „vorwärts“, „links“, „rechts 45 Grad“, „zurück 2 Sekunden“, „Licht blau“, „stopp“.</p>
       <p id="voice-state" class="muted"></p>
     </section>
+
+    <details id="panel-chat">
+      <summary>Gespräch</summary>
+      <p id="chat-hint" class="muted small">Für das Gespräch wird ein Anthropic-API-Schlüssel benötigt (Einstellungen → KI).</p>
+      <ol id="chat-log" class="chat-log" aria-live="polite"></ol>
+      <div class="row chat-input">
+        <input id="chat-text" type="text" placeholder="Schreiben oder sprechen…" autocomplete="off">
+        <button id="btn-chat-send">Senden</button>
+      </div>
+      <div class="row">
+        <span id="chat-state" class="muted small"></span>
+        <button id="btn-chat-reset" class="small-btn">Neues Gespräch</button>
+      </div>
+    </details>
+
+    <details id="panel-scan">
+      <summary>Umgebung scannen</summary>
+      <div class="row">
+        <select id="scan-steps" aria-label="Messpunkte">
+          <option value="8">8 Messpunkte</option>
+          <option value="12" selected>12 Messpunkte</option>
+          <option value="16">16 Messpunkte</option>
+        </select>
+        <button id="btn-scan">Scannen</button>
+        <button id="btn-explore">Erkunden</button>
+      </div>
+      <canvas id="radar" width="480" height="480"></canvas>
+      <p id="scan-text" class="muted small">Noch kein Scan. Der Roboter dreht sich einmal im Kreis und misst in jede Richtung den Abstand.</p>
+      <div id="scan-openings" class="chips"></div>
+    </details>
 
     <details id="panel-lights">
       <summary>Lichter</summary>
@@ -134,6 +168,12 @@
       <label><input id="opt-guard" type="checkbox" checked> Hindernis-Bremse (bremst ab 40 cm, Stopp bei 15 cm)</label>
       <label><input id="opt-mirrored" type="checkbox" checked> Motoren gespiegelt (Standard mBot2)</label>
       <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen</label>
+      <h3>KI (Gespräch)</h3>
+      <label>API-Schlüssel <input id="ai-key" type="password" autocomplete="off" placeholder="sk-ant-…"></label>
+      <label><input id="ai-remember" type="checkbox"> Schlüssel auf diesem Gerät merken</label>
+      <label>Modell <select id="ai-model"></select></label>
+      <label><input id="ai-speak" type="checkbox" checked> Antworten vorlesen</label>
+      <p class="muted small">Der Schlüssel wird nur direkt an api.anthropic.com gesendet. Nutze einen eigenen Schlüssel mit Ausgabenlimit. „Merken“ speichert ihn im Browser dieses Geräts.</p>
     </details>
 
     <details>

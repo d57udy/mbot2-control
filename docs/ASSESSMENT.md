@@ -62,8 +62,8 @@ Hard limits to design around:
 
 | Stage | Scope | Exit criterion |
 |---|---|---|
-| v0.1 (this commit) | Web Bluetooth driver, buttons, German/English voice, simulator, safety layer | Hardware checklist (`docs/HARDWARE_TEST.md`) passes |
+| v0.1 (done) | Web Bluetooth driver, buttons, German/English voice, simulator, safety layer | Hardware checklist (`docs/HARDWARE_TEST.md`) passes |
 | v0.2 | Fixes from hardware test; publish on GitHub Pages; measure latency | Drive a lap by voice on the phone |
-| v1 | LLM-in-page mode with user-supplied key, tool calling over the command schema | "Fahr zum Sofa und dreh dich um" works in the simulator, then on hardware |
+| v0.3 (done, pending UAT) | Joystick + watchdog, lights, floor sensor, environment scan, LLM conversation in the page with tool calling | `docs/UAT-v0.3.md` passes |
 | v2 | Cloudflare relay + remote MCP server, authenticated, remote-armed switch | Claude Desktop drives the robot through the phone |
 | v3 | Camera goals (approach target), or Raspberry Pi bridge for unattended use | Defined after v2 |

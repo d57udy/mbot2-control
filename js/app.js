@@ -1,7 +1,13 @@
 import { BleRobot } from './robot-ble.js';
-import { SimRobot, SIM_ROOM } from './robot-sim.js';
+import { SimRobot, SIM_ROOM, SIM_OBSTACLES } from './robot-sim.js';
+import { drawSim } from './sim-view.js';
+import { scan, findOpenings, describeScan, driveToward, explore } from './scan.js';
+import { drawRadar } from './radar.js';
 import { CommandBus, makeCommand, LIMITS, LED_EFFECTS, EYE_EFFECTS } from './bus.js';
-import { VoiceListener, parseUtterance } from './voice.js';
+import { VoiceListener, parseUtterance, isStop, isStrictStop } from './voice.js';
+import { TOOLS, createToolExecutor } from './tools.js';
+import { ConversationAgent, MODELS, DEFAULT_MODEL } from './agent.js';
+import tts from './tts.js';
 import { Joystick } from './joystick.js';
 import { DriveStream, mixArcade } from './drive.js';
 
@@ -92,6 +98,7 @@ async function connectBle(reuse) {
     applyWheelSettings();
     await robot.connect();
     bus.submit(makeCommand('read', { sensor: 'battery' }));
+    probeEyes();
   } catch (e) {
     log(`Verbindung fehlgeschlagen: ${e.message}`);
     setStatus(ble?.device ? 'disconnected' : 'idle');
@@ -100,10 +107,10 @@ async function connectBle(reuse) {
 
 async function connectSim() {
   $('sim').hidden = false;
-  robot = new SimRobot({ log, onStatus: setStatus, onChange: drawSim });
+  robot = new SimRobot({ log, onStatus: setStatus, onChange: redrawSim });
   bus.setRobot(robot);
   await robot.connect();
-  drawSim(robot.state);
+  redrawSim();
   bus.submit(makeCommand('read', { sensor: 'battery' }));
 }
 
@@ -173,7 +180,7 @@ async function pollSensors() {
     const tick = performance.now();
     if (!document.hidden) {
       const driving = stream.timer || mode === 'joystick';
-      if ($('opt-guard').checked && (driving || n % 4 === 0)) {
+      if ($('opt-guard').checked && (driving || n % 4 === 0) && !bus.sensorsQuiet()) {
         await bus.submit(makeCommand('read', { sensor: 'distance' }));
       }
       if ($('floor-live').checked && $('panel-floor').open && n % 2 === 0) {
@@ -201,6 +208,9 @@ speedEl.oninput = () => setSpeed(Number(speedEl.value));
 
 function emergencyStop(src = 'ui') {
   stream.halt();
+  scanAbort?.abort();
+  chatAbort?.abort();
+  tts.cancel();
   joystick.reset();
   document.querySelectorAll('.pad .held').forEach((b) => b.classList.remove('held'));
   return bus.stop(src);
@@ -259,7 +269,8 @@ function makeVoice() {
     onState: (s) => { $('voice-state').textContent = s === 'off' ? '' : `Mikrofon: ${s}`; },
     onTranscript: (text, final) => { transcriptEl.textContent = final ? text : `${text} …`; },
     onStop: (text) => { log(`🎤 „${text}“ → stop`); emergencyStop('voice'); },
-    onCommand: (text) => runVoice(text),
+    onCommand: (text) => (voiceMode === 'chat' ? chat(text) : runVoice(text)),
+    stopTest: voiceMode === 'chat' ? isStrictStop : isStop,
   });
 }
 
@@ -341,7 +352,13 @@ const EYE_LABELS = {
 for (const name of EYE_EFFECTS) {
   const b = document.createElement('button');
   b.textContent = EYE_LABELS[name] ?? name;
-  b.onclick = () => send('eyes_effect', { name });
+  b.dataset.effect = name;
+  b.onclick = async () => {
+    // drive frames sent during a blocking effect pile up on the robot
+    if (stream.timer) { log('Erst anhalten, dann Emotion abspielen.'); return; }
+    const r = await send('eyes_effect', { name });
+    if (r.ok) log(`Augen ${name}: ${r.value?.running ? 'läuft noch' : `${r.value?.ms ?? '?'} ms`}`);
+  };
   $('eye-effects').append(b);
 }
 for (let id = 1; id <= 8; id++) {
@@ -351,7 +368,148 @@ for (let id = 1; id <= 8; id++) {
   $('eye-leds').append(l);
 }
 
+// Hide effect buttons this firmware does not have; show all if probing fails.
+async function probeEyes() {
+  const buttons = document.querySelectorAll('#eye-effects [data-effect]');
+  buttons.forEach((b) => { b.hidden = false; });
+  if (!robot?.probeEyeEffects) return;
+  try {
+    const ok = await robot.probeEyeEffects(EYE_EFFECTS);
+    if (Array.isArray(ok) && ok.length) {
+      buttons.forEach((b) => { b.hidden = !ok.includes(b.dataset.effect); });
+      log(`Augen-Effekte verfügbar: ${ok.join(', ')}`);
+    }
+  } catch (e) { log(`Augen-Effekte nicht geprüft: ${e.message}`); }
+}
+
 $('floor-light').onchange = () => send('floor_light', { color: $('floor-light').value });
+
+// --- conversation (LLM with tool calling) ------------------------------------
+
+let voiceMode = store.get('voiceMode', 'commands');
+let agent = null;
+let chatAbort = null;
+let aiKey = store.get('aiKey', '');
+
+function setVoiceMode(m) {
+  voiceMode = m === 'chat' ? 'chat' : 'commands';
+  document.querySelectorAll('[data-voice]').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.voice === voiceMode)));
+  store.set('voiceMode', voiceMode);
+  if (voiceMode === 'chat') $('panel-chat').open = true;
+  if (!voice?.active) {
+    transcriptEl.textContent = voiceMode === 'chat'
+      ? 'Sprich ganz normal mit dem Roboter, z.B. „Wie geht es dir?“ oder „Schau dich mal um und fahr dahin, wo Platz ist.“ „Stopp“ hält alles an.'
+      : 'Sag z.B. „vorwärts“, „links“, „rechts 45 Grad“, „zurück 2 Sekunden“, „Licht blau“, „stopp“.';
+  }
+  if (voice?.active) { setMic(false); setMic(true); } // new stop-word rules
+}
+document.querySelectorAll('[data-voice]').forEach((t) => { t.onclick = () => setVoiceMode(t.dataset.voice); });
+
+for (const m of MODELS) $('ai-model').add(new Option(m.label, m.id));
+$('ai-model').value = store.get('aiModel', DEFAULT_MODEL);
+$('ai-key').value = aiKey;
+$('ai-remember').checked = !!aiKey;
+$('ai-speak').checked = store.get('aiSpeak', '1') === '1';
+
+function updateChatHint() { $('chat-hint').hidden = !!aiKey; }
+function dropAgent() { chatAbort?.abort(); agent = null; }
+$('ai-key').onchange = () => {
+  aiKey = $('ai-key').value.trim();
+  store.set('aiKey', $('ai-remember').checked ? aiKey : '');
+  updateChatHint();
+  dropAgent();
+};
+$('ai-remember').onchange = () => store.set('aiKey', $('ai-remember').checked ? aiKey : '');
+$('ai-model').onchange = () => { store.set('aiModel', $('ai-model').value); dropAgent(); };
+$('ai-speak').onchange = () => store.set('aiSpeak', $('ai-speak').checked ? '1' : '0');
+updateChatHint();
+
+const EMOTION_DE = {
+  happy: 'fröhlich', excited: 'aufgeregt', sad: 'traurig', surprised: 'überrascht', thinking: 'nachdenklich',
+  curious: 'neugierig', dizzy: 'schwindelig', wink: 'zwinkert', naughty: 'frech', angry: 'verärgert',
+  sleepy: 'müde', neutral: 'neutral',
+};
+
+function chatLine(kind, text) {
+  const li = document.createElement('li');
+  li.className = kind;
+  li.textContent = text;
+  $('chat-log').append(li);
+  li.scrollIntoView({ block: 'nearest' });
+  return li;
+}
+
+function getAgent() {
+  if (!aiKey) throw new Error('Kein API-Schlüssel (Einstellungen → KI).');
+  if (agent && agent.lang === $('lang').value) return agent;
+  const executor = createToolExecutor({
+    bus, makeCommand, scan, findOpenings, describeScan, driveToward,
+    onEmotion: (e) => chatLine('tool', `😶 ${EMOTION_DE[e] ?? e}`),
+    onScan: (points) => {
+      if (robot?.kind === 'sim') { lastScan = { x: robot.state.x, y: robot.state.y, heading: robot.state.heading, points }; }
+      $('panel-scan').open = true;
+      showScan(points);
+      redrawSim();
+    },
+  });
+  agent = new ConversationAgent({
+    apiKey: aiKey,
+    model: $('ai-model').value,
+    tools: TOOLS,
+    executor,
+    lang: $('lang').value,
+    onEvent: (e) => {
+      if (e.type === 'tool_call') chatLine('tool', `⚙ ${e.name} ${JSON.stringify(e.input ?? {})}`);
+      if (e.type === 'tool_result' && e.result && e.result.ok === false) chatLine('tool', `⚠ ${e.name}: ${e.result.error}`);
+      if (e.type === 'error') log(`! KI: ${e.message ?? e.error ?? ''}`);
+    },
+  });
+  agent.lang = $('lang').value;
+  return agent;
+}
+
+async function chat(text) {
+  text = text.trim();
+  if (!text) return;
+  chatLine('user', text);
+  let a;
+  try { a = getAgent(); } catch (e) { chatLine('error', e.message); return; }
+  chatAbort?.abort();
+  tts.cancel();
+  const ctl = new AbortController();
+  chatAbort = ctl;
+  $('chat-state').textContent = 'denkt nach…';
+  try {
+    const r = await a.send(text, { signal: ctl.signal });
+    if (r.aborted || ctl.signal.aborted) { $('chat-state').textContent = 'abgebrochen'; return; }
+    if (r.text) {
+      chatLine('bot', r.text);
+      if ($('ai-speak').checked) await say(r.text);
+    }
+    $('chat-state').textContent = '';
+  } catch (e) {
+    if (ctl.signal.aborted) { $('chat-state').textContent = 'abgebrochen'; return; }
+    chatLine('error', e.message);
+    $('chat-state').textContent = '';
+  } finally {
+    if (chatAbort === ctl) chatAbort = null;
+  }
+}
+window.mbot.chat = chat;
+
+// The mic is paused while the robot speaks so it does not hear itself.
+async function say(text) {
+  const micWasOn = !!voice?.active;
+  if (micWasOn) voice.stop();
+  $('chat-state').textContent = 'spricht…';
+  try { await tts.speak(text, $('lang').value); } finally {
+    if (micWasOn && $('btn-mic').getAttribute('aria-pressed') === 'true' && !document.hidden) voice.start();
+  }
+}
+
+$('btn-chat-send').onclick = () => { const t = $('chat-text').value; $('chat-text').value = ''; chat(t); };
+$('chat-text').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btn-chat-send').click(); });
+$('btn-chat-reset').onclick = () => { dropAgent(); tts.cancel(); $('chat-log').textContent = ''; $('chat-state').textContent = ''; };
 
 // --- manual command box --------------------------------------------------
 
@@ -406,39 +564,85 @@ window.addEventListener('blur', () => { if (stream.timer) emergencyStop('ui'); }
 
 // --- simulator drawing -------------------------------------------------
 
-function drawSim(s) {
-  const c = $('sim');
-  const ctx = c.getContext('2d');
-  const k = c.width / SIM_ROOM.w;
-  const css = getComputedStyle(document.documentElement);
-  ctx.clearRect(0, 0, c.width, c.height);
-  ctx.strokeStyle = css.getPropertyValue('--border');
-  ctx.lineWidth = 4;
-  ctx.strokeRect(2, 2, c.width - 4, c.height - 4);
-  ctx.save();
-  ctx.translate(s.x * k, s.y * k);
-  ctx.rotate((s.heading * Math.PI) / 180);
-  ctx.fillStyle = css.getPropertyValue('--accent');
-  ctx.fillRect(-24, -18, 48, 36);
-  // five back LEDs along the rear edge
-  s.leds.forEach((rgb, i) => {
-    ctx.fillStyle = `rgb(${rgb.join(',')})`;
-    ctx.beginPath(); ctx.arc(-24, -14 + i * 7, 3, 0, Math.PI * 2); ctx.fill();
-  });
-  // eyes at the front
-  s.eyes.forEach((bri, i) => {
-    ctx.fillStyle = `rgba(80,160,255,${0.15 + (bri / 100) * 0.85})`;
-    ctx.beginPath(); ctx.arc(26, i === 0 ? -8 : 8, 5, 0, Math.PI * 2); ctx.fill();
-  });
-  ctx.restore();
-  if (s.label) {
-    ctx.fillStyle = css.getPropertyValue('--text');
-    ctx.font = '24px system-ui';
-    ctx.fillText(s.label, 12, 32);
+let lastScan = null; // { x, y, heading, points } for drawing rays in the sim
+
+function redrawSim() {
+  if (robot?.kind !== 'sim') return;
+  drawSim($('sim'), robot.state, SIM_ROOM, SIM_OBSTACLES, { rays: lastScan });
+}
+
+// --- environment scan ------------------------------------------------------
+
+let scanAbort = null;
+
+function showScan(points) {
+  const openings = findOpenings(points);
+  drawRadar($('radar'), points, { highlight: openings });
+  $('scan-text').textContent = describeScan(points, openings);
+  const chips = $('scan-openings');
+  chips.textContent = '';
+  for (const o of openings.slice(0, 4)) {
+    const b = document.createElement('button');
+    const dir = o.angle === 0 ? 'geradeaus' : o.angle > 0 ? `${o.angle}° rechts` : `${-o.angle}° links`;
+    b.textContent = `→ ${dir} (${o.cm >= 300 ? 'frei' : `${Math.round(o.cm)} cm`})`;
+    b.onclick = () => runScanTask(async () => {
+      const r = await driveToward(bus, { angle: o.angle, cm: 40 });
+      log(`Fahrt Richtung ${o.angle}°: ${r.ok ? `${r.droveCm} cm` : r.error ?? r.note}`);
+      lastScan = null;
+      redrawSim();
+    });
+    chips.append(b);
+  }
+  return openings;
+}
+
+// Scans and explores share one AbortController so STOPP cancels them.
+async function runScanTask(fn) {
+  if (!robot?.connected) { log('! nicht verbunden'); return null; }
+  if (scanAbort) { log('! Scan läuft bereits'); return null; }
+  stream.halt();
+  scanAbort = new AbortController();
+  $('btn-scan').disabled = $('btn-explore').disabled = true;
+  try {
+    return await fn(scanAbort.signal);
+  } catch (e) {
+    log(e.name === 'AbortError' ? 'Scan abgebrochen' : `! Scan: ${e.message}`);
+    return null;
+  } finally {
+    scanAbort = null;
+    $('btn-scan').disabled = $('btn-explore').disabled = false;
   }
 }
+
+async function doScan(steps, signal) {
+  const pose = robot.kind === 'sim' ? { x: robot.state.x, y: robot.state.y, heading: robot.state.heading } : null;
+  const points = [];
+  const result = await scan(bus, {
+    steps,
+    signal,
+    onPoint: (p) => { points.push(p); drawRadar($('radar'), points); },
+  });
+  if (pose) { lastScan = { ...pose, points: result.points }; redrawSim(); }
+  showScan(result.points);
+  log(`Scan: ${describeScan(result.points)}`);
+  return result;
+}
+
+$('btn-scan').onclick = () => runScanTask((signal) => doScan(Number($('scan-steps').value), signal));
+$('btn-explore').onclick = () => runScanTask(async (signal) => {
+  const r = await explore(bus, { maxMoves: 3, signal, onEvent: (e) => {
+    redrawSim();
+    log(e.opening
+      ? `Erkunden ${e.move}: Richtung ${e.opening.angle}°, ${e.ok ? `${e.droveCm} cm gefahren` : e.error ?? e.note}`
+      : `Erkunden ${e.move}: ${e.note}`);
+  } });
+  log(`Erkunden fertig: ${r.moves} Fahrten`);
+  lastScan = null;
+  redrawSim();
+});
 
 checkSupport();
 setSpeed(Number(store.get('speed', 80)));
 setMode(store.get('mode', 'buttons'));
+setVoiceMode(voiceMode);
 log('Bereit. Roboter einschalten, Startbildschirm, kein Programm aktiv, nicht mit mBlock verbunden.');

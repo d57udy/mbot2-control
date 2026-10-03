@@ -26,6 +26,10 @@ function number(text) {
 
 export const isStop = (text) => STOP.test(text);
 
+// In conversation mode whole sentences are spoken, so only a short utterance
+// that is mainly a stop word counts ("Wie siehst du aus?" must reach the LLM).
+export const isStrictStop = (text) => text.trim().split(/\s+/).length <= 3 && /\b(stopp?|halt|anhalten|stop it)\b/i.test(text);
+
 // Returns { cmd, args } (plus { drive: secs } for long moves) or null.
 export function parseUtterance(raw) {
   const t = raw.toLowerCase().replace(/[.!?]/g, ' ').trim();
@@ -64,11 +68,11 @@ export function parseUtterance(raw) {
 // reports every partial guess as final. Stop words fire immediately on any
 // result; everything else waits until the transcript has settled.
 export class VoiceListener {
-  constructor({ lang = 'de-DE', onStop, onCommand, onTranscript, onState, settleMs = 500 }) {
+  constructor({ lang = 'de-DE', onStop, onCommand, onTranscript, onState, settleMs = 500, stopTest = isStop }) {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     this.supported = !!SR;
     this.SR = SR;
-    Object.assign(this, { lang, onStop, onCommand, onTranscript, onState, settleMs });
+    Object.assign(this, { lang, onStop, onCommand, onTranscript, onState, settleMs, stopTest });
     this.active = false;
     this.rec = null;
     this.settleTimer = null;
@@ -117,7 +121,7 @@ export class VoiceListener {
     const text = last[0].transcript.trim();
     this.onTranscript?.(text, last.isFinal);
 
-    if (isStop(text) && !/licht|light/i.test(text)) {
+    if (this.stopTest(text) && !/licht|light/i.test(text)) {
       if (this.stopFiredFor !== text) { this.stopFiredFor = text; this.onStop?.(text); }
       clearTimeout(this.settleTimer);
       this.pendingText = '';

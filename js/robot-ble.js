@@ -4,6 +4,7 @@ import {
   UUID, ONLINE_FRAME, MODE_NO_REPLY, MODE_REPLY, buildScriptFrame, F3Parser, toHex,
 } from './protocol.js';
 
+const eyeList = (l, r) => `[${l},${l},${l},${l},${r},${r},${r},${r}]`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const py = (s) => JSON.stringify(String(s)); // JSON string literal is valid Python
 const MODE_IMMEDIATE = 3; // runs outside the robot's script queue (research/05)
@@ -33,6 +34,47 @@ const WATCHDOG_SRC = [
   ' _thread.start_new_thread(_wd,())',
 ].join('\n');
 
+// Eye LED helpers (research/06-eye-leds.md). In CyberPiOS 44.01.011,
+// cyberpi.ultrasonic2 is the module mbuild_modules/led_ultrasonic_sensor.py and
+// eight of the thirteen *_effect functions take a required brightness argument,
+// so calling them with no arguments raises TypeError. _fx tries both forms and
+// returns the run time in ms or an error string, so failures become visible
+// even if Live Mode does not report exceptions. _eyes prefers the documented
+// 8-value led_show and falls back to the form DrorSh saw on 44.01.013.
+const EYE_HELPER_SRC = [
+  'import time,cyberpi as C,mbot2 as M',
+  'def _fx(n,b=100):',
+  " f=getattr(C.ultrasonic2,n+'_effect',None)",
+  " if f is None:return 'missing'",
+  ' t=time.ticks_ms()',
+  ' try:',
+  '  try:f()',
+  '  except TypeError:f(b)',
+  ' except Exception as e:',
+  "  return 'error: '+repr(e)",
+  ' return time.ticks_diff(time.ticks_ms(),t)',
+  'def _eyes(l,r):',
+  ' u=C.ultrasonic2',
+  ' try:',
+  '  u.led_show([l,l,l,l,r,r,r,r],1)',
+  "  return 'list'",
+  ' except Exception:',
+  '  pass',
+  ' u.set_both_led_bri(l,r)',
+  ' try:u.led_show()',
+  ' except Exception:pass',
+  " return 'both'",
+  'M._fx=_fx',
+  'M._eyes=_eyes',
+].join('\n');
+
+// Signatures read from the 44.01.011 firmware image: these take (led_bri, index=1),
+// the others take (index=1). Only used when the helper could not be installed.
+export const EYE_EFFECT_NEEDS_BRI = new Set(['happy', 'wink', 'naughty', 'aggrieved', 'look_left', 'look_right',
+  'eye_left', 'eye_right']);
+const EFFECT_DEFAULT_MS = 6000; // generous: the reply ends the quiet period early
+const safeName = (n) => { if (!/^[a-z_]+$/.test(n)) throw new Error(`bad effect name ${n}`); return n; };
+
 export class BleRobot {
   constructor({ log, onStatus, chunkSize = 20, chunkDelayMs = 8, debugAllDevices = false }) {
     this.kind = 'ble';
@@ -51,6 +93,10 @@ export class BleRobot {
     this.connected = false;
     this.watchdog = false;
     this.ignoreIdx = new Set();
+    this.eyeHelperFor = null; // writeChar the helper was installed over (new connection = reinstall)
+    this.eyeHelper = false;
+    this.eyeModeLogged = null;
+    this.effectMs = {}; // measured effect durations, name -> ms
     // Wheel mapping: the motors are mirrored, so forward is EM1 +, EM2 -.
     this.wheels = { swap: false, mirrored: true };
   }
@@ -233,7 +279,18 @@ export class BleRobot {
     return this.run(`mbot2.${fn}(${speed},${secs})`);
   }
 
-  turn(deg) { return this.run(`mbot2.turn(${deg})`); }
+  // wait: send with reply so the promise resolves when the robot has finished
+  // the (blocking) gyro turn. Used by scans and the AI agent.
+  turn(deg, { wait = false } = {}) {
+    const s = `mbot2.turn(${deg})`;
+    return wait ? this.query(s, 2000 + Math.abs(deg) * 30) : this.run(s);
+  }
+
+  // Drive straight for cm (negative = backward), gyro-corrected on the robot.
+  straight(cm, { wait = false } = {}) {
+    const s = `mbot2.straight(${cm})`;
+    return wait ? this.query(s, 2000 + Math.abs(cm) * 150) : this.run(s);
+  }
 
   // Immediate mode first so it skips anything the robot is still executing,
   // then a normal copy in case this firmware ignores mode 3 for scripts.
@@ -276,15 +333,102 @@ export class BleRobot {
 
   ledBrightness(v) { return this.run(`cyberpi.led.set_bri(${v})`); }
 
-  ledEffect(name) { return this.run(`cyberpi.led.play(${py(name)})`); }
-
-  eyes(left, right) {
-    return this.run(`[cyberpi.ultrasonic2.set_both_led_bri(${left},${right}),cyberpi.ultrasonic2.led_show()]`);
+  // led.play blocks the robot until the animation ends; the reply marks the end.
+  async ledEffect(name) {
+    const key = `led:${safeName(name)}`;
+    const r = await this.queryUntilDone(`cyberpi.led.play(${py(name)})`, 12000, `led ${name}`);
+    if (!r.done) return { name, running: true };
+    this.effectMs[key] = r.ms + 300;
+    return { name, ms: r.ms };
   }
 
-  eyeLed(id, bri) { return this.run(`cyberpi.ultrasonic2.set_bri(${bri},${id === 'all' ? '"all"' : id},1)`); }
+  // Long blocking scripts (effects): resolves { done: true, value } when the
+  // robot replies, or { done: false } after timeoutMs while it may still run.
+  // A late reply is logged instead of showing up as "unmatched".
+  queryUntilDone(script, timeoutMs, label = script) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      this.enqueue(async () => {
+        const idx = this.nextIdx();
+        const entry = {
+          resolve: (value) => resolve({ done: true, value, ms: Date.now() - t0 }),
+          reject,
+          timer: setTimeout(() => {
+            resolve({ done: false });
+            const late = {
+              resolve: (v) => this.log(`< ${label} finished late after ${Date.now() - t0} ms: ${JSON.stringify(v)}`),
+              reject: () => {},
+              timer: setTimeout(() => this.pending.delete(idx), 30000),
+            };
+            this.pending.set(idx, late);
+          }, timeoutMs),
+        };
+        this.pending.set(idx, entry);
+        this.log(`> ${script}`);
+        await this.writeRaw(buildScriptFrame(script, idx, MODE_REPLY));
+      }).catch(reject);
+    });
+  }
 
-  eyesEffect(name) { return this.run(`cyberpi.ultrasonic2.${name}_effect()`); }
+  async ensureEyeHelper() {
+    if (this.eyeHelperFor === this.writeChar) return this.eyeHelper;
+    this.eyeHelperFor = this.writeChar;
+    this.eyeHelper = false;
+    this.eyeModeLogged = null;
+    try {
+      await this.query(`exec(${py(EYE_HELPER_SRC)})`, 3000);
+      const [fx, eyes] = await this.query("[hasattr(mbot2,'_fx'),hasattr(mbot2,'_eyes')]", 1500);
+      this.eyeHelper = fx === true && eyes === true;
+    } catch (e) {
+      this.log(`Eye helper install failed: ${e.message}`);
+    }
+    if (!this.eyeHelper) this.log('Eye helper not available; eye effects use direct calls, errors may stay silent.');
+    return this.eyeHelper;
+  }
+
+  // Both eyes, 0..100 each. Eye A = LEDs 1-4 = "left" (UNVERIFIED which side).
+  async eyes(left, right) {
+    if (await this.ensureEyeHelper()) {
+      if (!this.eyeModeLogged) {
+        this.eyeModeLogged = true;
+        const mode = await this.query(`mbot2._eyes(${left},${right})`, 3000);
+        this.log(`Eyes use ${mode === 'list' ? 'led_show([8 values],1)' : 'set_both_led_bri(l,r)+led_show()'} (${JSON.stringify(mode)})`);
+        return mode;
+      }
+      return this.run(`mbot2._eyes(${left},${right})`, { quiet: true });
+    }
+    return this.run(`cyberpi.ultrasonic2.led_show(${eyeList(left, right)},1)`);
+  }
+
+  // One eye LED (1..8) or all; set_bri = set_single_led_bri(led_bri, led_index, index) on 44.01.011.
+  eyeLed(id, bri) {
+    if (id === 'all') return this.run(`cyberpi.ultrasonic2.led_show(${eyeList(bri, bri)},1)`);
+    return this.run(`cyberpi.ultrasonic2.set_bri(${bri},${id},1)`);
+  }
+
+  effectEstimateMs(name) { return this.effectMs[name] ?? EFFECT_DEFAULT_MS; }
+
+  // Runs one eye animation and resolves when it has finished on the robot.
+  // Returns { name, ms } or { name, running: true } if no reply came in time.
+  async eyesEffect(name) {
+    safeName(name);
+    const script = (await this.ensureEyeHelper())
+      ? `mbot2._fx(${py(name)})`
+      : `cyberpi.ultrasonic2.${name}_effect(${EYE_EFFECT_NEEDS_BRI.has(name) ? 100 : ''})`;
+    const r = await this.queryUntilDone(script, 12000, `eyes ${name}`);
+    if (!r.done) return { name, running: true };
+    if (r.value === 'missing') throw new Error(`eye effect ${name} does not exist on this firmware`);
+    if (typeof r.value === 'string' && r.value.startsWith('error')) throw new Error(`eye effect ${name}: ${r.value}`);
+    const ms = Number.isFinite(r.value) ? r.value : r.ms;
+    this.effectMs[name] = ms + 300;
+    return { name, ms };
+  }
+
+  // Which candidate effects exist on this firmware (hasattr on the robot).
+  probeEyeEffects(names) {
+    const list = `[${names.map((n) => py(safeName(n))).join(',')}]`;
+    return this.query(`[n for n in ${list} if hasattr(cyberpi.ultrasonic2,n+'_effect')]`, 3000);
+  }
 
   floorLight(color) {
     return this.run(color === 'off' ? 'cyberpi.quad_rgb_sensor.off_led(1)' : `cyberpi.quad_rgb_sensor.set_led(${py(color)},1)`);

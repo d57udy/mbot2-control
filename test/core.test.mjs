@@ -1,4 +1,4 @@
-// Run with: node test/run.mjs
+// Run with: npm test
 import assert from 'node:assert/strict';
 import { buildScriptFrame, F3Parser, toHex } from '../js/protocol.js';
 import { parseUtterance, isStop } from '../js/voice.js';

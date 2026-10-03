@@ -7,7 +7,8 @@
 // cmd / args:
 //   move     { dir: 'forward'|'backward', speed?, secs? }
 //   spin     { dir: 'left'|'right', speed?, secs? }
-//   turn     { deg }                     (+ right, - left; gyro turn)
+//   turn     { deg, wait? }              (+ right, - left; gyro turn; wait = resolve when done)
+//   straight { cm, wait? }               gyro-straight distance, negative = backward
 //   drive    { left, right }             wheel RPM, forward-positive, continuous;
 //                                        robot watchdog stops it 0.4 s after the
 //                                        last drive command, so resend to keep going
@@ -29,13 +30,15 @@ export const LIMITS = {
   maxDriveRpm: 150,  // RPM for continuous joystick drive
   maxSecs: 2,        // longest single timed move
   maxTurnDeg: 360,
+  maxStraightCm: 100,
   obstacleCm: 15,    // forward moves refused below this
   distanceFreshMs: 1500,
   defaultTimeoutMs: 2000,
 };
 
 // Names from research/04-leds-and-rgb-sensor.md; effects are whitelisted
-// because they are interpolated into Python source.
+// because they are interpolated into Python source. All 13 eye effects exist
+// as cyberpi.ultrasonic2.<name>_effect in CyberPiOS 44.01.011 (research/06).
 export const LED_EFFECTS = ['rainbow', 'spoondrift', 'meteor_blue', 'meteor_green', 'flash_red', 'flash_orange', 'firefly'];
 export const EYE_EFFECTS = ['happy', 'new_happy', 'wink', 'naughty', 'aggrieved', 'raises_brow', 'look_left',
   'look_right', 'eye_left', 'eye_right', 'thinking', 'dizzy', 'standby'];
@@ -59,6 +62,31 @@ export class CommandBus {
     this.guard = true;
     this.lastDistance = { value: null, at: 0 };
     this.listeners = new Set();
+    // Blocking LED animations occupy the robot's script executor; until this
+    // time, sensor reads return the last value instead of queueing behind them.
+    this.sensorQuietUntil = 0;
+    this.effectsRunning = 0;
+    this.lastReads = {};
+  }
+
+  sensorsQuiet() { return Date.now() < this.sensorQuietUntil; }
+
+  // Runs a blocking animation with a quiet period; one at a time so taps do
+  // not pile up minutes of animation on the robot.
+  async runEffect(key, fn) {
+    if (this.effectsRunning) throw new Error('busy: an LED effect is still running');
+    const est = this.robot.effectEstimateMs?.(key) ?? 3000;
+    this.effectsRunning++;
+    this.sensorQuietUntil = Math.max(this.sensorQuietUntil, Date.now() + est);
+    let res;
+    try {
+      res = await fn();
+      return res;
+    } finally {
+      this.effectsRunning--;
+      // finished on the robot (reply arrived): end the quiet period now
+      if (!res?.running) this.sensorQuietUntil = Date.now();
+    }
   }
 
   setRobot(robot) { this.robot = robot; }
@@ -105,11 +133,29 @@ export class CommandBus {
         return robot.spin(a.dir === 'left' ? 'left' : 'right', speed, secs);
       case 'turn': {
         const deg = Math.round(clamp(a.deg ?? 90, -LIMITS.maxTurnDeg, LIMITS.maxTurnDeg));
-        return robot.turn(deg);
+        return robot.turn(deg, { wait: !!a.wait });
+      }
+      case 'straight': {
+        let cm = Math.round(clamp(a.cm ?? 0, -LIMITS.maxStraightCm, LIMITS.maxStraightCm));
+        if (cm > 0) {
+          this.checkObstacle();
+          // never plan to drive closer than the stop distance to a fresh reading
+          const { value, at } = this.lastDistance;
+          if (this.guard && value != null && Date.now() - at < LIMITS.distanceFreshMs) {
+            cm = Math.min(cm, Math.floor(value - LIMITS.obstacleCm));
+            if (cm <= 0) throw new Error(`obstacle at ${value} cm`);
+          }
+        }
+        return robot.straight(cm, { wait: !!a.wait });
       }
       case 'read': {
+        if (!['battery', 'distance', 'floor'].includes(a.sensor)) throw new Error(`unknown sensor ${a.sensor}`);
+        if (this.sensorsQuiet()) {
+          return a.sensor === 'distance' ? this.lastDistance.value : (this.lastReads[a.sensor] ?? null);
+        }
         if (a.sensor === 'battery') {
           const v = await robot.battery();
+          this.lastReads.battery = v;
           this.onSensor?.('battery', v);
           return v;
         }
@@ -119,12 +165,10 @@ export class CommandBus {
           this.onSensor?.('distance', v);
           return v;
         }
-        if (a.sensor === 'floor') {
-          const v = await robot.floor(!!a.colors);
-          this.onSensor?.('floor', v);
-          return v;
-        }
-        throw new Error(`unknown sensor ${a.sensor}`);
+        const v = await robot.floor(!!a.colors);
+        this.lastReads.floor = v;
+        this.onSensor?.('floor', v);
+        return v;
       }
       case 'led': {
         const id = a.id == null || a.id === 'all' ? null : clamp(a.id, 1, 5) | 0;
@@ -141,14 +185,14 @@ export class CommandBus {
         return robot.ledBrightness(clamp(a.value ?? 100, 0, 100) | 0);
       case 'led_effect':
         if (!LED_EFFECTS.includes(a.name)) throw new Error(`unknown led effect ${a.name}`);
-        return robot.ledEffect(a.name);
+        return this.runEffect(`led:${a.name}`, () => robot.ledEffect(a.name));
       case 'eyes':
         return robot.eyes(clamp(a.left ?? 0, 0, 100) | 0, clamp(a.right ?? 0, 0, 100) | 0);
       case 'eye_led':
         return robot.eyeLed(a.id === 'all' ? 'all' : clamp(a.id ?? 1, 1, 8) | 0, clamp(a.bri ?? 0, 0, 100) | 0);
       case 'eyes_effect':
         if (!EYE_EFFECTS.includes(a.name)) throw new Error(`unknown eye effect ${a.name}`);
-        return robot.eyesEffect(a.name);
+        return this.runEffect(a.name, () => robot.eyesEffect(a.name));
       case 'floor_light':
         if (!FLOOR_LIGHTS.includes(a.color)) throw new Error(`unknown floor light ${a.color}`);
         return robot.floorLight(a.color);
