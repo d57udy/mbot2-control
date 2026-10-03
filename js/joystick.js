@@ -2,9 +2,10 @@
 // Calls onMove while held (on every pointer move) and onRelease when let go.
 
 export class Joystick {
-  constructor(el, { onMove, onRelease }) {
+  constructor(el, { onStart, onMove, onRelease }) {
     this.el = el;
     this.knob = el.querySelector('.knob');
+    this.onStart = onStart;
     this.onMove = onMove;
     this.onRelease = onRelease;
     this.pointerId = null;
@@ -24,6 +25,7 @@ export class Joystick {
     this.pointerId = e.pointerId;
     try { this.el.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
     this.el.classList.add('active');
+    this.onStart?.();
     this.move(e);
   }
 

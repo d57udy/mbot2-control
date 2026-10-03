@@ -51,7 +51,11 @@ export function makeCommand(cmd, args = {}, src = 'ui', timeout_ms = LIMITS.defa
   return { v: 1, id: `${src}-${Date.now().toString(36)}-${seq++}`, ts: Date.now(), src, cmd, args, timeout_ms };
 }
 
-const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Number(v)));
+const clamp = (v, lo, hi) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new Error(`invalid number ${v}`);
+  return Math.min(hi, Math.max(lo, n));
+};
 
 export class CommandBus {
   constructor({ log, onSensor }) {
@@ -60,6 +64,7 @@ export class CommandBus {
     this.robot = null;
     this.settings = { speed: 50 };
     this.guard = true;
+    this.stopGen = 0;
     this.lastDistance = { value: null, at: 0 };
     this.listeners = new Set();
     // Blocking LED animations occupy the robot's script executor; until this
@@ -104,12 +109,25 @@ export class CommandBus {
     return r;
   }
 
-  stop(src = 'ui') { return this.submit(makeCommand('stop', {}, src)); }
+  // A real stop bumps the generation, which cancels every command stamped
+  // with an older one (multi-step AI tools and scans). soft: the drive
+  // stream's end-of-motion stop, which must not cancel anything.
+  stop(src = 'ui', { soft = false } = {}) {
+    if (!soft) this.stopGen++;
+    return this.submit(makeCommand('stop', {}, src));
+  }
+
+  // makeCommand that stamps the current generation; use one per task.
+  stamped() {
+    const gen = this.stopGen;
+    return (cmd, args, src, timeout) => ({ ...makeCommand(cmd, args, src, timeout), gen });
+  }
 
   async execute(c) {
     const robot = this.robot;
     if (!robot?.connected) throw new Error('robot not connected');
     if (c.v !== 1) throw new Error(`unsupported schema version ${c.v}`);
+    if (c.cmd !== 'stop' && c.gen != null && c.gen !== this.stopGen) throw new Error('cancelled by stop');
     if (c.cmd !== 'stop' && Date.now() - c.ts > (c.timeout_ms ?? LIMITS.defaultTimeoutMs)) {
       throw new Error('expired');
     }

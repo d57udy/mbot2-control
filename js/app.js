@@ -228,6 +228,7 @@ document.querySelectorAll('.pad .dir').forEach((btn) => {
     e.preventDefault();
     try { btn.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
     held = true;
+    takeOver();
     btn.classList.add('held');
     stream.set(...BUTTON_TARGETS[btn.dataset.drive]);
   });
@@ -243,7 +244,15 @@ document.querySelectorAll('.pad .dir').forEach((btn) => {
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
 });
 
+// Touching the manual controls cancels a running scan or AI action.
+function takeOver() {
+  if (scanAbort || chatAbort) log('Manuelle Steuerung übernimmt.');
+  scanAbort?.abort();
+  chatAbort?.abort();
+}
+
 const joystick = new Joystick($('joystick'), {
+  onStart: takeOver,
   onMove: ({ x, y }) => stream.set(...mixArcade(x, y)),
   onRelease: () => stream.release(),
 });
@@ -389,6 +398,7 @@ $('floor-light').onchange = () => send('floor_light', { color: $('floor-light').
 let voiceMode = store.get('voiceMode', 'commands');
 let agent = null;
 let chatAbort = null;
+let chatRunning = null; // promise of the current agent.send
 let aiKey = store.get('aiKey', '');
 
 function setVoiceMode(m) {
@@ -459,6 +469,7 @@ function getAgent() {
     executor,
     lang: $('lang').value,
     onEvent: (e) => {
+      if (e.type === 'tool_call') stream.halt();
       if (e.type === 'tool_call') chatLine('tool', `⚙ ${e.name} ${JSON.stringify(e.input ?? {})}`);
       if (e.type === 'tool_result' && e.result && e.result.ok === false) chatLine('tool', `⚠ ${e.name}: ${e.result.error}`);
       if (e.type === 'error') log(`! KI: ${e.message ?? e.error ?? ''}`);
@@ -478,9 +489,13 @@ async function chat(text) {
   tts.cancel();
   const ctl = new AbortController();
   chatAbort = ctl;
+  // barge-in: the agent rejects a second send until the aborted one unwinds
+  if (chatRunning) await chatRunning.catch(() => {});
+  if (ctl.signal.aborted) { if (chatAbort === ctl) chatAbort = null; return; }
   $('chat-state').textContent = 'denkt nach…';
   try {
-    const r = await a.send(text, { signal: ctl.signal });
+    chatRunning = a.send(text, { signal: ctl.signal });
+    const r = await chatRunning;
     if (r.aborted || ctl.signal.aborted) { $('chat-state').textContent = 'abgebrochen'; return; }
     if (r.text) {
       chatLine('bot', r.text);
@@ -492,7 +507,7 @@ async function chat(text) {
     chatLine('error', e.message);
     $('chat-state').textContent = '';
   } finally {
-    if (chatAbort === ctl) chatAbort = null;
+    if (chatAbort === ctl) { chatAbort = null; chatRunning = null; }
   }
 }
 window.mbot.chat = chat;
@@ -501,9 +516,10 @@ window.mbot.chat = chat;
 async function say(text) {
   const micWasOn = !!voice?.active;
   if (micWasOn) voice.stop();
+  const micPressed = () => $('btn-mic').getAttribute('aria-pressed') === 'true';
   $('chat-state').textContent = 'spricht…';
   try { await tts.speak(text, $('lang').value); } finally {
-    if (micWasOn && $('btn-mic').getAttribute('aria-pressed') === 'true' && !document.hidden) voice.start();
+    if (micWasOn && micPressed() && !document.hidden && !voice?.active) setMic(true);
   }
 }
 
@@ -554,7 +570,7 @@ function releaseWakeLock() { wakeLock?.release(); wakeLock = null; }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     if (robot?.connected) emergencyStop('ui');
-    if (voice?.active) setMic(false);
+    if (voice?.active || $('btn-mic').getAttribute('aria-pressed') === 'true') setMic(false);
   } else if (robot?.connected) {
     acquireWakeLock();
   }
@@ -586,7 +602,7 @@ function showScan(points) {
     const dir = o.angle === 0 ? 'geradeaus' : o.angle > 0 ? `${o.angle}° rechts` : `${-o.angle}° links`;
     b.textContent = `→ ${dir} (${o.cm >= 300 ? 'frei' : `${Math.round(o.cm)} cm`})`;
     b.onclick = () => runScanTask(async () => {
-      const r = await driveToward(bus, { angle: o.angle, cm: 40 });
+      const r = await driveToward(bus, { angle: o.angle, cm: 40, makeCommand: bus.stamped() });
       log(`Fahrt Richtung ${o.angle}°: ${r.ok ? `${r.droveCm} cm` : r.error ?? r.note}`);
       lastScan = null;
       redrawSim();
@@ -620,6 +636,7 @@ async function doScan(steps, signal) {
   const result = await scan(bus, {
     steps,
     signal,
+    makeCommand: bus.stamped(),
     onPoint: (p) => { points.push(p); drawRadar($('radar'), points); },
   });
   if (pose) { lastScan = { ...pose, points: result.points }; redrawSim(); }
@@ -630,7 +647,7 @@ async function doScan(steps, signal) {
 
 $('btn-scan').onclick = () => runScanTask((signal) => doScan(Number($('scan-steps').value), signal));
 $('btn-explore').onclick = () => runScanTask(async (signal) => {
-  const r = await explore(bus, { maxMoves: 3, signal, onEvent: (e) => {
+  const r = await explore(bus, { maxMoves: 3, signal, makeCommand: bus.stamped(), onEvent: (e) => {
     redrawSim();
     log(e.opening
       ? `Erkunden ${e.move}: Richtung ${e.opening.angle}°, ${e.ok ? `${e.droveCm} cm gefahren` : e.error ?? e.note}`

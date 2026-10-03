@@ -185,6 +185,7 @@ export class BleRobot {
   handleDisconnect() {
     this.connected = false;
     this.writeChar = null;
+    for (const q of this.queue) q.reject(new Error('disconnected'));
     this.queue = [];
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('disconnected')); }
     this.pending.clear();

@@ -8,6 +8,8 @@ const SAFE_CM = 20; // never plan to end closer than this to an obstacle
 
 const obj = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 
+const BLIND_CM = 30; // max forward move when the distance is unknown
+
 export const EMOTIONS = {
   happy: { eyes: 'happy', led: [255, 180, 0], tone: [880, 0.15] },
   excited: { eyes: 'new_happy', led: [0, 255, 80], tone: [1200, 0.12] },
@@ -121,7 +123,10 @@ const fail = (error) => ({ ok: false, error });
 export function createToolExecutor({ bus, makeCommand, scan, findOpenings, describeScan, driveToward, onEmotion, onScan }) {
   let lastScan = null; // { points, openings }, cleared by any movement
 
-  const submit = (cmd, args = {}, timeout_ms) => bus.submit(makeCommand(cmd, args, 'agent', timeout_ms));
+  // Each tool call stamps its commands with the bus stop generation, so a
+  // STOPP mid-tool cancels the remaining steps (turn then straight etc.).
+  let mk = makeCommand;
+  const submit = (cmd, args = {}, timeout_ms) => bus.submit(mk(cmd, args, 'agent', timeout_ms));
 
   async function readDistance() {
     const r = await submit('read', { sensor: 'distance' });
@@ -149,6 +154,9 @@ export function createToolExecutor({ bus, makeCommand, scan, findOpenings, descr
           const max = Math.floor(d - SAFE_CM);
           if (max <= 0) return fail(`obstacle ${Math.round(d)} cm ahead, not moving`);
           if (n > max) { note = `shortened from ${n} cm, obstacle at ${Math.round(d)} cm`; n = max; }
+        } else if (n > BLIND_CM) {
+          note = `distance unknown, limited to ${BLIND_CM} cm`;
+          n = BLIND_CM;
         }
       }
       lastScan = null;
@@ -174,7 +182,7 @@ export function createToolExecutor({ bus, makeCommand, scan, findOpenings, descr
       if (!scan) return fail('scan not available');
       const n = [8, 12, 16].includes(num(steps)) ? num(steps) : 12;
       lastScan = null;
-      const res = await scan(bus, { steps: n, signal, makeCommand });
+      const res = await scan(bus, { steps: n, signal, makeCommand: mk });
       const points = (res?.points ?? []).map((p) => ({ angle: Math.round(p.angle), cm: finite(p.cm) ? Math.round(p.cm) : null }));
       const openings = findOpenings ? findOpenings(points, { minCm: 50 }) : [];
       lastScan = { points, openings };
@@ -204,7 +212,7 @@ export function createToolExecutor({ bus, makeCommand, scan, findOpenings, descr
       }
       lastScan = null;
       if (driveToward) {
-        const res = await driveToward(bus, { angle: target, cm: dist, makeCommand });
+        const res = await driveToward(bus, { angle: target, cm: dist, makeCommand: mk });
         if (res && res.ok === false) return fail(res.error ?? 'drive failed');
         if (res && 'droveCm' in res) return { ok: true, angle: Math.round(target), cm: res.droveCm, ...(res.note && { note: res.note }) };
       } else {
@@ -295,6 +303,7 @@ export function createToolExecutor({ bus, makeCommand, scan, findOpenings, descr
       if (signal?.aborted) return fail('aborted');
       if (!Object.hasOwn(handlers, name)) return fail(`unknown tool ${name}`);
       const args = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+      mk = bus.stamped ? bus.stamped() : makeCommand;
       try {
         return await handlers[name](args, { signal });
       } catch (e) {

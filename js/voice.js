@@ -90,6 +90,7 @@ export class VoiceListener {
   stop() {
     this.active = false;
     clearTimeout(this.settleTimer);
+    if (this.rec) this.rec.onend = null; // a late onend must not spawn a second recognizer
     try { this.rec?.abort(); } catch { /* ignore */ }
     this.onState?.('off');
   }
@@ -122,7 +123,13 @@ export class VoiceListener {
     this.onTranscript?.(text, last.isFinal);
 
     if (this.stopTest(text) && !/licht|light/i.test(text)) {
-      if (this.stopFiredFor !== text) { this.stopFiredFor = text; this.onStop?.(text); }
+      // Android repeats the same final several times; dedupe briefly, not forever.
+      const now = Date.now();
+      if (this.stopFiredFor !== text || now - this.stopFiredAt > 1500) {
+        this.stopFiredFor = text;
+        this.stopFiredAt = now;
+        this.onStop?.(text);
+      }
       clearTimeout(this.settleTimer);
       this.pendingText = '';
       return;

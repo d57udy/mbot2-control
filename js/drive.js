@@ -133,7 +133,7 @@ export class DriveStream {
     if (!moving && this.target[0] === 0 && this.target[1] === 0) {
       clearInterval(this.timer);
       this.timer = null;
-      this.stopTimer = setTimeout(() => this.bus.stop('ui'), 300);
+      this.stopTimer = setTimeout(() => this.bus.stop('ui', { soft: true }), 300);
     }
   }
 }

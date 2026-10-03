@@ -49,6 +49,10 @@ Setup: robot charged, home screen, no program running; floor space of about 2 x 
 | D9 | Robot speech is not picked up as a new command | No self-triggered replies | |
 | D10 | Wrong API key | Clear German error message in the chat, robot stays still | |
 | D11 | English: switch language to English and talk | Answers in English | |
+| D12 | Ask a second question while the robot is still thinking | First request is dropped, second is answered | |
+| D13 | Ask "Fahr dahin, wo Platz ist" and press STOPP while it turns | It does not drive off after the turn finishes | |
+| D14 | Grab the joystick while the AI or a scan is moving the robot | Manual control takes over immediately | |
+| D15 | Say "Stopp" twice in one session (with something in between) | Both stop the robot | |
 
 ## E. Safety
 
