@@ -173,6 +173,34 @@ export class BleRobot {
 
   // Diagnoses link problems: latency, how long a frame may be, whether the
   // robot is jammed after a long frame, and whether threads are available.
+  // Read-only sensor discovery for motion tracking: which methods exist
+  // (hasattr only, no dir() and no imports) and what they return.
+  async sensorTest(report) {
+    const t = async (label, script) => {
+      const t0 = performance.now();
+      try {
+        const v = await this.query(script, 2500);
+        report(`OK  ${label}: ${JSON.stringify(v)} (${Math.round(performance.now() - t0)} ms)`);
+      } catch (e) {
+        report(`--  ${label}: ${e.message.split(':')[0]}`);
+      }
+    };
+    report('Sensor-Test (nur lesen, Roboter bewegt sich nicht)');
+    await t('Firmware', 'cyberpi.get_firmware_version()');
+    const names = (obj, list) => `[n for n in ${JSON.stringify(list)} if hasattr(${obj},n)]`;
+    await t('mbot2 hat', names('mbot2', ['EM_get_angle', 'EM_get_speed', 'EM_reset_angle', 'EM_get_power', 'get_speed', 'get_angle']));
+    await t('cyberpi hat', names('cyberpi', ['get_yaw', 'get_roll', 'get_pitch', 'get_acc', 'get_gyro', 'get_rotation', 'reset_yaw', 'reset_rotation', 'get_shakeval', 'is_shake', 'timer']));
+    await t('yaw', 'cyberpi.get_yaw()');
+    await t('roll, pitch', '[cyberpi.get_roll(),cyberpi.get_pitch()]');
+    await t('acc x,y,z', "[cyberpi.get_acc('x'),cyberpi.get_acc('y'),cyberpi.get_acc('z')]");
+    await t('gyro x,y,z', "[cyberpi.get_gyro('x'),cyberpi.get_gyro('y'),cyberpi.get_gyro('z')]");
+    await t('rotation z', "cyberpi.get_rotation('z')");
+    await t('Encoder Winkel 1,2', '[mbot2.EM_get_angle(1),mbot2.EM_get_angle(2)]');
+    await t('Encoder Tempo 1,2', '[mbot2.EM_get_speed(1),mbot2.EM_get_speed(2)]');
+    await t('Abstand + yaw', '[cyberpi.ultrasonic2.get(1),cyberpi.get_yaw()]');
+    report('Sensor-Test fertig. Bitte den Roboter jetzt von Hand etwa 90° im Uhrzeigersinn drehen und den Test erneut starten.');
+  }
+
   async connectionTest(report) {
     const ms = (t0) => Math.round(performance.now() - t0);
     const t = async (label, script, timeout = 4000) => {

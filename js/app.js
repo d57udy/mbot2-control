@@ -568,6 +568,23 @@ $('opt-helpers').checked = store.get('helpers', '0') === '1';
 $('opt-delay').onchange = () => { store.set('chunkDelay', $('opt-delay').value); if (ble) ble.chunkDelayMs = Number($('opt-delay').value); };
 $('opt-helpers').onchange = () => { store.set('helpers', $('opt-helpers').checked ? '1' : '0'); log('Roboter-Helfer: wirkt beim nächsten Verbinden (Roboter vorher aus- und einschalten).'); };
 
+$('btn-sensortest').onclick = async () => {
+  if (!robot?.sensorTest) { log('! Sensor-Test nur mit echtem Roboter'); return; }
+  $('btn-sensortest').disabled = true;
+  try { await robot.sensorTest((line) => log(line)); } finally { $('btn-sensortest').disabled = false; }
+};
+
+// Copies the log (oldest first) for pasting into a chat; falls back to the share sheet.
+$('btn-log-copy').onclick = async () => {
+  const text = logEl.textContent.split('\n').reverse().join('\n').trim();
+  try {
+    await navigator.clipboard.writeText(text);
+    log('Log in die Zwischenablage kopiert.');
+  } catch {
+    try { await navigator.share({ title: 'mBot2 Log', text }); } catch { log('! Kopieren nicht möglich'); }
+  }
+};
+
 $('btn-linktest').onclick = async () => {
   if (!robot?.connectionTest) { log('! Verbindungstest nur mit echtem Roboter'); return; }
   $('btn-linktest').disabled = true;
