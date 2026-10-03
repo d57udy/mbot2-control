@@ -165,6 +165,10 @@
       <label>Chunk-Größe (Bytes)
         <select id="opt-chunk"><option>20</option><option>100</option><option>180</option></select>
       </label>
+      <label>Pause zwischen Chunks (ms)
+        <select id="opt-delay"><option>8</option><option>20</option><option>40</option></select>
+      </label>
+      <label><input id="opt-helpers" type="checkbox" checked> Roboter-Helfer installieren (Watchdog, Augen-Effekte)</label>
       <label><input id="opt-guard" type="checkbox" checked> Hindernis-Bremse (bremst ab 40 cm, Stopp bei 15 cm)</label>
       <label><input id="opt-mirrored" type="checkbox" checked> Motoren gespiegelt (Standard mBot2)</label>
       <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen</label>
@@ -183,6 +187,7 @@
       <div class="row">
         <button id="btn-send">Senden</button>
         <button id="btn-diagnose">Diagnose (Firmware + APIs)</button>
+        <button id="btn-linktest">Verbindungstest</button>
       </div>
     </details>
 

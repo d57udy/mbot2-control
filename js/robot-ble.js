@@ -76,7 +76,9 @@ const EFFECT_DEFAULT_MS = 6000; // generous: the reply ends the quiet period ear
 const safeName = (n) => { if (!/^[a-z_]+$/.test(n)) throw new Error(`bad effect name ${n}`); return n; };
 
 export class BleRobot {
-  constructor({ log, onStatus, chunkSize = 20, chunkDelayMs = 8, debugAllDevices = false }) {
+  // helpers: install the robot-side watchdog and eye helper (exec of ~400 byte scripts).
+  constructor({ log, onStatus, chunkSize = 20, chunkDelayMs = 8, debugAllDevices = false, helpers = true }) {
+    this.helpers = helpers;
     this.kind = 'ble';
     this.log = log;
     this.onStatus = onStatus;
@@ -143,7 +145,8 @@ export class BleRobot {
 
     this.connected = true;
     await this.handshake();
-    await this.installWatchdog();
+    if (this.helpers) await this.installWatchdog();
+    else this.log('Robot helpers off: no watchdog, eye effects use direct calls.');
     this.onStatus('connected');
   }
 
@@ -160,6 +163,34 @@ export class BleRobot {
       } catch { /* retry */ }
     }
     this.log('No handshake reply. Continuing anyway; the robot often still accepts commands.');
+  }
+
+  // Diagnoses link problems: latency, how long a frame may be, whether the
+  // robot is jammed after a long frame, and whether threads are available.
+  async connectionTest(report) {
+    const ms = (t0) => Math.round(performance.now() - t0);
+    const t = async (label, script, timeout = 4000) => {
+      const t0 = performance.now();
+      try {
+        const v = await this.query(script, timeout);
+        report(`OK  ${label}: ${ms(t0)} ms → ${JSON.stringify(v).slice(0, 40)}`);
+        return true;
+      } catch (e) {
+        report(`FEHLER ${label}: ${e.message.split(':')[0]} nach ${ms(t0)} ms`);
+        return false;
+      }
+    };
+    report(`Test: Chunk ${this.chunkSize} B, Pause ${this.chunkDelayMs} ms, Helfer ${this.helpers ? 'an' : 'aus'}`);
+    for (let i = 1; i <= 3; i++) await t(`kurz ${i}`, 'cyberpi.get_bri()');
+    await t('Abstand', 'cyberpi.ultrasonic2.get(1)');
+    for (const n of [60, 120, 200, 300, 450]) {
+      const ok = await t(`${n} Bytes`, `len("${'x'.repeat(n - 7)}")`, 6000);
+      const alive = await t(`  danach kurz`, 'cyberpi.get_bri()');
+      if (!ok || !alive) { report(`→ Abbruch bei ${n} Bytes`); break; }
+    }
+    await t('Firmware', 'cyberpi.get_firmware_version()');
+    await t('_thread vorhanden', "__import__('_thread').get_ident()>0");
+    report('Test fertig');
   }
 
   async installWatchdog() {
@@ -372,6 +403,7 @@ export class BleRobot {
   }
 
   async ensureEyeHelper() {
+    if (!this.helpers) return false;
     if (this.eyeHelperFor === this.writeChar) return this.eyeHelper;
     this.eyeHelperFor = this.writeChar;
     this.eyeHelper = false;

@@ -90,6 +90,8 @@ async function connectBle(reuse) {
         log,
         onStatus: setStatus,
         chunkSize: Number($('opt-chunk').value),
+        chunkDelayMs: Number($('opt-delay').value),
+        helpers: $('opt-helpers').checked,
         debugAllDevices: $('opt-all').checked,
       });
     }
@@ -545,6 +547,18 @@ $('btn-send').onclick = async () => {
   } catch (e) {
     log(`! ${e.message}`);
   }
+};
+
+// Link settings apply on the next connect; remembered per device.
+$('opt-delay').value = store.get('chunkDelay', '8');
+$('opt-helpers').checked = store.get('helpers', '1') === '1';
+$('opt-delay').onchange = () => { store.set('chunkDelay', $('opt-delay').value); if (ble) ble.chunkDelayMs = Number($('opt-delay').value); };
+$('opt-helpers').onchange = () => { store.set('helpers', $('opt-helpers').checked ? '1' : '0'); log('Roboter-Helfer: wirkt beim nächsten Verbinden (Roboter vorher aus- und einschalten).'); };
+
+$('btn-linktest').onclick = async () => {
+  if (!robot?.connectionTest) { log('! Verbindungstest nur mit echtem Roboter'); return; }
+  $('btn-linktest').disabled = true;
+  try { await robot.connectionTest((line) => log(line)); } finally { $('btn-linktest').disabled = false; }
 };
 
 $('btn-diagnose').onclick = async () => {
