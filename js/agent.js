@@ -54,8 +54,8 @@ const textOf = (content) => content.filter((b) => b.type === 'text').map((b) => 
 export class ConversationAgent {
   constructor({ apiKey, model = DEFAULT_MODEL, tools = [], executor, lang = 'de-DE', systemPrompt, onEvent,
     fetchImpl = (...a) => fetch(...a), maxIterations = 8, maxTokens = 2048, maxHistory = 20, effort = 'low',
-    retryDelayMs = 1000 }) {
-    Object.assign(this, { apiKey, model, tools, executor, lang, onEvent, fetchImpl, maxIterations, maxTokens, maxHistory, effort, retryDelayMs });
+    retryDelayMs = 1000, requestTimeoutMs = 30000 }) {
+    Object.assign(this, { apiKey, model, tools, executor, lang, onEvent, fetchImpl, maxIterations, maxTokens, maxHistory, effort, retryDelayMs, requestTimeoutMs });
     this.systemPrompt = systemPrompt ?? buildSystemPrompt(lang);
     this.history = [];
     this.busy = false;
@@ -203,11 +203,20 @@ export class ConversationAgent {
     for (let attempt = 0; ; attempt++) {
       this.emit('request', { model: this.model, messages: this.history.length, attempt });
       let res;
+      // A stalled request must not hang the conversation: time out per attempt.
+      const timeout = new AbortController();
+      const timer = setTimeout(() => timeout.abort(), this.requestTimeoutMs);
+      const onAbort = () => timeout.abort();
+      signal?.addEventListener('abort', onAbort);
       try {
-        res = await this.fetchImpl(API_URL, { method: 'POST', headers: this.headers(), body: payload, signal });
+        res = await this.fetchImpl(API_URL, { method: 'POST', headers: this.headers(), body: payload, signal: timeout.signal });
       } catch (e) {
-        if (e?.name === 'AbortError' || signal?.aborted) throw abortError();
+        if (signal?.aborted) throw abortError();
+        if (timeout.signal.aborted) throw this.fail(new AgentError('Zeitüberschreitung bei der Anfrage an Claude', 0));
         throw this.fail(new AgentError(`Netzwerkfehler: ${e?.message ?? e}`, 0));
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
       }
       if (res.ok) return res.json();
       let detail = '';

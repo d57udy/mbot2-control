@@ -85,3 +85,13 @@ test('invalid numbers are rejected, not sent to the robot', async () => {
   assert.equal(r.ok, false);
   assert.match(r.error, /invalid number/);
 });
+
+test('a stalled Claude request times out with a clear error', async () => {
+  const { ConversationAgent } = await import('../js/agent.js');
+  const fetchImpl = (url, { signal }) => new Promise((_, rej) => {
+    signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+  });
+  const agent = new ConversationAgent({ apiKey: 'k', fetchImpl, requestTimeoutMs: 50, executor: { execute: async () => ({ ok: true }) } });
+  await assert.rejects(agent.send('hallo'), /Zeitüberschreitung/);
+  assert.equal(agent.busy, false);
+});
