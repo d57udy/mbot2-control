@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  driveLeg, detectCrash, buildSampleExpr, parseSample, makeBleSampler, makeSimSampler,
+  driveLeg, turnInPlace, detectCrash, buildSampleExpr, parseSample, makeBleSampler, makeSimSampler,
   SENSOR_EXPR, BLE_SENSORS, BLE_SENSORS_MIN, CM_PER_DEG,
 } from '../js/motion.js';
 import { SimRobot } from '../js/robot-sim.js';
@@ -153,7 +153,7 @@ test('driveLeg detects a jolt without encoders and a heading kick', async () => 
   const h = world({ yawKickAt: 10 });
   const rh = await h.leg({ cm: 40 });
   assert.equal(rh.reason, 'crash');
-  assert.equal(rh.detail, 'heading');
+  assert.equal(rh.detail, 'twist', 'yaw turned on a straight leg');
 });
 
 test('driveLeg without encoders uses time x speed', async () => {
@@ -272,4 +272,60 @@ test('SimRobot sensorSample stays exact while spinning with drive()', async () =
   } finally {
     await sim.disconnect();
   }
+});
+
+test('driveLeg detects a glancing hit: one wheel caught while the other keeps going', async () => {
+  // left wheel held at 12 cm (door frame); the right wheel drives on, the body pivots
+  const w = { t: 0, l: 0, r: 0, rpm: 0, cmds: [] };
+  const adv = (ms) => {
+    const d = ((w.rpm / 60) * WHEEL_CM * ms) / 1000;
+    w.l = Math.min(w.l + d, 12); w.r += d; w.t += ms;
+  };
+  const bus = { submit: async (c) => { w.cmds.push(c); if (c.cmd === 'drive') w.rpm = c.args.left; if (c.cmd === 'stop') w.rpm = 0; return { ok: true }; } };
+  const sample = async () => {
+    adv(200);
+    const heading = (((w.l - w.r) / 12) * 180) / Math.PI;
+    return { distanceCm: 300, encL: w.l / CM_PER_DEG + 0.7, encR: w.r / CM_PER_DEG - 0.7, yaw: Math.round(heading), acc: { x: 0.1, y: 0, z: -9.6 }, shake: 2 };
+  };
+  const r = await driveLeg(bus, { cm: 40, sample, clock: { now: () => w.t, sleep: async (ms) => adv(ms) } });
+  assert.ok(r.reason === 'crash' || r.reason === 'stall', r.reason);
+  assert.ok(['stall', 'twist', 'wheel'].includes(r.detail), r.detail);
+  assert.ok(w.r - 12 < 8, `right wheel ran on ${(w.r - 12).toFixed(1)} cm past the catch`);
+  assert.ok(r.details && typeof r.details.value === 'number');
+  assert.equal(w.cmds.at(-1).cmd, 'stop');
+});
+
+test('turnInPlace: closed-loop gyro turns within 2.5 deg under latency, integer and unbounded yaw', async () => {
+  const stub = () => {};
+  const sim = new SimRobot({ log: stub, onStatus: stub, timeScale: 25, yawInteger: true, yawMode: 'unbounded', encNoiseDeg: 1, latencyMs: 200 });
+  const bus = { submit: async (c) => { if (c.cmd === 'drive') await sim.drive(c.args.left, c.args.right); else if (c.cmd === 'stop') await sim.stop(); return { ok: true }; } };
+  await sim.connect();
+  try {
+    const sample = makeSimSampler(sim);
+    let spinSign = -1; // wrong on purpose: the first turn must discover it
+    for (const deg of [90, -150, 170, 20]) {
+      const h0 = sim.state.heading;
+      const r = await turnInPlace(bus, { deg, sample, spinSign });
+      spinSign = r.spinSign;
+      const truth = sim.state.heading - h0;
+      assert.equal(r.reason, 'done', `${deg}: ${r.reason}`);
+      assert.ok(Math.abs(truth - deg) <= 2.5, `${deg}: turned ${truth.toFixed(1)}`);
+      assert.ok(Math.abs(truth - r.achievedDeg) <= 1.5, `${deg}: reported ${r.achievedDeg}, true ${truth.toFixed(1)}`);
+      assert.equal(sim.motion, null);
+    }
+    assert.equal(spinSign, 1, 'reversed spin learned');
+    const none = await turnInPlace(bus, { deg: 45, sample: async () => ({ distanceCm: 50 }) });
+    assert.equal(none.reason, 'nosensor');
+  } finally {
+    await sim.disconnect();
+  }
+});
+
+test('turnInPlace stops on a stall (wheels blocked)', async () => {
+  let t = 0, rpm = 0;
+  const bus = { submit: async (c) => { if (c.cmd === 'drive') rpm = c.args.left; if (c.cmd === 'stop') rpm = 0; return { ok: true }; } };
+  const sample = async () => { t += 150; return { yaw: 3, encL: 0, encR: 0 }; };
+  const r = await turnInPlace(bus, { deg: 90, sample, clock: { now: () => t, sleep: async (ms) => { t += ms; } } });
+  assert.equal(r.reason, 'stall');
+  assert.equal(rpm, 0);
 });

@@ -78,7 +78,14 @@ export class SimRobot {
   // timeScale > 1 runs motion faster than real time (tests).
   // encScale: per-wheel encoder scale [left, right], e.g. [1.03, 1] to emulate
   // a slipping or worn wheel for odometry fusion tests.
-  constructor({ log, onStatus, onChange, timeScale = 1, obstacles = OBSTACLES, room = ROOM, encScale = [1, 1] }) {
+  // Hardware imperfections (all off by default):
+  //   turnError     blocking turn() rotates deg * (1 + turnError)
+  //   yawMode       'wrap' (-180..180) or 'unbounded' (keeps counting)
+  //   yawInteger    yaw reported as an integer, like get_yaw() on 44.01.013
+  //   encNoiseDeg   uniform noise on each encoder reading
+  //   latencyMs     sensor query round trip for makeSimSampler (read halfway)
+  constructor({ log, onStatus, onChange, timeScale = 1, obstacles = OBSTACLES, room = ROOM, encScale = [1, 1],
+    turnError = 0, yawMode = 'wrap', yawInteger = false, encNoiseDeg = 0, latencyMs = 0 }) {
     this.kind = 'sim';
     this.timeScale = timeScale;
     this.obstacles = obstacles;
@@ -93,6 +100,7 @@ export class SimRobot {
     this.startHeading = this.state.heading;
     this.enc = [0, 0];      // cumulative wheel angles in degrees, forward-positive
     this.encScale = encScale;
+    Object.assign(this, { turnError, yawMode, yawInteger, encNoiseDeg, latencyMs });
     this.impact = null;     // { at: sim seconds, ms2 } of the last collision
     this.motion = null; // {vLin cm/s, vAng deg/s, until}
     this.connected = false;
@@ -180,7 +188,7 @@ export class SimRobot {
 
   async turn(deg, { wait = false, speed = 50 } = {}) {
     const secs = (Math.abs(deg) / 180) * (50 / speed);
-    await this.go(0, (Math.sign(deg) * Math.abs(deg)) / secs, secs, `turn(${deg},${speed})`);
+    await this.go(0, (deg * (1 + this.turnError)) / secs, secs, `turn(${deg},${speed})`);
     if (wait) await this.settle(secs);
   }
 
@@ -213,8 +221,9 @@ export class SimRobot {
   async yaw() { return this.yawNow(); }
 
   yawNow() {
-    const d = ((this.state.heading - this.startHeading) % 360 + 540) % 360 - 180;
-    return Math.round(d * 10) / 10;
+    const raw = this.state.heading - this.startHeading;
+    const d = this.yawMode === 'unbounded' ? raw : ((raw % 360) + 540) % 360 - 180;
+    return this.yawInteger ? Math.round(d) : Math.round(d * 10) / 10;
   }
 
   // Ultrasonic: nearest echo within a narrow cone from the sensor at the
@@ -243,8 +252,8 @@ export class SimRobot {
     return {
       t: now * 1000,
       distanceCm: this.distanceNow(),
-      encL: Math.round(this.enc[0] * 10) / 10,
-      encR: Math.round(this.enc[1] * 10) / 10,
+      encL: Math.round((this.enc[0] + this.encNoiseDeg * (2 * Math.random() - 1)) * 10) / 10,
+      encR: Math.round((this.enc[1] + this.encNoiseDeg * (2 * Math.random() - 1)) * 10) / 10,
       acc: { x: -hit, y: 0, z: -G },
       yaw: this.yawNow(),
       shake: hit ? Math.min(100, hit * 5) : 0,

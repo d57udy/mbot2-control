@@ -90,3 +90,23 @@ The combined poll in its full form (port form `"EM1"`) is 168 bytes:
 (the exact string comes from `buildSampleExpr`; the test suite checks that it stays under 200 bytes).
 
 After the session, update `SENSOR_EXPR` (port form), `BLE_SENSORS` (which entries are confirmed) and `yawSign` in `js/motion.js`, and record the measured jolt and shake values to tune `MOTION.joltMs2` and `MOTION.shakeLimit`.
+
+## 5. Field test v0.5.4: oscillating turns (2026-10-04)
+
+Log: turns -72, -2, -44, -12, -149, then -69, -125, +104, -122, +104 with 20 to 30 cm legs, and a door frame hit that was not detected.
+
+Reproduced in the simulator with `turnError: -2` (the blocking `mbot2.turn(deg)` rotating by -deg). Every other imperfection was on as well: integer, unbounded yaw, ±1° encoder noise and 200 ms sensor latency. The gyro keeps the estimate right, so each next plan asks to undo the last turn, and that undo runs backwards too. The simulated legs gave -149, +99, -167, +124, -145, +100, the same pattern as the log. With a correct `mbot2.turn` but up to ±10 % turn error, there is no oscillation. A second defect made it worse: the gyro reference (`yawRef`) was set at the first correction, after the first turn, so that turn's error stayed in every later heading.
+
+Hardware check still open: send `mbot2.turn(90)` and read `cyberpi.get_yaw()` before and after. Clockwise positive means yaw rises by about 90.
+
+Fixes in `js/navigate.js` and `js/motion.js`:
+- **Turns:** they are closed-loop on the gyro by default (`turnInPlace`). The robot spins with `drive` frames and stops on yaw (±1.5°, correction passes at creep speed). If the robot turns the wrong way, it learns `spinSign`. Without a sampler, the robot falls back to `mbot2.turn`. With the gyro on, it learns the sign of that turn as well (`turnSign`).
+- **Gyro reference:** `yawRef` is taken before the first motion of every task.
+- **Scan matching:** the match moves only x/y while the gyro is on. Routine corrections are capped at 30 cm and 30°.
+- **Glancing hits on straight legs:**
+
+| Check | Trigger |
+|---|---|
+| Per-wheel stall | One wheel makes less than 30 % of its commanded progress over 400 ms, seen in two consecutive windows |
+| Twist | Yaw changes more than 10° |
+| Wheel | The heading implied by the encoder difference changes more than 8° |

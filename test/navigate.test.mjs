@@ -185,6 +185,38 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
     }
   });
 
+  // Field log (v0.5.4): turns -125, +104, -122, +104 ... and no progress. Reproduced
+  // when mbot2.turn rotates the other way than commanded while the gyro keeps the
+  // estimate right: every correction is executed backwards. Emulated here with
+  // turnError -2 plus integer, unbounded yaw, encoder noise and 200 ms latency.
+  const FIELD = { turnError: -2, yawInteger: true, yawMode: 'unbounded', encNoiseDeg: 1, latencyMs: 200 };
+  for (const turnMode of ['gyro', 'blocking']) {
+    test(`field oscillation regression (${turnMode} turns)`, async () => {
+      // timeScale 10: the emulated latency must dominate event-loop jitter under test load
+      const { sim, nav, pose, events, truth } = await setup({ attach: true, useYaw: true, localize: true, turnMode, timeScale: 10, simOpts: FIELD });
+      try {
+        const goal = { x: 110, y: 70 };
+        const r = await nav.goTo(goal, { tolCm: 10, maxLegs: 10 });
+        assert.equal(r.ok, true, r.note);
+        assert.ok(d(truth(), goal) <= 15, `truth ${JSON.stringify(truth())}`);
+        assert.ok(d(truth(), pose.pose) < 10 && angErr(truth().heading, pose.pose.heading) < 5, `est ${JSON.stringify(pose.pose)} truth ${JSON.stringify(truth())}`);
+        const turns = events.filter((e) => e.type === 'turn');
+        assert.ok(turns.length && turns.every((e) => e.mode === turnMode));
+        // no back-and-forth. The field run flipped the sign of every large turn
+        // (9 flips in 10 legs); a detour may need one, blocking mode one more
+        // to undo its wrong-way turn before it has learned the sign.
+        const big = turns.filter((e) => Math.abs(e.target) > 60).map((e) => e.target);
+        const flips = big.filter((t, i) => i > 0 && Math.sign(t) !== Math.sign(big[i - 1])).length;
+        assert.ok(flips <= (turnMode === 'blocking' ? 2 : 1), `large turns ${big}`);
+        if (turnMode === 'blocking') assert.ok(events.some((e) => e.type === 'warning' && /opposite sign/.test(e.note)), 'learned the turn sign');
+        else assert.ok(turns.every((e) => Math.abs(e.achieved - e.target) <= 3 || Math.abs(e.target) <= 1.5), JSON.stringify(turns.map((e) => [e.target, e.achieved])));
+        assert.ok(!events.some((e) => e.type === 'crash'), `no false crash: ${JSON.stringify(events.filter((e) => e.type === 'crash'))}`);
+      } finally {
+        await sim.disconnect();
+      }
+    });
+  }
+
   test('yaw correction keeps the heading on the gyro', async () => {
     const { sim, nav, pose, truth } = await setup({ useYaw: true });
     try {

@@ -28,7 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.5.5';
+export const APP_VERSION = '0.6.0';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -578,6 +578,13 @@ function showLog() {
   logEl.closest('details').open = true;
   logEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
+
+$('btn-turntest').onclick = async () => {
+  showLog();
+  if (!robot?.connected || !robot.turnTest) { log('! Dreh-Test: erst mit dem echten Roboter verbinden'); return; }
+  $('btn-turntest').disabled = true;
+  try { await robot.turnTest((line) => log(line)); } finally { $('btn-turntest').disabled = false; }
+};
 
 $('btn-enctest').onclick = async () => {
   showLog();

@@ -38,6 +38,11 @@ export const MOTION = {
   joltMs2: 6,         // change of the acceleration vector between two samples
   shakeLimit: 40,     // cyberpi.get_shakeval() 0..100
   headingDeg: 12,     // yaw change not explained by the wheels
+  // Glancing hits on straight legs (one wheel caught, the body twisted).
+  // Noise at 4 to 6 Hz: integer yaw +-1 deg, encoders +-1 wheel deg (0.5 deg
+  // of heading), closed-loop wheels hold a straight line within a few deg.
+  twistDeg: 10,       // yaw change on a straight leg
+  wheelDeg: 8,        // encoder-implied heading change on a straight leg
   settleMs: 150,      // wait after a stop before the final reading, so the coast is counted
   backoffCm: 5,
   backoffRpm: 25,
@@ -120,20 +125,32 @@ export function makeBleSampler(robot, sensors = BLE_SENSORS, { fallback = BLE_SE
 
 // Sampler over SimRobot.sensorSample(), with a clock in simulated time so
 // legs behave the same at any timeScale.
+// sim.latencyMs emulates the BLE round trip: the robot reads its sensors
+// halfway, the reply (and t) arrives at the end.
 export function makeSimSampler(sim) {
-  const sample = async () => sim.sensorSample();
   const k = () => sim.timeScale || 1;
-  sample.clock = {
+  const clock = {
     now: () => performance.now() * k(),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms / k())),
   };
+  const sample = async () => {
+    const lat = sim.latencyMs || 0;
+    if (!lat) return sim.sensorSample();
+    await clock.sleep(lat / 2);
+    const s = sim.sensorSample();
+    await clock.sleep(lat / 2);
+    return { ...s, t: clock.now() };
+  };
+  sample.clock = clock;
   return sample;
 }
 
 const realClock = { now: () => performance.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
 
 // Looks back over the sample history (newest last) for a crash or stall.
-// Each entry: { t, drivenCm, cmdCm, distanceCm?, acc?, shake?, yawDelta?, encHeading?, hasEnc }.
+// Each entry: { t, drivenCm, cmdCm, distanceCm?, acc?, shake?, yawDelta?, encHeading?, hasEnc,
+// dL?, dR?, cmdL?, cmdR? } (per-wheel cm, signed). expected.straight enables the
+// glancing-hit checks (twist, wheel) that assume equal wheel commands.
 export function detectCrash(samples, expected = {}) {
   const o = { ...MOTION, ...expected };
   const n = samples.length;
@@ -146,14 +163,36 @@ export function detectCrash(samples, expected = {}) {
     if (d > o.joltMs2) return { crash: true, reason: 'jolt', value: d };
   }
   if (s.shake != null && s.shake > o.shakeLimit) return { crash: true, reason: 'jolt', value: s.shake };
+  // Stall must show in two consecutive windows: a single sample can lag the
+  // commanded progress by half a round trip (150 to 270 ms on BLE).
+  const stalled = (j) => {
+    const e = samples[j];
+    if (!e?.hasEnc) return null;
+    let w = null;
+    for (let i = j - 1; i >= 0; i--) if (e.t - samples[i].t >= o.stallMs) { w = samples[i]; break; }
+    if (!w) return null;
+    const want = e.cmdCm - w.cmdCm, got = e.drivenCm - w.drivenCm;
+    if (want >= o.stallMinCm && got < o.stallRatio * want) return { value: got / want };
+    // one wheel held back (door frame, chair leg) while the other keeps going
+    for (const [k, c, side] of [['dL', 'cmdL', 'left'], ['dR', 'cmdR', 'right']]) {
+      if (e[k] == null || w[k] == null || e[c] == null || w[c] == null) continue;
+      const wantW = e[c] - w[c], gotW = (e[k] - w[k]) * Math.sign(wantW);
+      if (Math.abs(wantW) >= o.stallMinCm && gotW < o.stallRatio * Math.abs(wantW)) return { value: gotW / Math.abs(wantW), wheel: side };
+    }
+    return null;
+  };
+  const st = stalled(n - 1);
+  if (st && stalled(n - 2)) return { crash: true, reason: 'stall', ...st };
+  if (o.straight && s.yawDelta != null && Math.abs(s.yawDelta) > o.twistDeg) {
+    return { crash: true, reason: 'twist', value: s.yawDelta };
+  }
+  if (o.straight && s.hasEnc && Math.abs(s.encHeading ?? 0) > o.wheelDeg) {
+    return { crash: true, reason: 'wheel', value: s.encHeading };
+  }
   if (s.yawDelta != null) {
     const div = Math.abs(normDeg(s.yawDelta - (s.encHeading ?? 0)));
-    if (div > o.headingDeg) return { crash: true, reason: 'heading', value: div };
-  }
-  const w = s.hasEnc && before(o.stallMs);
-  if (w) {
-    const want = s.cmdCm - w.cmdCm, got = s.drivenCm - w.drivenCm;
-    if (want >= o.stallMinCm && got < o.stallRatio * want) return { crash: true, reason: 'stall', value: got / want };
+    const tol = o.headingDeg + (o.headingFrac ?? 0) * Math.abs(s.yawDelta);
+    if (div > tol) return { crash: true, reason: 'heading', value: div };
   }
   const v = o.slip && before(o.slipMs);
   const ok = (x) => x != null && x > 0 && x < o.slipMaxRangeCm;
@@ -195,7 +234,7 @@ export async function driveLeg(bus, {
   const target = Math.max(0, Number(cm) || 0);
   const vNom = (speed / 60) * WHEEL_CM;
   const samples = [];
-  let reason = null, detail = null, note, contactCm = null, backedCm = 0;
+  let reason = null, detail = null, details = null, note, contactCm = null, backedCm = 0;
   let base = null, last = null, cmdCm = 0, tPrev = null, errors = 0, cancelled = false;
 
   const send = async (l, r) => {
@@ -217,7 +256,8 @@ export async function driveLeg(bus, {
     const hasEnc = raw.encL != null && raw.encR != null && base.encL != null && base.encR != null;
     const dL = hasEnc ? (raw.encL - base.encL) * cmPerDeg : 0, dR = hasEnc ? (raw.encR - base.encR) * cmPerDeg : 0;
     const s = {
-      t, hasEnc, cmdCm,
+      t, hasEnc, cmdCm, cmdL: cmdCm, cmdR: cmdCm,
+      dL: hasEnc ? dL : undefined, dR: hasEnc ? dR : undefined,
       drivenCm: hasEnc ? (dL + dR) / 2 : cmdCm,
       encHeading: hasEnc ? ((dL - dR) / TRACK_CM) * (180 / Math.PI) : 0,
       distanceCm: raw.distanceCm, acc: raw.acc, shake: raw.shake,
@@ -262,8 +302,14 @@ export async function driveLeg(bus, {
       const s = await readSafe(rpm);
       if (signal?.aborted) throw abortError();
       if (s) {
-        const c = detectCrash(samples, o);
-        if (c.crash) { reason = c.reason === 'stall' ? 'stall' : 'crash'; detail = c.reason; contactCm = s.drivenCm; break; }
+        const c = detectCrash(samples, { ...o, straight: true });
+        if (c.crash) {
+          reason = c.reason === 'stall' ? 'stall' : 'crash';
+          detail = c.reason;
+          details = { value: c.value, wheel: c.wheel, drivenCm: s.drivenCm, yawDelta: s.yawDelta, encHeading: s.encHeading };
+          contactCm = s.drivenCm;
+          break;
+        }
       }
       const wait = period - (clock.now() - tick);
       if (wait > 1) await clock.sleep(wait);
@@ -300,8 +346,158 @@ export async function driveLeg(bus, {
   return {
     ok: reason === 'done',
     droveCm: last ? last.drivenCm : 0,
-    reason, detail, note, cancelled, contactCm, backedCm, samples,
+    reason, detail, details, note, cancelled, contactCm, backedCm, samples,
     encHeading: last?.hasEnc ? last.encHeading : null,
     yawDelta: last?.yawDelta ?? null,
   };
+}
+
+export const TURN = {
+  rpm: 30,            // wheel RPM while far from the target (about 100 deg/s)
+  creepRpm: 6,        // near the target (about 20 deg/s)
+  slowDeg: 40,        // ramp down over the last degrees
+  tolDeg: 1.5,
+  coastS: 0.05,       // extra lead for the stop on top of the sample age
+  reverseDeg: 8,      // rotation against the command that proves a reversed spin
+  maxPasses: 4,       // first pass plus corrections
+  hz: 10,             // at most this many polls per second (BLE is slower anyway)
+};
+
+// Closed-loop turn in place: streams spin `drive` commands (leg: true) and
+// reads yaw (encoders if yaw is missing) until the heading is within tolDeg of
+// the target. Positive deg = clockwise, like `turn`. Stops early on a stall
+// or jolt. spinSign maps clockwise onto wheel commands; if the robot turns
+// the other way the sign is flipped and returned (reversed: true).
+// Returns { ok, achievedDeg, reason: 'done'|'crash'|'stall'|'aborted'|'error'|'nosensor',
+// detail, details, spinSign, reversed, passes, samples, note }. Always ends with a stop.
+export async function turnInPlace(bus, {
+  deg, sample, makeCommand = defaultMakeCommand, signal, clock, spinSign = 1, yawSign = 1,
+  cmPerDeg = CM_PER_DEG, opts = {},
+} = {}) {
+  const o = { ...MOTION, ...TURN, ...opts };
+  const mk = makeCommand;
+  clock ??= sample?.clock ?? realClock;
+  const target = Number(deg) || 0;
+  const samples = [];
+  let reason = null, detail = null, details = null, note, cancelled = false, reversed = false, passes = 0;
+  let base = null, prevYaw = null, yawAcc = 0, last = null, tPrev = null, cmdL = 0, cmdR = 0, errors = 0;
+  const rate = (rpm) => (rpm * 360 * WHEEL_CM) / (60 * Math.PI * TRACK_CM); // deg/s of the body
+
+  const send = async (l, r) => {
+    const res = await bus.submit(mk('drive', { left: l, right: r, leg: true }, 'agent', 500));
+    if (!res.ok) {
+      if (/cancelled by stop/.test(res.error ?? '')) { cancelled = true; throw abortError(res.error); }
+      throw new Error(res.error);
+    }
+  };
+  const stop = () => bus.submit(mk('stop', {}, 'agent')).catch(() => {});
+
+  // turned: clockwise degrees since the start, from unwrapped yaw or encoders
+  const read = async (l, r) => {
+    const raw = await sample();
+    const t = clock.now();
+    if (tPrev != null) {
+      const dt = (t - tPrev) / 1000;
+      cmdL += (l / 60) * WHEEL_CM * dt;
+      cmdR += (r / 60) * WHEEL_CM * dt;
+    }
+    tPrev = t;
+    base ??= raw;
+    if (raw.yaw != null) {
+      if (prevYaw != null) yawAcc += normDeg(raw.yaw - prevYaw); // works for wrapped and unbounded yaw
+      prevYaw = raw.yaw;
+    }
+    const hasEnc = raw.encL != null && raw.encR != null && base.encL != null && base.encR != null;
+    const dL = hasEnc ? (raw.encL - base.encL) * cmPerDeg : undefined, dR = hasEnc ? (raw.encR - base.encR) * cmPerDeg : undefined;
+    const encHeading = hasEnc ? ((dL - dR) / TRACK_CM) * (180 / Math.PI) : undefined;
+    const yawDelta = base.yaw != null && raw.yaw != null ? yawAcc * yawSign : undefined;
+    const s = {
+      t, hasEnc, dL, dR, cmdL, cmdR, encHeading, yawDelta, acc: raw.acc, shake: raw.shake,
+      // stall over both wheels: travel in the commanded directions
+      cmdCm: (Math.abs(cmdL) + Math.abs(cmdR)) / 2,
+      drivenCm: hasEnc ? (dL * Math.sign(cmdL || 1) + dR * Math.sign(cmdR || -1)) / 2 : 0,
+      turned: yawDelta ?? encHeading,
+    };
+    samples.push(s);
+    last = s;
+    return s;
+  };
+  const readSafe = async (l, r) => {
+    try { const s = await read(l, r); errors = 0; return s; } catch (e) {
+      if (++errors >= o.maxSampleErrors) throw new Error(`sensor poll failed: ${e?.message ?? e}`);
+      return null;
+    }
+  };
+
+  try {
+    if (signal?.aborted) throw abortError();
+    if (typeof sample !== 'function') { reason = 'nosensor'; return finish(); }
+    await read(0, 0);
+    if (last.turned == null) { reason = 'nosensor'; return finish(); }
+    const t0 = clock.now();
+    const timeout = (Math.abs(target) / rate(o.creepRpm + 4)) * 1000 + 3000;
+    while (passes < o.maxPasses && !reason) {
+      const remaining0 = target - last.turned;
+      if (Math.abs(remaining0) <= o.tolDeg) { reason = 'done'; break; }
+      passes++;
+      const dir = Math.sign(remaining0); // +1 clockwise
+      const startTurned = last.turned;
+      let prev = last;
+      while (true) {
+        if (signal?.aborted) throw abortError();
+        if (clock.now() - t0 > timeout) { reason = 'stall'; detail = 'timeout'; break; }
+        const remaining = (target - last.turned) * dir;
+        // stop early by what the robot turns before the stop lands
+        const dt = Math.max(0.05, (last.t - prev.t) / 1000);
+        const w = prev === last ? 0 : Math.abs(last.turned - prev.turned) / dt;
+        if (remaining <= 0.5 + w * (dt * 0.75 + o.coastS)) break;
+        // correction passes creep slower: they start close to the target
+        const creep = passes > 1 ? Math.max(3, o.creepRpm / 2) : o.creepRpm;
+        const rpm = Math.round(creep + (o.rpm - creep) * clamp((remaining - o.tolDeg) / o.slowDeg, 0, 1));
+        const l = dir * spinSign * rpm, r = -dir * spinSign * rpm;
+        const tick = clock.now();
+        await send(l, r);
+        prev = last;
+        const s = await readSafe(l, r);
+        if (signal?.aborted) throw abortError();
+        if (!s) continue;
+        const moved = s.turned - startTurned;
+        if (!reversed && Math.abs(moved) >= o.reverseDeg && Math.sign(moved) !== dir) {
+          // the wheels turn the robot the other way: flip the spin mapping
+          spinSign = -spinSign;
+          reversed = true;
+          passes--; // the reversal does not count as a correction pass
+          break;
+        }
+        const c = detectCrash(samples, { ...o, straight: false, headingFrac: 0.25 });
+        if (c.crash && c.reason !== 'heading') {
+          reason = c.reason === 'stall' ? 'stall' : 'crash';
+          detail = c.reason;
+          details = { value: c.value, wheel: c.wheel, turned: s.turned };
+          break;
+        }
+        const wait = 1000 / o.hz - (clock.now() - tick);
+        if (wait > 1) await clock.sleep(wait);
+      }
+      await stop();
+      await clock.sleep(o.settleMs);
+      await readSafe(0, 0);
+    }
+    reason ??= 'done'; // errorDeg tells how close the last pass got
+  } catch (e) {
+    if (e?.name === 'AbortError') { reason = 'aborted'; note = cancelled ? e.message : 'aborted'; }
+    else { reason = 'error'; note = e?.message ?? String(e); }
+  } finally {
+    if (reason !== 'nosensor') await stop();
+  }
+  return finish();
+
+  function finish() {
+    const achieved = last?.turned ?? 0;
+    return {
+      ok: reason === 'done', achievedDeg: Math.round(achieved * 10) / 10, targetDeg: target,
+      errorDeg: Math.round((target - achieved) * 10) / 10,
+      reason, detail, details, note, cancelled, spinSign, reversed, passes, samples,
+    };
+  }
 }

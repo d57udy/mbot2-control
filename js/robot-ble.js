@@ -227,6 +227,30 @@ export class BleRobot {
     report('Encoder-Test fertig. Erwartet: nach 1 s bei 30 RPM etwa 180° Radwinkel (EM2 negativ, weil gespiegelt).');
   }
 
+  // Checks the sign and accuracy of the firmware's blocking mbot2.turn():
+  // a +90 command should raise get_yaw() (clockwise positive) by about 90.
+  async turnTest(report) {
+    const yaw = async () => Number(await this.query('cyberpi.get_yaw()', 2000));
+    report('Dreh-Test: mbot2.turn(90), dann mbot2.turn(-90) (Roboter dreht sich auf der Stelle)');
+    try {
+      const y0 = await yaw();
+      await this.query('mbot2.turn(90)', 8000);
+      await new Promise((r) => setTimeout(r, 300));
+      const y1 = await yaw();
+      await this.query('mbot2.turn(-90)', 8000);
+      await new Promise((r) => setTimeout(r, 300));
+      const y2 = await yaw();
+      const d1 = ((y1 - y0 + 540) % 360) - 180, d2 = ((y2 - y1 + 540) % 360) - 180;
+      report(`yaw ${y0} → ${y1} → ${y2}: turn(90) ergab ${d1}°, turn(-90) ergab ${d2}°`);
+      report(d1 > 45 ? 'Ergebnis: mbot2.turn dreht wie erwartet (+ = im Uhrzeigersinn).'
+        : d1 < -45 ? 'Ergebnis: mbot2.turn dreht ANDERSHERUM als kommandiert (bestätigt die Ursache des Zickzacks).'
+          : 'Ergebnis: unklar (kaum Drehung gemessen).');
+    } catch (e) {
+      report(`! Dreh-Test: ${e.message.split(':')[0]}`);
+      await this.stop().catch(() => {});
+    }
+  }
+
   async connectionTest(report) {
     const ms = (t0) => Math.round(performance.now() - t0);
     const t = async (label, script, timeout = 4000) => {

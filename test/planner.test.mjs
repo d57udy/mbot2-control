@@ -195,7 +195,9 @@ test('planner: home path keeps clear of the table leg after scans from other pos
   assert.ok(c > SIM_ROBOT.radiusCm + 3, `home path ${c.toFixed(1)} cm from an obstacle`);
 });
 
-// legMode 'straight': blocking legs, independent of the drive-leg crash detection
+// legMode 'straight': blocking legs, independent of the drive-leg crash detection.
+// legsPerScan 2: checks planner clearance on a well-scanned map; the leg is
+// only in the map if a scan beam has hit it.
 test('planner: scan, drive past the leg and go home in the sim without coming close', async () => {
   const sim = new SimRobot({ log: () => {}, onStatus: () => {}, timeScale: 80 });
   const bus = new CommandBus({ log: () => {} });
@@ -205,7 +207,7 @@ test('planner: scan, drive past the leg and go home in the sim without coming cl
   sim.onChange = (s) => { minClear = Math.min(minClear, trueClearance([{ x: s.x - 150, y: 100 - s.y }, { x: s.x - 150, y: 100 - s.y }], SIM_OBSTACLES)); };
   const map = new GridMap({});
   const plans = [];
-  const nav = new Navigator({ bus, map, pose: new PoseTracker(), scan, settleMs: 0, legMode: 'straight', steps: 8,
+  const nav = new Navigator({ bus, map, pose: new PoseTracker(), scan, settleMs: 0, legMode: 'straight', steps: 8, legsPerScan: 2,
     onEvent: (e) => { if (e.type === 'plan') plans.push(e.path); } });
   try {
     await nav.scanHere({});
