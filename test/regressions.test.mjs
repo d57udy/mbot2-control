@@ -106,3 +106,15 @@ test('turn and straight carry the chosen speed', async () => {
   await bus.submit(makeCommand('straight', { cm: 20, speed: 80 }));
   assert.deepEqual(sent, [['turn', 90, 30], ['straight', 20, 80]]);
 });
+
+test('BLE turn compensates the firmware turn sign (+90 = clockwise)', async () => {
+  const { FIRMWARE_TURN_SIGN } = await import('../js/robot-ble.js');
+  const sent = [];
+  const r = new BleRobot({ log: stub, onStatus: stub });
+  r.run = async (s) => sent.push(s);
+  r.query = async (s) => sent.push(s);
+  await r.turn(90, { speed: 40 });
+  await r.turn(-45, { wait: true, speed: 40 });
+  assert.equal(FIRMWARE_TURN_SIGN, -1);
+  assert.deepEqual(sent, ['mbot2.turn(-90,40)', 'mbot2.turn(45,40)']);
+});

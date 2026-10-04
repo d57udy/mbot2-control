@@ -35,3 +35,4 @@ Open: whether the eye effects now all play, the line-sensor polarity, wheel dire
 | `mbot2.EM_get_angle("EM1"/"EM2")` and `(1/2)` | both forms work; during `drive_speed(30,-30)`: 97/-104 after 0.5 s, 245/-247 after stop (wheel degrees, EM2 negative forward) |
 | `mbot2.EM_get_speed(1/2)` | 29.6/-29.6 at 30 RPM, 0 after stop |
 | One combined poll (8 values) | 150 to 270 ms per round trip |
+| `mbot2.turn(90)` / `mbot2.turn(-90)` (Dreh-Test) | yaw 0 → **-87** → 0: **the firmware turns opposite to the documented sign** (+ = counterclockwise). The driver sends `-deg` (`FIRMWARE_TURN_SIGN`); this caused the navigation zigzag and mirrored step scans in v0.5.x |

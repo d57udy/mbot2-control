@@ -75,6 +75,7 @@ export const EYE_EFFECT_NEEDS_BRI = new Set(['happy', 'wink', 'naughty', 'aggrie
 // Measured on firmware 44.01.013: 200-byte scripts work, 300-byte scripts are
 // silently dropped. Longer code goes through execLong; long replies through queryLong.
 export const MAX_SCRIPT = 200;
+export const FIRMWARE_TURN_SIGN = -1; // see turn()
 const byteLen = (s) => new TextEncoder().encode(s).length;
 const EFFECT_DEFAULT_MS = 6000; // generous: the reply ends the quiet period early
 const safeName = (n) => { if (!/^[a-z_]+$/.test(n)) throw new Error(`bad effect name ${n}`); return n; };
@@ -413,8 +414,11 @@ export class BleRobot {
   // wait: send with reply so the promise resolves when the robot has finished
   // the (blocking) gyro turn. Used by scans and the AI agent.
   // speed: wheel RPM (Makeblock signature turn(angle, speed=50)).
+  // Firmware 44.01.013 turns mbot2.turn(+90) counterclockwise (yaw 0 -> -87,
+  // Dreh-Test 2026-10-04), opposite to the documentation; FIRMWARE_TURN_SIGN
+  // keeps "+ = clockwise/right" for every caller.
   turn(deg, { wait = false, speed = 50 } = {}) {
-    const s = `mbot2.turn(${deg},${speed})`;
+    const s = `mbot2.turn(${FIRMWARE_TURN_SIGN * deg},${speed})`;
     return wait ? this.query(s, 2000 + Math.abs(deg) * 30 * (50 / speed)) : this.run(s);
   }
 
