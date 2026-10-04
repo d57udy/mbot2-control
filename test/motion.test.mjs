@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   driveLeg, detectCrash, buildSampleExpr, parseSample, makeBleSampler, makeSimSampler,
-  SENSOR_EXPR, BLE_SENSORS, CM_PER_DEG,
+  SENSOR_EXPR, BLE_SENSORS, BLE_SENSORS_MIN, CM_PER_DEG,
 } from '../js/motion.js';
 import { SimRobot } from '../js/robot-sim.js';
 
@@ -158,7 +158,7 @@ test('sample expressions fit the 200-byte limit and parse mirrored encoders', as
   assert.equal(a.distanceCm, 42);
   assert.equal(b.yaw, 7);
   assert.equal(sent.length, 3);
-  assert.equal(sent[2], buildSampleExpr(BLE_SENSORS).expr);
+  assert.equal(sent[2], buildSampleExpr(BLE_SENSORS_MIN).expr);
 });
 
 test('SimRobot sensorSample: encoders follow motion, impact shows on the accelerometer', async () => {

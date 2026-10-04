@@ -52,8 +52,15 @@ export const SENSOR_EXPR = {
   shake: 'cyberpi.get_shakeval()',
 };
 
-// What the robot is known to answer today; extend after the probe session.
-export const BLE_SENSORS = { distance: SENSOR_EXPR.distance, yaw: SENSOR_EXPR.yaw };
+// Confirmed on firmware 44.01.013 (research/07): distance, yaw (clockwise
+// positive, degrees), acceleration (m/s², z = -9.6 at rest), shake.
+// Encoders exist but the port form is not confirmed yet, so they stay out:
+// a wrong form reads 0 and would look like a stall on every leg.
+export const BLE_SENSORS = {
+  distance: SENSOR_EXPR.distance, yaw: SENSOR_EXPR.yaw,
+  ax: SENSOR_EXPR.ax, ay: SENSOR_EXPR.ay, az: SENSOR_EXPR.az, shake: SENSOR_EXPR.shake,
+};
+export const BLE_SENSORS_MIN = { distance: SENSOR_EXPR.distance, yaw: SENSOR_EXPR.yaw };
 
 const FIELDS = ['distance', 'encL', 'encR', 'ax', 'ay', 'az', 'yaw', 'shake'];
 const MAX_SCRIPT = 200;
@@ -88,7 +95,7 @@ export function parseSample(keys, values, { mirrored = true, swap = false } = {}
 
 // Sampler over BleRobot.query. If the full expression fails (a name the
 // firmware lacks), falls back once to `fallback` and keeps using it.
-export function makeBleSampler(robot, sensors = BLE_SENSORS, { fallback = BLE_SENSORS, timeoutMs = 1200, log } = {}) {
+export function makeBleSampler(robot, sensors = BLE_SENSORS, { fallback = BLE_SENSORS_MIN, timeoutMs = 1200, log } = {}) {
   let cur = buildSampleExpr(sensors);
   let canFall = fallback && fallback !== sensors;
   const sample = async () => {

@@ -203,6 +203,30 @@ export class BleRobot {
     report('Sensor-Test fertig. Bitte den Roboter jetzt von Hand etwa 90° im Uhrzeigersinn drehen und den Test erneut starten.');
   }
 
+  // Drives both wheels slowly for about 1 s (forward, mirrored motors) and
+  // reads the encoders with both port forms, to find the one that works.
+  async encoderTest(report) {
+    const read = async (label) => {
+      try {
+        const v = await this.query('[mbot2.EM_get_angle("EM1"),mbot2.EM_get_angle("EM2"),mbot2.EM_get_angle(1),mbot2.EM_get_angle(2),mbot2.EM_get_speed(1),mbot2.EM_get_speed(2)]', 2500);
+        report(`${label}: Winkel "EM1","EM2" = ${v[0]}, ${v[1]} | Winkel 1,2 = ${v[2]}, ${v[3]} | Tempo 1,2 = ${v[4]}, ${v[5]}`);
+      } catch (e) { report(`${label}: Fehler ${e.message.split(':')[0]}`); }
+    };
+    report('Encoder-Test: Räder drehen 1 s langsam vorwärts (Roboter anheben oder Platz lassen)');
+    await read('vorher');
+    try {
+      await this.run('mbot2.drive_speed(30,-30)');
+      await new Promise((r) => setTimeout(r, 500));
+      await read('während');
+      await new Promise((r) => setTimeout(r, 500));
+    } finally {
+      await this.stop();
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    await read('nachher');
+    report('Encoder-Test fertig. Erwartet: nach 1 s bei 30 RPM etwa 180° Radwinkel (EM2 negativ, weil gespiegelt).');
+  }
+
   async connectionTest(report) {
     const ms = (t0) => Math.round(performance.now() - t0);
     const t = async (label, script, timeout = 4000) => {

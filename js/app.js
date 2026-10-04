@@ -7,7 +7,7 @@ import { drawRadar } from './radar.js';
 import { GridMap } from './gridmap.js';
 import { PoseTracker } from './pose.js';
 import { Navigator } from './navigate.js';
-import { makeBleSampler, makeSimSampler, BLE_SENSORS } from './motion.js';
+import { makeBleSampler, makeSimSampler, BLE_SENSORS, BLE_SENSORS_MIN } from './motion.js';
 import { drawMap, fitView, screenToWorld } from './mapview.js';
 import { attachMapControls } from './mapcontrols.js';
 import { saveMap, listMaps, loadMap, deleteMap, exportMap, importMap } from './mapstore.js';
@@ -28,7 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.5.2';
+export const APP_VERSION = '0.5.3';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -579,6 +579,13 @@ function showLog() {
   logEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
+$('btn-enctest').onclick = async () => {
+  showLog();
+  if (!robot?.connected || !robot.encoderTest) { log('! Encoder-Test: erst mit dem echten Roboter verbinden'); return; }
+  $('btn-enctest').disabled = true;
+  try { await robot.encoderTest((line) => log(line)); } finally { $('btn-enctest').disabled = false; }
+};
+
 $('btn-sensortest').onclick = async () => {
   showLog();
   if (!robot?.connected) { log('! Sensor-Test: erst mit dem Roboter verbinden (Verbinden)'); return; }
@@ -758,7 +765,7 @@ let mapScan = null; // { pose, points } of the last scan, drawn on the map
 
 const nav = new Navigator({
   bus, map, pose: tracker, scan,
-  useYaw: false,
+  useYaw: true, // gyro yaw confirmed clockwise positive on 44.01.013
   onEvent: (e) => {
     if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
     if (e.type === 'leg') log(`Navigation: ${e.turnDeg ?? 0}° drehen, ${e.cm ?? '?'} cm fahren`);
@@ -813,7 +820,7 @@ function attachSampler() {
   if (!robot) { nav.sample = undefined; nav.legMode = 'straight'; return; }
   nav.sample = robot.kind === 'sim'
     ? makeSimSampler(robot)
-    : makeBleSampler(robot, BLE_SENSORS, { log });
+    : makeBleSampler(robot, BLE_SENSORS, { fallback: BLE_SENSORS_MIN, log });
   // the navigator picks its leg mode at construction; it is created before any robot connects
   nav.legMode = nav.sample ? 'drive' : 'straight';
 }
