@@ -53,7 +53,7 @@ Each Live Mode query costs about 90 ms (research/07), so one combined list per p
 | Detector | Signal | Works without |
 |---|---|---|
 | Stall | encoder progress below 30 % of the commanded progress over 400 ms (wheels stopped against an obstacle) | accelerometer |
-| Slip | encoders progress more than 8 cm in the window but the ultrasonic range ahead shrinks by less than 30 % of that (wheels spin, robot does not move) | accelerometer |
+| Slip (off by default, `opts.slip`) | encoders progress more than 8 cm in the window but the ultrasonic range ahead shrinks by less than 15 % of that. False positives in the simulator when driving past a side object (the nearest echo in the cone stays at a constant range) | accelerometer |
 | Heading | yaw change minus encoder-implied heading change above 12 degrees (glancing hit turns the robot; this is the owner's "compass vs counted wheel rotations") | accelerometer |
 | Jolt | change of the acceleration vector between two samples above 6 m/s², or `get_shakeval()` above 40 | encoders |
 | Obstacle | ultrasonic below `stopAtCm` | everything else |

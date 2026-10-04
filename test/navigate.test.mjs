@@ -64,7 +64,11 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
   test('goTo around the chair with the pose tracker attached to the bus', async () => {
     const { sim, nav, pose, truth, track } = await setup({ attach: true });
     try {
-      const goal = { x: 130, y: -40 };    // between the chair and the right wall
+      // past the table leg to above the chair. The old goal (130, -40) sat in the
+      // 38 cm gap between the chair and the right wall: with 14 cm inflation
+      // that leaves a 2-cell corridor, which one misplaced cell from a scan
+      // closes ("no path"), so the outcome depended on where the scans landed.
+      const goal = { x: 120, y: 15 };
       const r = await nav.goTo(goal, { tolCm: 10 });
       assert.equal(r.ok, true, r.note);
       assert.ok(d(truth(), goal) <= 15, `truth ${JSON.stringify(truth())}`);

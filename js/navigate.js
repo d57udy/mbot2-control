@@ -53,10 +53,11 @@ const pathLen = (p) => p.slice(1).reduce((s, q, i) => s + dist(p[i], q), 0);
 export class Navigator {
   constructor({ bus, map, pose, scan, onEvent, steps = 12, safetyCm = 20, inflateCm = DEFAULT_INFLATE_CM, maxLegCm = 40,
     legsPerScan = 2, settleMs, useYaw = false, beamDeg = 16, maxRangeCm = 250,
-    sampler, sample = sampler, legMode = sample ? 'drive' : 'straight', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.7, stopAtCm = 15 }) {
+    sampler, sample = sampler, sweepSample, legMode = sample ? 'drive' : 'straight', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.7, stopAtCm = 15 }) {
     // sampler (alias sample): js/motion.js sampler for legs and sweeps; with one,
     // scans default to 'sweep' = continuous rotation, else 'step' = stop-and-measure
     this.scanMode = scanMode;
+    this.sweepSample = sweepSample; // optional lighter sampler for sweeps (distance + yaw)
     this.sweepDegS = sweepDegS;
     Object.assign(this, { bus, map, pose, scanFn: scan, onEvent, steps, safetyCm, inflateCm, maxLegCm, legsPerScan, settleMs, useYaw, beamDeg, maxRangeCm });
     // legMode 'drive': driveLeg with sensor polling (default with a sampler);
@@ -158,7 +159,7 @@ export class Navigator {
     const loc = this.localize && this.mapKnown() ? (this.localizer ?? await loadLocalizer()) : null;
     let res;
     try {
-      res = await sweepScan(this.bus, { sample: this.sample, makeCommand: mk, signal, speedDegS: this.sweepDegS });
+      res = await sweepScan(this.bus, { sample: this.sweepSample ?? this.sample, makeCommand: mk, signal, speedDegS: this.sweepDegS });
     } catch (e) {
       // a bus stop surfaces as AbortError from sweepScan; only the signal is a real abort
       if (e?.name === 'AbortError' && !signal?.aborted) throw new Cancelled(e.message);

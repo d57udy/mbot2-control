@@ -61,6 +61,66 @@ test('driveLeg reaches the target with a ramp and ends with a stop', async () =>
   assert.ok(w.cmds.filter((c) => c.cmd === 'drive').every((c) => c.args.leg === true && c.args.left === c.args.right));
 });
 
+test('driveLeg: realistic IMU noise at rest and while driving does not trigger a crash', async () => {
+  // hardware: get_acc z about -9.6 at rest; small noise on every axis, low shake, yaw jitter
+  let seed = 7;
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 - 0.5; };
+  for (const encoders of [true, false]) {
+    const w = world({ encoders, imu: false });
+    const inner = w.sample;
+    w.sample = async () => ({
+      ...(await inner()),
+      acc: { x: 0.6 * rnd(), y: 0.6 * rnd(), z: -9.6 + 0.6 * rnd() },
+      shake: Math.round(8 * (rnd() + 0.5)),
+      yaw: 30 + 2 * rnd(),
+    });
+    const r = await w.leg({ cm: 60 });
+    assert.equal(r.reason, 'done', `${r.reason} ${r.detail} (encoders ${encoders})`);
+  }
+});
+
+// Hardware-like robot: 150..270 ms per 8-value poll, first-order motor lag and
+// coast (tau 150 ms), +-1 degree encoder noise, mirrored EM2 already undone.
+function laggyWorld({ stuckAt = Infinity, seed = 3 } = {}) {
+  const w = { t: 0, x: 0, v: 0, rpm: 0, cmds: [] };
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  w.advance = (ms) => {
+    for (let k = 0; k < ms; k += 5) {
+      const target = (w.rpm / 60) * WHEEL_CM;
+      w.v += (target - w.v) * (5 / 150);
+      w.x = Math.min(w.x + (w.v * 5) / 1000, stuckAt);
+      if (w.x >= stuckAt) w.v = Math.min(w.v, 0);
+    }
+    w.t += ms;
+  };
+  w.clock = { now: () => w.t, sleep: async (ms) => w.advance(ms) };
+  w.bus = { submit: async (c) => { w.cmds.push(c); if (c.cmd === 'drive') w.rpm = c.args.left; if (c.cmd === 'stop') w.rpm = 0; return { ok: true }; } };
+  w.sample = async () => {
+    const lat = 150 + 120 * rnd();
+    w.advance(lat / 2);
+    const s = { distanceCm: 300, encL: w.x / CM_PER_DEG + (rnd() * 2 - 1), encR: w.x / CM_PER_DEG + (rnd() * 2 - 1),
+      acc: { x: 0.3 * rnd(), y: 0.3 * rnd(), z: -9.6 }, yaw: 0.5 * rnd(), shake: 3 };
+    w.advance(lat / 2);
+    return s;
+  };
+  w.leg = (opts) => driveLeg(w.bus, { sample: w.sample, clock: w.clock, ...opts });
+  return w;
+}
+
+test('driveLeg with hardware-like polls (4 to 6 Hz), motor lag, encoder noise and coast', async () => {
+  for (const seed of [3, 11, 29, 47]) {
+    const w = laggyWorld({ seed });
+    const r = await w.leg({ cm: 40, speed: 40 });
+    assert.equal(r.reason, 'done', `seed ${seed}: ${r.reason} ${r.detail}`);
+    assert.ok(Math.abs(r.droveCm - w.x) < 0.3, `seed ${seed}: reported ${r.droveCm} vs actual ${w.x} (coast counted)`);
+    assert.ok(w.x > 39 && w.x < 43, `seed ${seed}: x ${w.x}`);
+    const b = laggyWorld({ seed, stuckAt: 18 });
+    const rb = await b.leg({ cm: 40, speed: 40 });
+    assert.equal(rb.reason, 'stall', `seed ${seed}: ${rb.reason}`);
+    assert.ok(rb.contactCm > 17 && b.x < 15, `seed ${seed}: contact ${rb.contactCm} x ${b.x}`);
+  }
+});
+
 test('driveLeg stops for an obstacle without backing off', async () => {
   const w = world({ wallAt: 45 });
   const r = await w.leg({ cm: 60, stopAtCm: 20 });
@@ -127,10 +187,11 @@ test('driveLeg aborts, fails on sensor errors and always stops', async () => {
   assert.equal(c.cmds.at(-1).cmd, 'stop');
 });
 
-test('detectCrash: slip when the range does not shrink', () => {
+test('detectCrash: slip (opt-in) when the range does not shrink', () => {
   const s = (t, drivenCm, distanceCm) => ({ t, drivenCm, cmdCm: drivenCm, distanceCm, hasEnc: true });
-  assert.equal(detectCrash([s(0, 0, 80), s(900, 10, 79)]).reason, 'slip');
-  assert.equal(detectCrash([s(0, 0, 80), s(900, 10, 70)]).crash, false);
+  assert.equal(detectCrash([s(0, 0, 80), s(900, 10, 79)]).crash, false, 'off by default');
+  assert.equal(detectCrash([s(0, 0, 80), s(900, 10, 79)], { slip: true }).reason, 'slip');
+  assert.equal(detectCrash([s(0, 0, 80), s(900, 10, 70)], { slip: true }).crash, false);
   assert.equal(detectCrash([s(0, 0, 80)]).crash, false);
 });
 

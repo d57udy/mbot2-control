@@ -27,13 +27,18 @@ export const MOTION = {
   stallMs: 400,       // window for stall: progress below stallRatio of commanded
   stallRatio: 0.3,
   stallMinCm: 1.5,    // judge only when this much was commanded in the window
-  slipMs: 800,        // window for slip: range ahead does not shrink while driving
+  // Slip (range ahead does not shrink while the wheels turn) is off by
+  // default: driving past a side object keeps the nearest echo in the cone at
+  // a constant range, which looked like slip and caused false crashes.
+  slip: false,
+  slipMs: 800,
   slipCm: 8,
   slipRatio: 0.15,
   slipMaxRangeCm: 150,
   joltMs2: 6,         // change of the acceleration vector between two samples
   shakeLimit: 40,     // cyberpi.get_shakeval() 0..100
   headingDeg: 12,     // yaw change not explained by the wheels
+  settleMs: 150,      // wait after a stop before the final reading, so the coast is counted
   backoffCm: 5,
   backoffRpm: 25,
   timeoutFactor: 2.5, // of the nominal leg time
@@ -150,7 +155,7 @@ export function detectCrash(samples, expected = {}) {
     const want = s.cmdCm - w.cmdCm, got = s.drivenCm - w.drivenCm;
     if (want >= o.stallMinCm && got < o.stallRatio * want) return { crash: true, reason: 'stall', value: got / want };
   }
-  const v = before(o.slipMs);
+  const v = o.slip && before(o.slipMs);
   const ok = (x) => x != null && x > 0 && x < o.slipMaxRangeCm;
   if (v && ok(v.distanceCm) && ok(s.distanceCm)) {
     const moved = s.drivenCm - v.drivenCm;
@@ -264,6 +269,7 @@ export async function driveLeg(bus, {
       if (wait > 1) await clock.sleep(wait);
     }
     await stop();
+    await clock.sleep(o.settleMs);
     await readSafe(0);
     if (reason === 'crash' || reason === 'stall') {
       // back off so the robot can turn without scraping the obstacle
@@ -280,6 +286,7 @@ export async function driveLeg(bus, {
         if (wait > 1) await clock.sleep(wait);
       }
       await stop();
+      await clock.sleep(o.settleMs);
       await readSafe(0);
       backedCm = Math.max(0, from - last.drivenCm);
     }
