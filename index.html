@@ -234,13 +234,14 @@
       <h3>Roboter-Kalibrierung</h3>
       <p class="muted small">Gilt für Joystick, Tasten, Scans, Navigation und KI. Wird auf diesem Gerät gespeichert.</p>
       <label><input id="opt-mirrored" type="checkbox" checked> Motoren gespiegelt (Standard mBot2)</label>
-      <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen (Motorstecker vertauscht)</label>
-      <label><input id="opt-turnrev" type="checkbox" checked> Eingebaute Drehung umgekehrt (mbot2.turn, Firmware 44.01.013)</label>
-      <label><input id="opt-yawrev" type="checkbox"> Gyro umgekehrt (nur bei anderer Firmware)</label>
+      <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen (wenn Joystick rechts nach links dreht)</label>
+      <label><input id="opt-turnrev" type="checkbox"> Eingebaute Drehung umgekehrt (mbot2.turn)</label>
+      <label><input id="opt-yawrev" type="checkbox" checked> Gyro umgekehrt (mBot2 Firmware 44.01.013: zählt gegen den Uhrzeigersinn)</label>
       <label>Ultraschall-Reichweite (cm)
         <input id="opt-maxrange" type="number" min="60" max="300" step="10" value="150" inputmode="numeric">
       </label>
       <p class="muted small">Messungen ab dieser Entfernung gelten als „nichts erkannt“: der Sensor meldet dann etwa 180 bis 200 cm, obwohl dort nichts ist. Kein Hindernis wird eingetragen.</p>
+      <p class="muted small">Erst prüfen: Joystick nach rechts dreht den Roboter nach rechts (sonst „Räder tauschen“). Dann erkennt der Knopf Spiegelung, Gyro- und Drehrichtung.</p>
       <button id="btn-calibrate">Automatisch erkennen (Roboter dreht kurz)</button>
       <h3>KI (Gespräch)</h3>
       <label>API-Schlüssel <input id="ai-key" type="password" autocomplete="off" placeholder="sk-ant-…"></label>

@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.6.6';
+export const APP_VERSION = '0.6.8';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -141,7 +141,8 @@ $('btn-disconnect').onclick = async () => {
 };
 
 // Robot calibration: one place for every direction setting, saved per device.
-const CAL_KEYS = { 'opt-mirrored': 'cal.mirrored', 'opt-swap': 'cal.swap', 'opt-turnrev': 'cal.turnrev', 'opt-yawrev': 'cal.yawrev' };
+// v2 keys: values saved before 2026-10-04 came from a gyro-anchored detection with the wrong gyro sign
+const CAL_KEYS = { 'opt-mirrored': 'cal2.mirrored', 'opt-swap': 'cal2.swap', 'opt-turnrev': 'cal2.turnrev', 'opt-yawrev': 'cal2.yawrev' };
 for (const [id, key] of Object.entries(CAL_KEYS)) {
   const saved = store.get(key, null);
   if (saved !== null) $(id).checked = saved === '1';
@@ -181,6 +182,7 @@ $('btn-calibrate').onclick = async () => {
       $('opt-mirrored').checked = r.mirrored;
       $('opt-swap').checked = r.swap;
       $('opt-turnrev').checked = r.turnSign === -1;
+      $('opt-yawrev').checked = r.yawSign === -1;
       applyWheelSettings();
     }
   } finally { $('btn-calibrate').disabled = false; }

@@ -382,7 +382,9 @@ export async function sweepScan(bus, {
     let last = -Infinity;
     const next = async () => {
       const wait = last + minSampleMs - now();
-      await raceAbort(clock.sleep(Math.max(0, wait)), signal);
+      // no timer when not needed (hidden tabs throttle them); the simulator's
+      // sampler answers synchronously and needs a turn of the event loop
+      if (wait > 0 || sample.clock) await raceAbort(clock.sleep(Math.max(0, wait)), signal);
       last = now();
       return raceAbort(within(Promise.resolve().then(sample), sampleTimeoutMs, () => { throw new Error('sweep: sample timeout'); }), signal);
     };

@@ -75,7 +75,7 @@ export const EYE_EFFECT_NEEDS_BRI = new Set(['happy', 'wink', 'naughty', 'aggrie
 // Measured on firmware 44.01.013: 200-byte scripts work, 300-byte scripts are
 // silently dropped. Longer code goes through execLong; long replies through queryLong.
 export const MAX_SCRIPT = 200;
-export const FIRMWARE_TURN_SIGN = -1; // see turn()
+export const FIRMWARE_TURN_SIGN = 1; // mbot2.turn(+deg) turns clockwise (as documented); see turn()
 const byteLen = (s) => new TextEncoder().encode(s).length;
 const EFFECT_DEFAULT_MS = 6000; // generous: the reply ends the quiet period early
 const safeName = (n) => { if (!/^[a-z_]+$/.test(n)) throw new Error(`bad effect name ${n}`); return n; };
@@ -109,7 +109,10 @@ export class BleRobot {
     // Wheel mapping: the motors are mirrored, so forward is EM1 +, EM2 -.
     // Robot calibration (settings "Roboter-Kalibrierung"): motor mounting,
     // connector swap, the firmware's mbot2.turn sign and the gyro sign.
-    this.wheels = { swap: false, mirrored: true, turnSign: FIRMWARE_TURN_SIGN, yawSign: 1 };
+    // Defaults for a standard mBot2 with firmware 44.01.013, anchored on what is
+    // visible (joystick right turns right, 2026-10-04): EM1 left, EM2 mirrored,
+    // mbot2.turn as documented, and the gyro counts COUNTERclockwise positive.
+    this.wheels = { swap: false, mirrored: true, turnSign: FIRMWARE_TURN_SIGN, yawSign: -1 };
   }
 
   // --- connection -------------------------------------------------------
@@ -236,39 +239,42 @@ export class BleRobot {
   // gyro (clockwise positive after yawSign) as the reference. Spins in place;
   // with unmirrored motors the first step drives a few cm forward.
   async calibrate(report) {
-    const ys = this.wheels.yawSign ?? 1;
-    const yaw = async () => Number(await this.query('cyberpi.get_yaw()', 2000)) * ys;
+    // Reference: the wheel mapping as set (check first that the joystick
+    // turns right when pushed right). Derives motor mirroring, the gyro sign
+    // and the mbot2.turn sign from that. Spins in place; with unmirrored
+    // motors the first step drives a few cm forward.
+    const rawYaw = async () => Number(await this.query('cyberpi.get_yaw()', 2000));
     const dyaw = (a, b) => ((b - a + 540) % 360) - 180;
     const pause = (ms) => new Promise((r) => setTimeout(r, ms));
     const out = { ...this.wheels };
-    report('Kalibrierung: Roboter dreht sich kurz auf der Stelle (etwas Platz lassen)');
+    report('Kalibrierung: Voraussetzung ist, dass der Joystick nach rechts den Roboter nach rechts dreht (sonst „Räder tauschen“ umschalten). Roboter dreht sich kurz auf der Stelle.');
     try {
       // 1. same RPM on both motors: mirrored motors spin the robot, unmirrored drive straight
-      let y0 = await yaw();
+      let y0 = await rawYaw();
       await this.run('mbot2.drive_speed(25,25)');
       await pause(700);
       await this.stop();
       await pause(400);
-      let d = dyaw(y0, await yaw());
+      let d = dyaw(y0, await rawYaw());
       out.mirrored = Math.abs(d) > 15;
-      report(`1. drive_speed(25,25): Drehung ${d}° → Motoren ${out.mirrored ? 'gespiegelt' : 'nicht gespiegelt'}`);
-      // 2. clockwise spin through the mapping: if the robot turns counterclockwise, left/right are swapped
-      this.wheels = { ...this.wheels, mirrored: out.mirrored, swap: false };
-      y0 = await yaw();
+      report(`1. drive_speed(25,25): Gyro ${d}° → Motoren ${out.mirrored ? 'gespiegelt' : 'nicht gespiegelt'}`);
+      // 2. right turn through the (trusted) wheel mapping: its gyro sign is the gyro sign
+      this.wheels = { ...this.wheels, mirrored: out.mirrored };
+      y0 = await rawYaw();
       await this.drive(25, -25);
       await pause(700);
       await this.stop();
       await pause(400);
-      d = dyaw(y0, await yaw());
-      out.swap = d < -15;
-      report(`2. Rechtsdrehung über die Zuordnung: ${d}° → Räder ${out.swap ? 'getauscht' : 'nicht getauscht'}`);
-      // 3. firmware turn: raw mbot2.turn(45) should turn clockwise
-      y0 = await yaw();
+      d = dyaw(y0, await rawYaw());
+      out.yawSign = d >= 0 ? 1 : -1;
+      report(`2. Rechtsdrehung über die Radzuordnung: Gyro ${d}° → Gyro ${out.yawSign === 1 ? 'normal' : 'umgekehrt'}`);
+      // 3. firmware turn: raw mbot2.turn(45) should turn right
+      y0 = await rawYaw();
       await this.query('mbot2.turn(45)', 6000);
       await pause(300);
-      d = dyaw(y0, await yaw());
+      d = dyaw(y0, await rawYaw()) * out.yawSign;
       out.turnSign = d >= 0 ? 1 : -1;
-      report(`3. mbot2.turn(45): ${d}° → eingebaute Drehung ${out.turnSign === 1 ? 'normal' : 'umgekehrt'}`);
+      report(`3. mbot2.turn(45): ${d}° (rechts positiv) → eingebaute Drehung ${out.turnSign === 1 ? 'normal' : 'umgekehrt'}`);
       await this.query(`mbot2.turn(${-45 * out.turnSign})`, 6000); // back
       if (Math.abs(d) < 20) report('! Drehung zu klein gemessen; Ergebnis bitte prüfen (Akku? Untergrund?)');
     } catch (e) {
@@ -279,7 +285,7 @@ export class BleRobot {
       await this.stop().catch(() => {});
     }
     this.wheels = out;
-    report(`Kalibrierung fertig: gespiegelt ${out.mirrored}, getauscht ${out.swap}, Drehung ${out.turnSign === 1 ? 'normal' : 'umgekehrt'}, Gyro ${ys === 1 ? 'normal' : 'umgekehrt'}`);
+    report(`Kalibrierung fertig: gespiegelt ${out.mirrored}, getauscht ${out.swap} (nicht geprüft), Drehung ${out.turnSign === 1 ? 'normal' : 'umgekehrt'}, Gyro ${out.yawSign === 1 ? 'normal' : 'umgekehrt'}`);
     return out;
   }
 
@@ -375,7 +381,9 @@ export class BleRobot {
     if (!this.writeChar) throw new Error('not connected');
     for (let i = 0; i < frame.length; i += this.chunkSize) {
       await this.writeChar.writeValueWithoutResponse(frame.slice(i, i + this.chunkSize));
-      if (this.chunkDelayMs) await sleep(this.chunkDelayMs);
+      // A hidden tab stretches timers to ~1 s; the pause is not needed on macOS
+      // Chrome (research/07), so skip it there rather than stall every frame.
+      if (this.chunkDelayMs && !(typeof document !== 'undefined' && document.hidden)) await sleep(this.chunkDelayMs);
     }
   }
 
@@ -467,9 +475,9 @@ export class BleRobot {
   // wait: send with reply so the promise resolves when the robot has finished
   // the (blocking) gyro turn. Used by scans and the AI agent.
   // speed: wheel RPM (Makeblock signature turn(angle, speed=50)).
-  // Firmware 44.01.013 turns mbot2.turn(+90) counterclockwise (yaw 0 -> -87,
-  // Dreh-Test 2026-10-04), opposite to the documentation; FIRMWARE_TURN_SIGN
-  // keeps "+ = clockwise/right" for every caller.
+  // wheels.turnSign keeps "+ = clockwise/right" for every caller. On firmware
+  // 44.01.013 mbot2.turn(+90) turns clockwise; the Dreh-Test reading of -87
+  // came from the gyro counting counterclockwise positive (wheels.yawSign).
   turn(deg, { wait = false, speed = 50 } = {}) {
     const s = `mbot2.turn(${(this.wheels.turnSign ?? FIRMWARE_TURN_SIGN) * deg},${speed})`;
     return wait ? this.query(s, 2000 + Math.abs(deg) * 30 * (50 / speed)) : this.run(s);

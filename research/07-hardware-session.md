@@ -35,4 +35,17 @@ Open: whether the eye effects now all play, the line-sensor polarity, wheel dire
 | `mbot2.EM_get_angle("EM1"/"EM2")` and `(1/2)` | both forms work; during `drive_speed(30,-30)`: 97/-104 after 0.5 s, 245/-247 after stop (wheel degrees, EM2 negative forward) |
 | `mbot2.EM_get_speed(1/2)` | 29.6/-29.6 at 30 RPM, 0 after stop |
 | One combined poll (8 values) | 150 to 270 ms per round trip |
-| `mbot2.turn(90)` / `mbot2.turn(-90)` (Dreh-Test) | yaw 0 → **-87** → 0: **the firmware turns opposite to the documented sign** (+ = counterclockwise). The driver sends `-deg` (`FIRMWARE_TURN_SIGN`); this caused the navigation zigzag and mirrored step scans in v0.5.x |
+| `mbot2.turn(90)` / `mbot2.turn(-90)` (Dreh-Test) | yaw 0 → **-87** → 0. Originally read as "turn reversed"; actually the gyro is counterclockwise positive (see the correction below). The driver sends `-deg` (`FIRMWARE_TURN_SIGN`); this caused the navigation zigzag and mirrored step scans in v0.5.x |
+
+## Correction 2026-10-04 evening: the gyro counts counterclockwise positive
+
+The hand test above ("0 to 90 after turning clockwise") was wrong; the robot was most likely turned the other way. Evidence anchored on visible motion:
+
+- With the original mapping (EM1 left, EM2 mirrored) the joystick turns the robot right when pushed right (owner). A sweep sending the same wheel command (`drive_speed(+,+)`) showed the gyro **falling** (56 → -180 → 30).
+- Setting "Räder tauschen" made the joystick turn left when pushed right (owner).
+- So `cyberpi.get_yaw()` is **counterclockwise positive**, and `mbot2.turn(+90)` turns **clockwise** as documented (the Dreh-Test's yaw of -87 was a clockwise turn).
+- Verified after the correction: a joystick-right spin read +80°, `turn(+30)` read +30° with the gyro sign applied.
+
+Defaults now: `wheels = { swap: false, mirrored: true, turnSign: 1, yawSign: -1 }`. "Automatisch erkennen" takes the wheel mapping (checked by the joystick) as its reference instead of the gyro. Continuous scans made before v0.6.8 were mirrored; delete maps saved before.
+
+Scan-Labor measurements (bottle at 37 cm, cw/ccw pair): sensor latency about 120 ms (the two directions agree within 0.2°), distance exact, beam about 25 to 30° wide, bottle about 5° off the robot's start heading (placement by eye).
