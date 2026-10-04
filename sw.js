@@ -34,7 +34,9 @@ self.addEventListener('fetch', (e) => {
   // offline fallback (and answers if the network takes longer than 4 s).
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const net = fetch(req).then((res) => {
+    // no-cache: revalidate with the server (cheap ETag check) instead of trusting
+    // the browser's HTTP cache, which can mix old and new modules after a deploy
+    const net = fetch(req, { cache: 'no-cache' }).then((res) => {
       if (res.ok && res.type === 'basic') cache.put(req, res.clone());
       return res;
     });

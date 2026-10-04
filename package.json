@@ -1,1 +1,1 @@
-{ "name": "mbot2-control", "private": true, "type": "module", "scripts": { "test": "node --test test/*.test.mjs" } }
+{ "name": "mbot2-control", "private": true, "type": "module", "scripts": { "test": "node --test --test-concurrency=1 test/*.test.mjs" } }

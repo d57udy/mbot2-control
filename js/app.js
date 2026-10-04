@@ -28,6 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
+export const APP_VERSION = '0.5.2';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -572,8 +573,16 @@ $('opt-helpers').checked = store.get('helpers', '0') === '1';
 $('opt-delay').onchange = () => { store.set('chunkDelay', $('opt-delay').value); if (ble) ble.chunkDelayMs = Number($('opt-delay').value); };
 $('opt-helpers').onchange = () => { store.set('helpers', $('opt-helpers').checked ? '1' : '0'); log('Roboter-Helfer: wirkt beim nächsten Verbinden (Roboter vorher aus- und einschalten).'); };
 
+// Test output goes to the log; open and show it so the result is visible.
+function showLog() {
+  logEl.closest('details').open = true;
+  logEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 $('btn-sensortest').onclick = async () => {
-  if (!robot?.sensorTest) { log('! Sensor-Test nur mit echtem Roboter'); return; }
+  showLog();
+  if (!robot?.connected) { log('! Sensor-Test: erst mit dem Roboter verbinden (Verbinden)'); return; }
+  if (!robot.sensorTest) { log('! Sensor-Test geht nur mit dem echten Roboter, nicht im Simulator'); return; }
   $('btn-sensortest').disabled = true;
   try { await robot.sensorTest((line) => log(line)); } finally { $('btn-sensortest').disabled = false; }
 };
@@ -590,6 +599,7 @@ $('btn-log-copy').onclick = async () => {
 };
 
 $('btn-linktest').onclick = async () => {
+  showLog();
   if (!robot?.connectionTest) { log('! Verbindungstest nur mit echtem Roboter'); return; }
   $('btn-linktest').disabled = true;
   try { await robot.connectionTest((line) => log(line)); } finally { $('btn-linktest').disabled = false; }
@@ -923,4 +933,5 @@ checkSupport();
 setSpeed(Number(store.get('speed', 60)));
 setMode(store.get('mode', 'buttons'));
 setVoiceMode(voiceMode);
-log('Bereit. Roboter einschalten, Startbildschirm, kein Programm aktiv, nicht mit mBlock verbunden.');
+$('app-version').textContent = `Version ${APP_VERSION}`;
+log(`mBot2 Control ${APP_VERSION}. Bereit. Roboter einschalten, Startbildschirm, kein Programm aktiv, nicht mit mBlock verbunden.`);
