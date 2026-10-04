@@ -800,10 +800,12 @@ $('panel-scan').addEventListener('toggle', redrawMap);
 
 // Sensor sampler for navigation legs (crash detection) and sweeps.
 function attachSampler() {
-  if (!robot) { nav.sample = undefined; return; }
+  if (!robot) { nav.sample = undefined; nav.legMode = 'straight'; return; }
   nav.sample = robot.kind === 'sim'
     ? makeSimSampler(robot)
     : makeBleSampler(robot, BLE_SENSORS, { log });
+  // the navigator picks its leg mode at construction; it is created before any robot connects
+  nav.legMode = nav.sample ? 'drive' : 'straight';
 }
 
 function resetMap() {
