@@ -13,8 +13,7 @@ const ROBOT_CM = 17; // robot length, for the marker
 
 const FALLBACK = {
   '--bg': '#f4f5f7', '--surface': '#ffffff', '--border': '#d5d9e0', '--text': '#1b1f27',
-  '--muted': '#667085', '--accent': '#2f6fde', '--stop': '#d92d20', '--ok': '#12805c',
-};
+  '--muted': '#667085', '--accent': '#2f6fde', '--stop': '#d92d20', '--ok': '#12805c', '--warn': '#b54708' };
 
 function colours() {
   let css = null;
@@ -137,12 +136,14 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
   if (map?.forEachCell) {
     const free = [];
     const occ = [[], [], [], []];
-    map.forEachCell((x, y, state, p) => {
-      if (state === 'unknown') return;
+    const suspect = []; // hit evidence not yet confirmed by a second scan (evidence model v2)
+    map.forEachCell((x, y, state, p, kind) => {
+      if (state === 'unknown' && kind !== 'suspect') return;
       const q = P(x, y);
       if (q.x < -cpx || q.y < -cpx || q.x > w + cpx || q.y > h + cpx) return;
       if (rot) { q.x -= w / 2; q.y -= h / 2; const u = turn(q.x, -q.y, -rot); q.x = u.x; q.y = -u.y; } // unturned, about the centre
-      if (state === 'occupied') {
+      if (kind === 'suspect') suspect.push(q);
+      else if (state === 'occupied') {
         const k = finite(p) && p >= 0 && p <= 1 ? Math.min(3, Math.max(0, Math.floor((p - 0.5) * 8))) : 3;
         occ[k].push(q);
       } else free.push(q);
@@ -158,6 +159,7 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
       ctx.fill();
     };
     fill(free, c.surface, 1);
+    fill(suspect, c.warn, 0.45);
     occ.forEach((list, k) => fill(list, c.text, 0.4 + k * 0.2));
     ctx.globalAlpha = 1;
     if (rot) ctx.restore();

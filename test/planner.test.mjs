@@ -1,7 +1,7 @@
 // Run with: npm test
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GridMap } from '../js/gridmap.js';
+import { GridMap, L_SUSPECT } from '../js/gridmap.js';
 import { planPath, simplifyPath, pathToMoves, lineOfSight } from '../js/planner.js';
 import { SimRobot, SIM_OBSTACLES, SIM_ROBOT } from '../js/robot-sim.js';
 import { CommandBus } from '../js/bus.js';
@@ -188,7 +188,7 @@ test('planner: home path keeps clear of the table leg after scans from other pos
     m.integrateScan(p, await simScan(sim, p), opts);
   }
   const leg = { x: 215 - 150, y: 100 - 55 };
-  assert.ok(m.clearance(leg.x, leg.y) <= 10, `the leg is still in the map (${m.clearance(leg.x, leg.y)})`);
+  assert.ok(m.clearance(leg.x, leg.y, L_SUSPECT) <= 10, `the leg is still in the map (${m.clearance(leg.x, leg.y, L_SUSPECT)})`);
   const p = simplifyPath(planPath(m, { x: 112, y: 78 }, { x: 0, y: 0 }, { inflateCm: 14 }), m, { inflateCm: 14 });
   assert.ok(p);
   const c = trueClearance(p, SIM_OBSTACLES);

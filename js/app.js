@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.6.8';
+export const APP_VERSION = '0.7.0';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -781,7 +781,7 @@ async function relocateOnMap(signal) {
     return null;
   }
   tracker.reset(res.pose);
-  map.integrateScan(res.pose, points, { beamDeg: 16, maxRangeCm: maxRange(), freeBeamDeg: 16 });
+  map.integrateScan(res.pose, points, { beamDeg: 25, maxRangeCm: maxRange(), freeBeamDeg: 25 }); // measured beam
   tracker.applyTurn(turned);
   relocalizePending = false;
   mapScan = { pose: res.pose, points };
@@ -837,6 +837,7 @@ let mapScan = null; // { pose, points } of the last scan, drawn on the map
 const nav = new Navigator({
   bus, map, pose: tracker, scan,
   maxRangeCm: maxRange(),
+  beamDeg: 25, // measured with a bottle (Scan-Labor, 2026-10-04)
   useYaw: true, // gyro yaw confirmed clockwise positive on 44.01.013
   onEvent: (e) => {
     if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
@@ -907,6 +908,20 @@ function resetMap() {
   lastDrive = null;
   redrawMap();
 }
+// Evidence per cell (hits vs. beams that passed through): explains why a cell is an obstacle.
+const KIND_DE = { occupied: 'Hindernis (bestätigt)', suspect: 'Hindernis (vermutet)', free: 'frei', unknown: 'unbekannt' };
+function showCellInfo({ x, y }) {
+  const i = map.cellInfo?.(x, y);
+  if (!i) { log(`Stelle ${x}/${y}: keine Daten`); return; }
+  const n = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : v ?? '?');
+  log(`Stelle ${x} cm rechts / ${y} cm vorne: ${KIND_DE[i.state] ?? i.state}; Treffer ${n(i.hits)}, durchschaut ${n(i.misses)}, Scans ${n(i.scans)}${i.p != null ? `, p ${n(i.p)}` : ''}`);
+}
+$('btn-map-cleanup').onclick = () => {
+  const removed = map.cleanup?.() ?? 0;
+  log(`Karte aufgeräumt: ${removed} unbestätigte Zellen entfernt.`);
+  redrawMap();
+};
+
 $('btn-map-clear').onclick = () => { resetMap(); log('Karte gelöscht; die aktuelle Position ist der neue Start.'); };
 $('opt-yaw').onchange = () => { nav.useYaw = $('opt-yaw').checked; };
 
@@ -933,6 +948,7 @@ const mapControls = attachMapControls($('map'), {
     lastTapAt = now;
     const goal = screenToWorld($('map'), mapView, x, y);
     goal.x = Math.round(goal.x); goal.y = Math.round(goal.y);
+    if ($('opt-tapinfo').checked) { showCellInfo(goal); return; }
     if (needsLocation()) return;
     log(`Ziel: ${goal.x} cm rechts, ${goal.y} cm vorne (vom Start)`);
     runScanTask(async (signal) => navResult('Fahrt zum Ziel', await nav.goTo(goal, { signal })));
@@ -960,8 +976,7 @@ function adoptMap(loaded, label) {
     log(`! ${label}: Kartenformat passt nicht (${loaded.map.cellCm} cm Raster)`);
     return;
   }
-  map.L.set(loaded.map.L);
-  map.touch();
+  map.copyFrom(loaded.map); // grid plus hit/miss evidence
   tracker.reset();
   nav.lastPath = null;
   nav.goal = null;

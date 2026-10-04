@@ -11,9 +11,13 @@ import { makeSimSampler } from '../js/motion.js';
 
 const stub = () => {};
 
+// timeScale 15: the sim robot moves timeScale times faster than real time, so
+// an event-loop stall of 50 ms under the parallel sim tests lets a leg run on
+// for 0.75 s of robot time before its stop lands; at 30 that was 1.5 s
+// (up to 20 cm) and legs ended close to walls.
 // Sim at its default start (150, 100) facing up (-90) = map origin, heading 0.
 // Map x = sim x - 150, map y = 100 - sim y, map heading = sim heading + 90.
-async function setup({ attach = false, timeScale = 30, simOpts = {}, ...opts } = {}) {
+async function setup({ attach = false, timeScale = 15, simOpts = {}, ...opts } = {}) {
   opts = { localize: false, ...opts };
   const sim = new SimRobot({ log: stub, onStatus: stub, timeScale, ...simOpts });
   const bus = new CommandBus({ log: stub });
@@ -98,9 +102,7 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
   });
 
   test('explore grows the known area without contact', async () => {
-    // timeScale 15: at 30, event-loop stalls under the parallel sim tests let a
-    // leg run on for centimetres before its stop lands (1 run in 20 came within 1 cm)
-    const { sim, nav, map, truth, pose, track } = await setup({ steps: 8, timeScale: 15 });
+    const { sim, nav, map, truth, pose, track } = await setup({ steps: 8 });
     try {
       await nav.scanHere({});
       const before = map.stats().knownM2;
@@ -287,6 +289,25 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
     }
   });
 
+  test('legs learn the stop distance (field: every leg 3 to 4 cm long)', async () => {
+    const { sim, nav, events, pose, truth } = await setup({ simOpts: { stopCoastCm: 3.5 } });
+    try {
+      const r = await nav.goTo({ x: 110, y: 70 }, { tolCm: 10 });
+      assert.equal(r.ok, true, r.note);
+      const legs = events.filter((e) => e.type === 'leg' && e.reason === 'done');
+      assert.ok(legs.length >= 3);
+      assert.ok(legs[0].droveCm - legs[0].cm > 2, `first leg ${legs[0].cm} -> ${legs[0].droveCm}`);
+      // the systematic 3.5 cm is learned away; what remains is stop-timing jitter
+      // of the 15x sim under the parallel tests (up to 2.7 cm seen), not a bias
+      const errs = legs.slice(2).map((l) => l.droveCm - l.cm);
+      const mean = errs.reduce((a, b) => a + b, 0) / errs.length;
+      assert.ok(Math.abs(mean) < 1.5 && errs.every((e) => Math.abs(e) < 3.2), `later legs off by ${errs.map((e) => e.toFixed(1))}`);
+      assert.ok(d(truth(), pose.pose) < 5, 'the overshoot is in the pose');
+    } finally {
+      await sim.disconnect();
+    }
+  });
+
   test('yaw correction keeps the heading on the gyro', async () => {
     const { sim, nav, pose, truth } = await setup({ useYaw: true });
     try {
@@ -339,6 +360,13 @@ test('navigator: shortens a leg to keep safetyCm, then reports blocked', async (
   assert.ok(bus.cmds.every((c) => c.gen === 7 && c.src === 'agent'), 'one stamped makeCommand');
   assert.ok(events.some((e) => e.type === 'blocked'));
   assert.match(r.note, /blocked|no path|gave up|goal blocked/);
+  // blocked after a scan here: back off and rescan before giving up (field:
+  // five 'blocked' in one second, then 'blocked: 10.1 cm ahead')
+  const backs = events.filter((e) => e.type === 'backoff');
+  assert.ok(backs.length >= 1 && backs.length <= 2, `backoffs ${backs.length}`);
+  assert.ok(bus.cmds.some((c) => c.cmd === 'straight' && c.args.cm === -10));
+  const firstBack = events.indexOf(backs[0]);
+  assert.ok(events.slice(firstBack).some((e) => e.type === 'scan' && /backed off/.test(e.reason)), 'rescanned after backing off');
 });
 
 test('navigator: failures return ok:false instead of throwing', async () => {
@@ -355,4 +383,22 @@ test('navigator: failures return ok:false instead of throwing', async () => {
   const nav2 = new Navigator({ bus, map: new GridMap({}), pose: new PoseTracker(), scan, settleMs: 0 });
   await assert.rejects(nav2.explore({ signal: pre.signal }), { name: 'AbortError' });
   assert.equal(bus.stops >= 1, true);
+});
+
+test('navigator: knownReach stops a leg along an unseen obstacle edge, not in open unknown space', () => {
+  const map = new GridMap({});
+  const nav = new Navigator({ bus: fakeBus(), map, pose: new PoseTracker(), scan, settleMs: 0 });
+  const free = (x0, x1, y0, y1) => {
+    for (let x = x0; x <= x1; x += 2.5) for (let y = y0; y <= y1; y += 2.5) map.add(map.index(x, y), -3);
+    map.touch();
+  };
+  free(-30, 30, -10, 40);   // known, wide enough for the footprint up to y = 40
+  free(-4, 4, 40, 80);      // only a narrow strip beyond: the sides are unknown
+  assert.equal(nav.knownReach({ x: 0, y: 0 }, { x: 0, y: 80 }, 80), 80, 'open unknown space does not stop the leg');
+  // an obstacle corner seen at a grazing angle, next to the unknown cells at x = 12
+  map.add(map.index(22, 52), 3); map.touch();
+  const r = nav.knownReach({ x: 0, y: 0 }, { x: 0, y: 80 }, 80);
+  assert.ok(r >= 30 && r <= 45, `reach ${r}`);
+  free(-30, 30, 40, 85);
+  assert.equal(nav.knownReach({ x: 0, y: 0 }, { x: 0, y: 80 }, 80), 80, 'all known');
 });

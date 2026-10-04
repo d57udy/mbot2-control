@@ -14,9 +14,10 @@
 // from the endpoint to the nearest occupied cell), plus a small reward for
 // no-echo beams whose ray stays clear of obstacles. Null beams are skipped.
 
-import { L_THRESH } from './gridmap.js';
+import { L_THRESH, L_SUSPECT } from './gridmap.js';
 
 const SIGMA_CM = 8;
+const SUSPECT_FIELD = 0.9;   // weight of suspect (unconfirmed) obstacles: most of a fresh map
 const UNKNOWN_FIELD = 0.1;   // endpoint in unknown space: no contradiction, little support
 const NO_ECHO_WEIGHT = 0.3;  // full reward of a no-echo beam with a clear ray
 const NO_ECHO_STEP_CM = 30;  // ray samples of a no-echo beam
@@ -29,17 +30,17 @@ const clamp01 = (v) => Math.max(0, Math.min(1, v));
 export const normDeg = (a) => { const r = ((((a + 180) % 360) + 360) % 360) - 180; return r === -180 ? 180 : r; };
 const angDiff = (a, b) => Math.abs(normDeg(a - b));
 
-// Likelihood per cell, cached per map version in map.cache.
+// Likelihood per cell, cached per map version in map.cache. Confirmed
+// obstacles count fully, suspect ones (not confirmed yet) SUSPECT_FIELD.
 export function likelihoodField(map, sigmaCm = SIGMA_CM) {
   const key = `lf${sigmaCm}`;
   let f = map.cache.get(key);
   if (f) return f;
-  const d = map.distanceField(L_THRESH);
+  const d = map.distanceField(L_THRESH), ds = map.distanceField(L_SUSPECT);
   f = new Float32Array(d.length);
-  const cap = 3 * sigmaCm;
+  const cap = 3 * sigmaCm, g = (x) => (x < cap ? Math.exp(-(x * x) / (2 * sigmaCm * sigmaCm)) : 0);
   for (let k = 0; k < d.length; k++) {
-    const g = d[k] < cap ? Math.exp(-(d[k] * d[k]) / (2 * sigmaCm * sigmaCm)) : 0;
-    f[k] = Math.max(g, Math.abs(map.L[k]) <= L_THRESH ? UNKNOWN_FIELD : 0);
+    f[k] = Math.max(g(d[k]), SUSPECT_FIELD * g(ds[k]), Math.abs(map.L[k]) <= L_THRESH ? UNKNOWN_FIELD : 0);
   }
   map.cache.set(key, f);
   return f;

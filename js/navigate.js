@@ -16,6 +16,7 @@
 
 import { makeCommand } from './bus.js';
 import { planPath, simplifyPath, pathToMoves, DEFAULT_INFLATE_CM } from './planner.js';
+import { L_SUSPECT } from './gridmap.js';
 import { driveLeg, turnInPlace } from './motion.js';
 import { sweepScan, resampleSweep } from './scan.js';
 
@@ -24,6 +25,11 @@ const FRONT_CM = 10;       // robot centre to front bumper
 const CONTACT_HALF_CM = 8; // half width of the marked contact
 const CONTACT_L = 4;       // log-odds added per contact cell (clamped by the map)
 const MAX_CRASHES = 4;
+const BACKOFF_CM = 10;     // reverse this far when every heading from here is blocked
+const MAX_BACKOFFS = 2;
+const FOOTPRINT_CM = 12;   // robot radius plus margin, for the known-cells check beside a leg
+const MIN_BLIND_LEG_CM = 12; // after a scan here, at most this far along an unseen edge
+const EDGE_CM = 15;        // unknown cells this close to obstacle evidence count as an unseen edge
 const MAX_FIX_CM = 30;     // largest position correction a routine scan match may apply
 const MAX_FIX_DEG = 30;    // largest heading correction (without a gyro) a routine match may apply
 
@@ -71,6 +77,7 @@ export class Navigator {
     this.droveSinceScan = 0;
     this.spinSign = 1; // learned if clockwise wheel commands turn the robot counterclockwise
     this.turnSign = 1; // learned if mbot2.turn(+deg) turns counterclockwise (needs the gyro)
+    this.legCoast = { cm: 0 }; // learned stop distance of drive legs (driveLeg aims this far short)
     this.sweepDegS = sweepDegS;
     Object.assign(this, { bus, map, pose, scanFn: scan, onEvent, steps, safetyCm, inflateCm, maxLegCm, legsPerScan, settleMs, useYaw, beamDeg, maxRangeCm });
     // legMode 'drive': driveLeg with sensor polling (default with a sampler);
@@ -146,16 +153,22 @@ export class Navigator {
     const loc = this.localize && this.mapKnown() ? (this.localizer ?? await loadLocalizer()) : null;
     const onPoint = loc ? null : (p) => this.map.integrateScan(at, [p], opts);
     let res;
+    // one map scan for all points: confirmation needs hits from two scans
+    this.map.beginScan?.();
     try {
-      res = await this.scanFn(this.bus, { steps: this.steps, signal, makeCommand: mk, onPoint, settleMs: this.settleMs });
-    } catch (e) {
-      if (e?.name === 'AbortError') throw e;
-      if (/cancelled by stop/.test(e?.message ?? '')) throw new Cancelled(e.message);
-      throw e;
-    }
-    if (loc) {
-      at = this.relocalize(loc, at, res.points) ?? at;
-      this.map.integrateScan(at, res.points, opts);
+      try {
+        res = await this.scanFn(this.bus, { steps: this.steps, signal, makeCommand: mk, onPoint, settleMs: this.settleMs });
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e;
+        if (/cancelled by stop/.test(e?.message ?? '')) throw new Cancelled(e.message);
+        throw e;
+      }
+      if (loc) {
+        at = this.relocalize(loc, at, res.points) ?? at;
+        this.map.integrateScan(at, res.points, opts);
+      }
+    } finally {
+      this.map.endScan?.();
     }
     this.markContacts();
     // scan() turns a full circle; with steps that do not divide 360 the bus
@@ -355,6 +368,15 @@ export class Navigator {
     return true;
   }
 
+  // Reverses cm with the gyro straight (the bus allows backward moves without
+  // the obstacle guard). The pose follows through the tracker or here.
+  async backOff(mk, signal, cm) {
+    const before = this.pose.pose;
+    const ok = await this.straight(mk, signal, -Math.abs(cm));
+    this.emit({ type: 'backoff', cm: Math.abs(cm), ok, from: before, pose: this.pose.pose });
+    return { ok };
+  }
+
   // One straight leg. Returns the driveLeg result (reason, droveCm, ...).
   async leg(mk, signal, cm) {
     if (this.legMode === 'straight') {
@@ -363,7 +385,7 @@ export class Navigator {
     }
     this.checkAbort(signal);
     const r = await driveLeg(this.bus, {
-      cm, speed: this.legRpm, makeCommand: mk, signal, sample: this.sample, stopAtCm: this.stopAtCm, opts: this.motionOpts,
+      cm, speed: this.legRpm, makeCommand: mk, signal, sample: this.sample, stopAtCm: this.stopAtCm, opts: this.motionOpts, coast: this.legCoast,
     });
     // the drive commands are not seen by the tracker: apply the measured leg here
     if (r.droveCm) {
@@ -404,11 +426,34 @@ export class Navigator {
     for (let i = 1; i < path.length && left > 0; i++) {
       const a = path[i - 1], b = path[i], d = dist(a, b), seg = Math.min(d, left);
       for (let t = this.map.cellCm; t <= seg; t += this.map.cellCm) {
-        if (this.map.cell(a.x + ((b.x - a.x) * t) / d, a.y + ((b.y - a.y) * t) / d) === 'unknown') return true;
+        if (this.unknownAt(a.x + ((b.x - a.x) * t) / d, a.y + ((b.y - a.y) * t) / d)) return true;
       }
       left -= d;
     }
     return false;
+  }
+
+  // Unknown in the sense of "never observed": suspect cells (weak hit
+  // evidence, which map.cell() reports as unknown) count as evidence.
+  unknownAt(x, y) { return this.map.kind ? this.map.kind(x, y) === 'unknown' : this.map.cell(x, y) === 'unknown'; }
+
+  // How far the robot can drive from a toward b (at most cm) before unknown
+  // cells beside its footprint (FOOTPRINT_CM each side) lie next to obstacle
+  // evidence (EDGE_CM). That is an obstacle edge seen only at a grazing angle
+  // (the explore near-miss along the chair); the ultrasonic only looks ahead,
+  // so a leg must not run along it blind. Unknown cells in open space do not
+  // count, which keeps extra scans rare.
+  knownReach(a, b, cm) {
+    const d = dist(a, b) || 1, ux = (b.x - a.x) / d, uy = (b.y - a.y) / d;
+    const step = this.map.cellCm / 2;
+    for (let t = step; t <= cm; t += step) {
+      const x = a.x + ux * t, y = a.y + uy * t;
+      for (const l of [-FOOTPRINT_CM, -FOOTPRINT_CM / 2, 0, FOOTPRINT_CM / 2, FOOTPRINT_CM]) {
+        const px = x + uy * l, py = y - ux * l;
+        if (this.unknownAt(px, py) && this.map.clearance(px, py, L_SUSPECT) <= EDGE_CM) return Math.max(0, t - step);
+      }
+    }
+    return cm;
   }
 
   plan(goal) {
@@ -427,7 +472,7 @@ export class Navigator {
     if (!Number.isFinite(goal.x) || !Number.isFinite(goal.y)) return { ok: false, reached: false, pose: this.pose.pose, legs: 0, note: 'invalid goal' };
     this.goal = goal;
     // a scan just taken here (e.g. scanHere before goTo) counts for this task
-    let legs = 0, sinceScan = 0, blocked = 0, crashes = 0, scannedHere = this.movedSinceScan() < 5;
+    let legs = 0, sinceScan = 0, blocked = 0, backoffs = 0, crashes = 0, scannedHere = this.movedSinceScan() < 5;
     const done = (ok, reached, note) => {
       const r = { ok, reached, pose: this.pose.pose, legs, note };
       if (reached) this.emit({ type: 'arrived', ...r, goal });
@@ -490,12 +535,28 @@ export class Navigator {
       }
       const reading = await this.readAhead(mk, signal);
       const room = reading == null ? 0 : reading >= NO_ECHO_CM ? Infinity : reading - this.safetyCm;
-      const cm = Math.floor(Math.min(m.cm, room));
+      // stop at the edge of the known area; past it, scan again from closer
+      const reach = this.knownReach(here, m.to, m.cm);
+      const blind = reach < m.cm;
+      const cap = blind ? Math.max(reach - 3, scannedHere ? Math.min(MIN_BLIND_LEG_CM, m.cm) : 0) : m.cm;
+      if (blind && cap <= 5 && !scannedHere) { await rescan('unseen obstacle edge beside the leg'); continue; }
+      const cm = Math.floor(Math.min(m.cm, room, cap));
       if (cm <= 5) {
         blocked++;
         this.emit({ type: 'blocked', readingCm: reading, pose: this.pose.pose });
-        if (blocked > 4) return done(false, false, `blocked: ${reading ?? '?'} cm ahead`);
-        if (!scannedHere) await rescan('blocked');
+        // Replanning from the same spot after a scan here gives the same
+        // blocked heading (field: 5 'blocked' in one second, then give up).
+        // Back off first, scan from there, and give up only after that failed.
+        if (scannedHere) {
+          if (backoffs >= MAX_BACKOFFS) return done(false, false, `blocked: ${reading ?? '?'} cm ahead`);
+          backoffs++;
+          const b = await this.backOff(mk, signal, BACKOFF_CM);
+          if (!b.ok) return done(false, false, `blocked: ${reading ?? '?'} cm ahead; back-off failed`);
+          await rescan('blocked, backed off');
+        } else {
+          if (blocked > 4) return done(false, false, `blocked: ${reading ?? '?'} cm ahead`);
+          await rescan('blocked');
+        }
         this.emit({ type: 'replan', reason: 'blocked' });
         continue;
       }
@@ -507,6 +568,7 @@ export class Navigator {
       this.droveSinceScan += Math.abs(lr.droveCm ?? 0);
       scannedHere = false;
       this.emit({ type: 'leg', leg: legs, turnDeg: m.turnDeg, cm, droveCm: lr.droveCm, reason: lr.reason, detail: lr.detail ?? null,
+        overshootCm: lr.overshootCm ?? null, coastCm: this.legCoast.cm,
         readingCm: reading, pose: this.pose.pose, samples: lr.samples ?? null });
       if (lr.reason === 'crash' || lr.reason === 'stall') {
         if (!(await crashed('leg', lr))) return done(false, false, `gave up after ${crashes} collisions`);
@@ -514,7 +576,7 @@ export class Navigator {
       }
       if (lr.reason === 'obstacle') this.emit({ type: 'blocked', readingCm: lr.samples?.at(-1)?.distanceCm, pose: this.pose.pose });
       if (dist(this.pose.pose, goal) <= tolCm) continue;
-      if (lr.reason === 'obstacle' || shortened) await rescan(lr.reason === 'obstacle' ? 'obstacle during leg' : 'leg shortened');
+      if (lr.reason === 'obstacle' || shortened) await rescan(lr.reason === 'obstacle' ? 'obstacle during leg' : blind ? 'unseen obstacle edge beside the leg' : 'leg shortened');
       else if (sinceScan >= this.legsPerScan) await rescan('periodic');
       else if (this.droveSinceScan >= this.rescanCm) await rescan('distance since last scan');
     }
@@ -559,7 +621,9 @@ export class Navigator {
     return this.task('goHome', signal, async (mk) => {
       const r = await this.doGoTo(mk, signal, { x: 0, y: 0 }, { tolCm, maxLegs: 12 });
       if (!r.reached) return r;
+      // face the start heading; one retry if the turn ended far off (field: -150 for -168)
       await this.turn(mk, signal, -this.pose.pose.heading);
+      if (Math.abs(normDeg(this.pose.pose.heading)) > 5) await this.turn(mk, signal, -this.pose.pose.heading);
       return { ...r, pose: this.pose.pose, note: 'home' };
     });
   }

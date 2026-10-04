@@ -76,11 +76,14 @@ export function decodeGrid(b64, length) {
 // map + meta -> plain object (what gets stored and exported).
 export function serializeMap(map, meta = {}) {
   if (!map?.L || !map.n) throw new Error('not a GridMap');
+  map.touch?.(); // imports direct writes to L into the evidence before saving it
   const st = map.stats?.() ?? {};
   return {
     format: FORMAT, v: VERSION,
     cellCm: map.cellCm, sizeCm: map.sizeCm, n: map.n,
     grid: encodeGrid(map.L),
+    // hit/miss evidence per cell (GridMap v2); readers without it use `grid`
+    ...(typeof map.toJSON === 'function' ? { evidence: map.toJSON() } : {}),
     meta: {
       start: { x: 0, y: 0, heading: 0 },
       savedAt: new Date().toISOString(),
@@ -110,6 +113,13 @@ export function parseMap(input) {
     throw new Error(`Kartendatei beschädigt (${e.message}).`);
   }
   map.touch();
+  // prefer the full evidence when present and consistent with the grid size
+  if (o.evidence && typeof GridMap.fromJSON === 'function') {
+    try {
+      const full = GridMap.fromJSON(o.evidence);
+      if (full.n === n && full.cellCm === cellCm) return { map: full, meta: o.meta && typeof o.meta === 'object' ? o.meta : {} };
+    } catch { /* fall back to the quantised grid */ }
+  }
   return { map, meta: o.meta && typeof o.meta === 'object' ? o.meta : {} };
 }
 

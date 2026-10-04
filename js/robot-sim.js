@@ -84,8 +84,9 @@ export class SimRobot {
   //   yawInteger    yaw reported as an integer, like get_yaw() on 44.01.013
   //   encNoiseDeg   uniform noise on each encoder reading
   //   latencyMs     sensor query round trip for makeSimSampler (read halfway)
+  //   stopCoastCm   distance a linear motion rolls on after stop()
   constructor({ log, onStatus, onChange, timeScale = 1, obstacles = OBSTACLES, room = ROOM, encScale = [1, 1],
-    turnError = 0, yawMode = 'wrap', yawInteger = false, encNoiseDeg = 0, latencyMs = 0 }) {
+    turnError = 0, yawMode = 'wrap', yawInteger = false, encNoiseDeg = 0, latencyMs = 0, stopCoastCm = 0 }) {
     this.kind = 'sim';
     this.timeScale = timeScale;
     this.obstacles = obstacles;
@@ -100,7 +101,7 @@ export class SimRobot {
     this.startHeading = this.state.heading;
     this.enc = [0, 0];      // cumulative wheel angles in degrees, forward-positive
     this.encScale = encScale;
-    Object.assign(this, { turnError, yawMode, yawInteger, encNoiseDeg, latencyMs });
+    Object.assign(this, { turnError, yawMode, yawInteger, encNoiseDeg, latencyMs, stopCoastCm });
     this.impact = null;     // { at: sim seconds, ms2 } of the last collision
     this.motion = null; // {vLin cm/s, vAng deg/s, until}
     this.connected = false;
@@ -209,8 +210,16 @@ export class SimRobot {
     return this.go((vl + vr) / 2, vAng, left || right ? 0.4 * this.timeScale : 0);
   }
 
+  // stopCoastCm: linear motion rolls on this far after a stop (field: legs
+  // overshoot by 3 to 4 cm); rotation stops at once.
   stop() {
-    this.motion = null;
+    if (this.timer) this.tick();
+    const m = this.motion;
+    if (m && m.vLin && this.stopCoastCm > 0) {
+      // the whole stop distance within 0.1 s, so a reading 150 ms later sees it
+      const secs = 0.1;
+      this.motion = { vLin: Math.sign(m.vLin) * (this.stopCoastCm / secs), vAng: 0, until: performance.now() + (secs * 1000) / this.timeScale };
+    } else this.motion = null;
     this.log('> sim stop');
     return Promise.resolve();
   }

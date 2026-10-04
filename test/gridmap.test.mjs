@@ -19,28 +19,43 @@ test('gridmap: starts unknown, cell geometry, out of range', () => {
   assert.match(m.describe(O), /empty/);
 });
 
-test('gridmap: a hit ahead makes the beam free and the arc occupied', () => {
+test('gridmap: a far hit is suspect after one scan, confirmed after a second one', () => {
   const m = new GridMap({});
   m.integrateScan(O, [{ angle: 0, cm: 100 }]);   // sensor at y = 6, hit at y = 106
   assert.equal(m.cell(0, 0), 'free');            // robot footprint
   assert.equal(m.cell(0, 50), 'free');
   assert.equal(m.cell(0, 95), 'free');
-  assert.equal(m.cell(0, 106), 'occupied');
+  assert.equal(m.kind(0, 106), 'suspect');       // one scan, far: not confirmed
+  assert.equal(m.cell(0, 106), 'unknown');       // legacy view of a suspect cell
+  assert.ok(m.L[m.index(0, 106)] > 0.15);
   assert.equal(m.cell(0, 130), 'unknown');       // behind the hit
   assert.equal(m.cell(-40, 50), 'unknown');      // outside the beam
   assert.equal(m.cell(0, -40), 'unknown');
-  // the arc is centre-weighted: edge cells are weaker than the centre
-  const edge = m.index(Math.sin((7.5 * Math.PI) / 180) * 100, 6 + Math.cos((7.5 * Math.PI) / 180) * 100);
-  assert.ok(m.L[edge] > 0 && m.L[edge] < m.L[m.index(0, 106)]);
+  // the arc is centre-weighted: edge cells hold less hit evidence
+  const edge = m.cellInfo(Math.sin((7 * Math.PI) / 180) * 100, 6 + Math.cos((7 * Math.PI) / 180) * 100);
+  assert.ok(edge.hits > 0 && edge.hits < m.cellInfo(0, 106).hits);
+  // a second scan from elsewhere confirms it
+  m.integrateScan({ x: 20, y: 0, heading: 0 }, [{ angle: -9.4, cm: 101 }]);
+  assert.equal(m.kind(0, 106), 'occupied');
+  assert.equal(m.cell(0, 106), 'occupied');
   const b = m.bounds;
   assert.ok(b.minY < 0 && b.maxY >= 105 && b.minX < -5 && b.maxX > 5);
+});
+
+test('gridmap: a head-on hit closer than 60 cm is confirmed at once', () => {
+  const m = new GridMap({});
+  m.integrateScan(O, [{ angle: 0, cm: 40 }]);
+  assert.equal(m.kind(0, 46), 'occupied');
+  assert.equal(m.cellInfo(0, 46).near, true);
+  // the arc edges are not head-on
+  assert.equal(m.kind(Math.sin((7 * Math.PI) / 180) * 46, Math.cos((7 * Math.PI) / 180) * 46), 'suspect');
 });
 
 test('gridmap: heading and angle rotate the beam clockwise; failed reads are ignored', () => {
   const m = new GridMap({});
   m.integrateScan({ x: 0, y: 0, heading: 90 }, [{ angle: 0, cm: 50 }, { angle: 90, cm: 40 }, { angle: 180, cm: null }]);
   assert.equal(m.cell(30, 0), 'free');           // heading 90 = right
-  assert.equal(m.cell(56, 0), 'occupied');
+  assert.equal(m.cell(56, 0), 'occupied');       // head-on and close: confirmed
   assert.equal(m.cell(0, -46), 'occupied');      // 90 + 90 = behind the start
   assert.equal(m.cell(-30, 0), 'unknown');       // null reading
 });
@@ -69,39 +84,124 @@ test('gridmap: repeated evidence clamps, free evidence erodes a false hit', () =
 
 test('gridmap: freeBeamDeg widens only the free cone, weaker and with a shorter reach', () => {
   const m = new GridMap({});
-  m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 16, freeBeamDeg: 30 });
   const at = (deg, r) => m.cell(Math.sin((deg * Math.PI) / 180) * r, 6 + Math.cos((deg * Math.PI) / 180) * r);
-  // not looked at: one pass leaves it unknown, a second pass makes it free
-  assert.equal(at(13, 50), 'unknown');
-  assert.ok(m.L[m.index(Math.sin((13 * Math.PI) / 180) * 50, 6 + Math.cos((13 * Math.PI) / 180) * 50)] < 0);
-  m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 16, freeBeamDeg: 30, robotRadiusCm: 0 });
+  const info = (deg, r) => m.cellInfo(Math.sin((deg * Math.PI) / 180) * r, 6 + Math.cos((deg * Math.PI) / 180) * r);
+  // not looked at: unknown after one and two passes, free after three
+  for (let i = 0; i < 3; i++) {
+    m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 16, freeBeamDeg: 30, robotRadiusCm: 0 });
+    if (i < 2) assert.equal(at(13, 50), 'unknown');
+  }
+  assert.ok(info(13, 50).misses > 0);
   assert.equal(at(13, 50), 'free');
   assert.equal(at(13, 90), 'unknown');           // beyond 0.7 of the range
+  assert.equal(info(13, 90).misses, 0);
   assert.notEqual(at(13, 100), 'occupied');
-  assert.equal(at(0, 100), 'occupied');
+  assert.equal(at(0, 100), 'occupied');          // three scans hit it
 });
 
-test('gridmap: hit evidence survives free cones that only graze it', () => {
-  // a thin leg 60 cm ahead, seen once by the beam centre
+test('gridmap: one contribution per cell per scan', () => {
   const m = new GridMap({});
-  m.integrateScan(O, [{ angle: 0, cm: 60 }], { beamDeg: 16, robotRadiusCm: 0 });
-  const k = m.index(0, 66);
-  assert.equal(m.stateOf(k), 'occupied');
-  // later scans from the side: widened gap fillers and beam edges pass over it many times
-  const side = { x: -50, y: 66, heading: 90 };
+  m.beginScan();
+  for (let i = 0; i < 10; i++) m.integrateScan(O, [{ angle: 0, cm: 100 }, { angle: 2, cm: 100 }]);
+  m.endScan();
+  const c = m.cellInfo(0, 106);
+  assert.ok(c.hits <= 1 + 1e-6, `hits ${c.hits}`);
+  assert.equal(c.scans, 1);
+  assert.equal(m.kind(0, 106), 'suspect');
+  assert.ok(m.cellInfo(0, 50).misses <= 1 + 1e-6);
+  // without beginScan every call is a scan of its own
+  m.integrateScan(O, [{ angle: 0, cm: 100 }]);
+  assert.equal(m.cellInfo(0, 106).scans, 2);
+  assert.equal(m.kind(0, 106), 'occupied');
+  assert.equal(m.scans, 2);
+});
+
+test('gridmap: a phantom is seen through and goes; grazing cones do not erase a real hit', () => {
+  const m = new GridMap({});
+  // random short reflection at 70 cm, then two scans that see through it
+  m.integrateScan(O, [{ angle: 0, cm: 70 }]);
+  assert.equal(m.kind(0, 76), 'suspect');
+  m.integrateScan(O, [{ angle: 0, cm: 200 }]);
+  assert.ok(m.cellInfo(0, 76).p < 0.55);
+  m.integrateScan(O, [{ angle: 0, cm: 200 }]);
+  assert.equal(m.kind(0, 76), 'free');
+  // a thin leg 60 cm ahead seen by two scans; later beams only graze it
+  const t = new GridMap({});
+  for (let i = 0; i < 2; i++) t.integrateScan(O, [{ angle: 0, cm: 70 }], { robotRadiusCm: 0 });
+  assert.equal(t.kind(0, 76), 'occupied');
+  const side = { x: -50, y: 76, heading: 90 };
   for (let i = 0; i < 10; i++) {
-    m.integrateScan(side, [{ angle: 12, cm: 200 }, { angle: -12, cm: 200 }], { beamDeg: 16, freeBeamDeg: 30, robotRadiusCm: 0 });
+    // gap fillers and beam edges (outside the +-4 deg core of a 16 deg beam)
+    t.integrateScan(side, [{ angle: 12, cm: 200 }, { angle: -12, cm: 200 }], { beamDeg: 16, freeBeamDeg: 30, robotRadiusCm: 0 });
+    t.integrateScan(side, [{ angle: 6, cm: 200 }], { beamDeg: 16, robotRadiusCm: 0 });
   }
-  for (let i = 0; i < 3; i++) m.integrateScan(side, [{ angle: 6, cm: 200 }], { beamDeg: 16, robotRadiusCm: 0 });
-  assert.equal(m.stateOf(k), 'occupied');
-  // the core of a beam through it does clear it (the obstacle moved away)
-  for (let i = 0; i < 3; i++) m.integrateScan(side, [{ angle: 0, cm: 200 }], { beamDeg: 16, robotRadiusCm: 0 });
-  assert.equal(m.stateOf(k), 'free');
+  assert.equal(t.kind(0, 76), 'occupied');
+  // the core of a beam through it does clear it (the obstacle was moved away)
+  for (let i = 0; i < 6; i++) t.integrateScan(side, [{ angle: 0, cm: 200 }], { beamDeg: 16, robotRadiusCm: 0 });
+  assert.notEqual(t.kind(0, 76), 'occupied');
   // the robot footprint erodes hit evidence only slowly (pose errors)
   const m2 = new GridMap({});
-  m2.L[m2.index(3, 3)] = 1.2;
+  m2.add(m2.index(3, 3), 2);
+  m2.touch();
   m2.markFree(0, 0, 9);
   assert.equal(m2.cell(3, 3), 'occupied');
+});
+
+test('gridmap: a well-confirmed wall survives specular ghosts', () => {
+  const m = new GridMap({});
+  // wall at y = 106 seen head-on by 8 scans
+  for (let i = 0; i < 8; i++) m.integrateScan({ x: (i % 3) * 5, y: 0, heading: 0 }, [{ angle: 0, cm: 100 }]);
+  assert.equal(m.kind(0, 106), 'occupied');
+  // 3 oblique scans whose reading passes the wall (reflection away, long echo)
+  for (let i = 0; i < 3; i++) m.integrateScan(O, [{ angle: 0, cm: 200 }]);
+  assert.equal(m.kind(0, 106), 'occupied');
+  const c = m.cellInfo(0, 106);
+  assert.ok(c.misses > 0 && c.hits > c.misses, JSON.stringify(c));
+  // evidence is capped: a wall that was really removed fades eventually
+  for (let i = 0; i < 20; i++) m.integrateScan(O, [{ angle: 0, cm: 200 }]);
+  assert.equal(m.kind(0, 106), 'free');
+});
+
+test('gridmap: cleanup removes unconfirmed single-scan hits only', () => {
+  const m = new GridMap({});
+  m.integrateScan(O, [{ angle: 0, cm: 100 }, { angle: 90, cm: 40 }]);   // far: suspect, near: confirmed
+  m.integrateScan({ x: 0, y: 0, heading: 180 }, [{ angle: 0, cm: 120 }]);
+  m.integrateScan({ x: 0, y: 0, heading: 180 }, [{ angle: 0, cm: 120 }]); // two scans: confirmed
+  assert.equal(m.kind(0, 106), 'suspect');
+  const v = m.version;
+  const n = m.cleanup();
+  assert.ok(n > 0 && m.version > v);
+  assert.notEqual(m.kind(0, 106), 'suspect');
+  assert.equal(m.kind(46, 0), 'occupied');
+  assert.equal(m.kind(0, -126), 'occupied');
+  assert.equal(m.cell(0, 50), 'free');            // misses stay
+});
+
+test('gridmap: cellInfo, aging, legacy log-odds writes and add()', () => {
+  const m = new GridMap({ decayAfterScans: 2, decayRate: 0.5 });
+  m.integrateScan(O, [{ angle: 0, cm: 40 }]);
+  const c = m.cellInfo(0, 46);
+  assert.deepEqual(Object.keys(c).sort(), ['hits', 'lastSeen', 'misses', 'near', 'p', 'scans', 'scansAgo', 'state', 'x', 'y'].sort());
+  assert.equal(c.state, 'occupied');
+  assert.equal(c.scansAgo, 0);
+  assert.equal(m.cellInfo(5000, 0), null);
+  // not observed for more than 2 scans: fades toward unknown
+  for (let i = 0; i < 8; i++) m.integrateScan({ x: 0, y: -200, heading: 180 }, [{ angle: 0, cm: 50 }]);
+  assert.equal(m.kind(0, 46), 'unknown');
+  assert.equal(m.cellInfo(0, -256).state, 'occupied');   // observed every scan
+  // L written from outside (old saved maps) is imported on touch()
+  const o = new GridMap({});
+  o.L[o.index(0, 50)] = 3; o.L[o.index(0, 0)] = -2; o.L[o.index(0, 20)] = 0.3;
+  o.touch();
+  assert.equal(o.kind(0, 50), 'occupied');
+  assert.equal(o.kind(0, 0), 'free');
+  assert.equal(o.kind(0, 20), 'suspect');
+  // add(): contacts (+2 and more) confirm, negative values are misses
+  o.add(o.index(30, 30), 4);
+  o.add(o.index(0, 50), -1);
+  o.touch();
+  assert.equal(o.kind(30, 30), 'occupied');
+  assert.ok(o.cellInfo(0, 50).misses > 0);
 });
 
 test('gridmap: distance field matches brute force and is cached', () => {
@@ -126,10 +226,10 @@ test('gridmap: distance field matches brute force and is cached', () => {
 
 test('gridmap: inflation and traversability', () => {
   const m = new GridMap({});
-  m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 1 });
+  for (let i = 0; i < 2; i++) m.integrateScan(O, [{ angle: 0, cm: 100 }], { beamDeg: 1 });
   assert.equal(m.isTraversable(0, 50), true);
-  assert.equal(m.isTraversable(0, 95), false);                  // within 14 cm of the hit at 106
-  assert.equal(m.isTraversable(0, 95, { inflateCm: 5 }), true);
+  assert.equal(m.isTraversable(0, 90), false);                  // within 14 cm of the hit arc at 100..110
+  assert.equal(m.isTraversable(0, 90, { inflateCm: 5 }), true);
   assert.equal(m.isTraversable(0, 106, { inflateCm: 0 }), false);  // occupied itself
   assert.equal(m.isTraversable(0, 115, { allowUnknown: true }), false); // unknown, but inflated
   assert.equal(m.isTraversable(0, 140, { allowUnknown: true }), true);
@@ -159,7 +259,7 @@ test('gridmap: frontiers cluster free cells next to unknown, largest first', () 
 
 test('gridmap: describe is compact and relative to the heading', () => {
   const m = new GridMap({});
-  m.integrateScan(O, [{ angle: 0, cm: 50 }, { angle: 90, cm: 120 }, { angle: 180, cm: 300 }, { angle: -90, cm: 300 }]);
+  for (let i = 0; i < 2; i++) m.integrateScan(O, [{ angle: 0, cm: 50 }, { angle: 90, cm: 120 }, { angle: 180, cm: 300 }, { angle: -90, cm: 300 }]);
   const s = m.describe({ x: 0, y: 0, heading: 90 });
   assert.ok(s.length < 400, `${s.length}`);
   assert.match(s, /m² known/);
@@ -168,20 +268,164 @@ test('gridmap: describe is compact and relative to the heading', () => {
   assert.match(s, /frontier/);
 });
 
-test('gridmap: clear, forEachCell, JSON round trip', () => {
+test('gridmap: clear, forEachCell, JSON round trip (v2 evidence, v1 read)', () => {
   const m = new GridMap({});
   m.integrateScan(O, [{ angle: 30, cm: 80 }]);
+  m.integrateScan(O, [{ angle: 0, cm: 40 }]);
   const v = m.version;
   const j = JSON.parse(JSON.stringify(m));
+  assert.equal(j.v, 2);
   const m2 = GridMap.fromJSON(j);
   let a = 0, b = 0;
-  m.forEachCell((x, y, s, p) => { a++; assert.ok(p > 0 && p < 1); assert.equal(m2.cell(x, y), s); });
+  const kinds = new Set();
+  m.forEachCell((x, y, s, p, kind) => {
+    a++; kinds.add(kind);
+    assert.ok(p > 0 && p < 1);
+    assert.equal(m2.cell(x, y), s);
+    assert.equal(m2.kind(x, y), kind);
+  });
   m2.forEachCell(() => b++);
   assert.equal(a, b);
   assert.ok(a > 20);
+  assert.ok(kinds.has('free') && kinds.has('suspect') && kinds.has('occupied'));
+  assert.equal(m2.cellInfo(0, 46).near, true);
+  const m3 = new GridMap({});
+  m3.copyFrom(m2);
+  assert.deepEqual(m3.cellInfo(0, 46), m2.cellInfo(0, 46));
+  assert.throws(() => m3.copyFrom(new GridMap({ sizeCm: 400 })), /size/);
+  // version 1 (log-odds only)
+  const old = GridMap.fromJSON({ v: 1, cellCm: 5, sizeCm: 800, cells: [m.index(0, 50), 2.5, m.index(0, 0), -2] });
+  assert.equal(old.kind(0, 50), 'occupied');
+  assert.equal(old.kind(0, 0), 'free');
   m.clear();
   assert.ok(m.version > v);
   assert.equal(m.bounds, null);
   let c = 0; m.forEachCell(() => c++);
   assert.equal(c, 0);
+  assert.equal(m.cellInfo(0, 46).hits, 0);
+});
+
+// Synthetic room with the measured sensor model: 25 deg beam (nearest echo
+// wins), readings at or beyond 150 cm mean nothing (reported as 190), surfaces
+// hit at more than 55 deg from their normal reflect away (specular ghost: the
+// beam sees past them), the thin table leg answers only within 8 deg of the
+// axis, and 5 % of the readings are random short reflections.
+const ROOM = { x0: -150, x1: 150, y0: -100, y1: 100 };
+const LEG = { x: 65, y: 45, r: 4 };
+const SOFA = { x0: -130, x1: -40, y0: 55, y1: 100 };
+const CHAIR = { x0: 78, x1: 112, y0: -52, y1: -18 };
+
+function rng(seed) {
+  let s = seed >>> 0;
+  return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 2 ** 32; };
+}
+
+// Distance and incidence (deg from the surface normal) of a ray against the scene.
+function castRay(ox, oy, dx, dy, boxes) {
+  let best = { t: Infinity, inc: 0, thin: false };
+  const seg = (t, nx, ny) => { if (t > 1e-6 && t < best.t) best = { t, inc: Math.acos(Math.min(1, Math.abs(dx * nx + dy * ny))) * 180 / Math.PI, thin: false }; };
+  // room walls from the inside
+  if (dx > 0) seg((ROOM.x1 - ox) / dx, 1, 0); else if (dx < 0) seg((ROOM.x0 - ox) / dx, 1, 0);
+  if (dy > 0) seg((ROOM.y1 - oy) / dy, 0, 1); else if (dy < 0) seg((ROOM.y0 - oy) / dy, 0, 1);
+  for (const b of boxes) {
+    for (const [x, nx] of [[b.x0, 1], [b.x1, 1]]) {
+      if (!dx) continue;
+      const t = (x - ox) / dx, y = oy + dy * t;
+      if (y >= b.y0 && y <= b.y1) seg(t, nx, 0);
+    }
+    for (const [y, ny] of [[b.y0, 1], [b.y1, 1]]) {
+      if (!dy) continue;
+      const t = (y - oy) / dy, x = ox + dx * t;
+      if (x >= b.x0 && x <= b.x1) seg(t, 0, ny);
+    }
+  }
+  const fx = ox - LEG.x, fy = oy - LEG.y, bq = fx * dx + fy * dy, disc = bq * bq - (fx * fx + fy * fy - LEG.r * LEG.r);
+  if (disc >= 0) { const t = -bq - Math.sqrt(disc); if (t > 0 && t < best.t) best = { t, inc: 0, thin: true }; }
+  return best;
+}
+
+function sweep(pose, { chair, rand }) {
+  const boxes = chair ? [SOFA, CHAIR] : [SOFA];
+  const points = [];
+  for (let a = 0; a < 360; a += 5) {
+    const dir = pose.heading + a;
+    const sx = pose.x + 6 * Math.sin((dir * Math.PI) / 180), sy = pose.y + 6 * Math.cos((dir * Math.PI) / 180);
+    let cm = Infinity;
+    for (let off = -12.5; off <= 12.5; off += 0.5) {
+      const t = ((dir + off) * Math.PI) / 180;
+      const h = castRay(sx, sy, Math.sin(t), Math.cos(t), boxes);
+      if (h.thin ? Math.abs(off) > 8 : h.inc > 55) continue;   // weak / specular: no echo from this ray
+      cm = Math.min(cm, h.t);
+    }
+    if (rand() < 0.05) cm = 15 + rand() * (Math.min(cm, 150) - 15);   // random reflection
+    points.push({ angle: a > 180 ? a - 360 : a, cm: cm >= 150 ? 190 : Math.round(cm * 10) / 10 });
+  }
+  return points;
+}
+
+// cm from (x, y) to the nearest real surface (chair optional)
+function surfaceDist(x, y, chair) {
+  const box = (b) => Math.hypot(x - Math.min(b.x1, Math.max(b.x0, x)), y - Math.min(b.y1, Math.max(b.y0, y)));
+  let d = Math.min(x - ROOM.x0, ROOM.x1 - x, y - ROOM.y0, ROOM.y1 - y, box(SOFA), Math.hypot(x - LEG.x, y - LEG.y) - LEG.r);
+  if (chair) d = Math.min(d, box(CHAIR));
+  return d;
+}
+
+test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and a removed chair', () => {
+  const m = new GridMap({});
+  const rand = rng(7);
+  const poses = [{ x: 0, y: 0, heading: 0 }, { x: 40, y: -20, heading: 30 }, { x: -50, y: 0, heading: -60 },
+    { x: 20, y: 30, heading: 90 }, { x: -90, y: -50, heading: 10 }, { x: 110, y: 20, heading: 200 }, { x: 0, y: -60, heading: 45 }];
+  const opts = { beamDeg: 25, maxRangeCm: 150 };
+  // the chair is there for the first three scans, then removed
+  for (let i = 0; i < 3; i++) m.integrateScan(poses[i], sweep(poses[i], { chair: true, rand }), opts);
+  const chairBefore = [];
+  m.forEachCell((x, y, s, p, kind) => { if (kind === 'occupied' && surfaceDist(x, y, false) > 8) chairBefore.push([x, y]); });
+  assert.ok(chairBefore.length > 3, 'the chair was mapped');
+  for (let i = 0; i < 11; i++) {
+    const p = poses[i % poses.length];
+    m.integrateScan(p, sweep(p, { chair: false, rand }), opts);
+  }
+  // phantoms: hit evidence more than 20 cm from any real surface (random
+  // reflections, the removed chair); bias: confirmed cells 8 to 20 cm in
+  // front of a surface (a 25 deg cone rounds corners and oblique walls)
+  const phantoms = { occupied: [], suspect: [] };
+  let bias = 0;
+  m.forEachCell((x, y, s, p, kind) => {
+    const d = surfaceDist(x, y, false);
+    if (d > 20 && (kind === 'occupied' || kind === 'suspect')) phantoms[kind].push([x, y]);
+    if (d > 8 && d <= 20 && kind === 'occupied') bias++;
+  });
+  // wall points within range of a pose with a confirmed cell within 5 cm
+  let wall = 0, wallOk = 0;
+  const pts = [];
+  for (let t = -145; t <= 145; t += 5) pts.push({ x: t, y: ROOM.y0 }, { x: t, y: ROOM.y1 });
+  for (let t = -95; t <= 95; t += 5) pts.push({ x: ROOM.x0, y: t }, { x: ROOM.x1, y: t });
+  for (let t = SOFA.x0; t <= SOFA.x1; t += 5) pts.push({ x: t, y: SOFA.y0 });
+  for (const q of pts) {
+    if (!poses.some((p) => Math.hypot(q.x - p.x, q.y - p.y) < 120)) continue;
+    wall++;
+    let ok = false;
+    for (let dx = -5; dx <= 5; dx += 5) for (let dy = -5; dy <= 5; dy += 5) if (m.kind(q.x + dx, q.y + dy) === 'occupied') ok = true;
+    if (ok) wallOk++;
+  }
+  assert.equal(phantoms.occupied.length, 0, `confirmed phantoms ${JSON.stringify(phantoms.occupied)}`);
+  assert.ok(phantoms.suspect.length <= 8, `suspect phantoms ${phantoms.suspect.length}`);
+  assert.ok(bias <= 20, `confirmed cells in front of surfaces ${bias}`);
+  assert.ok(wallOk / wall > 0.7, `walls confirmed ${wallOk}/${wall}`);
+  // nothing of the removed chair is left confirmed
+  m.forEachCell((x, y, s, p, kind) => {
+    if (kind === 'occupied') assert.ok(!(x > CHAIR.x0 - 3 && x < CHAIR.x1 + 3 && y > CHAIR.y0 - 3 && y < CHAIR.y1 + 3), `chair cell ${x},${y}`);
+  });
+  // the leg stays confirmed
+  let leg = false;
+  m.forEachCell((x, y, s, p, kind) => { if (kind === 'occupied' && Math.hypot(x - LEG.x, y - LEG.y) < 9) leg = true; });
+  assert.ok(leg, 'leg confirmed');
+  // cleanup drops the remaining single-scan suspects and keeps everything confirmed
+  const before = m.stats().occupied;
+  m.cleanup();
+  let left = 0;
+  m.forEachCell((x, y, s, p, kind) => { if (kind === 'suspect' && surfaceDist(x, y, false) > 20) left++; });
+  assert.ok(left <= phantoms.suspect.length / 2, `after cleanup ${left}`);
+  assert.equal(m.stats().occupied, before);
 });

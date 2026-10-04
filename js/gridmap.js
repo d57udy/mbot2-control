@@ -1,31 +1,55 @@
-// Log-odds occupancy grid in the map frame (x right, y forward of the start,
-// heading clockwise from +y). Square, centred on the origin.
+// Occupancy grid in the map frame (x right, y forward of the start, heading
+// clockwise from +y). Square, centred on the origin.
 //
-// Ultrasonic model: the echo is the nearest surface anywhere in the cone, so
-// the whole cone up to the reading is free evidence, and the hit lies somewhere
-// on the arc at the reading. The arc is marked occupied with a weight that
-// falls off toward the beam edges: the centre becomes occupied after one scan,
-// the edges need confirmation, and free cones from other poses erode the
-// false part of the arc. Planning inflates obstacles on top of that.
+// Evidence model (v0.6). Each cell keeps hit evidence H and miss evidence M
+// separately, the number of distinct scans that hit it and the scan that last
+// observed it. A scan contributes at most one hit and one miss per cell (the
+// strongest), so the overlapping beams of a sweep or repeated readings cannot
+// inflate the evidence; open a scan with beginScan()/endScan(), otherwise
+// every integrateScan() call is one scan.
 //
-// Occupied evidence is protected: thin obstacles (a table leg) are seen by
-// one beam of one scan and missed by the neighbours, so free evidence on a
-// cell that already holds hit evidence (L > 0) only counts from the core of
-// a real beam at short range. The widened gap filler (freeBeamDeg) never
-// erodes it, the beam edges only weakly, and long ranges less than short ones.
+// Ultrasonic: the echo is the nearest surface anywhere in the cone.
+//  - Hit: the cell lies on the arc at the reading, weighted toward the beam
+//    centre (an off-centre echo is less likely to come from that cell) and
+//    toward short range (a far arc is wide; on an oblique wall its centre
+//    lies in front of the wall).
+//  - Miss: the beam core (+-1/4 of the beam) passes through the cell and the
+//    reading ends clearly beyond it (MISS_MARGIN_CM), weighted higher at short
+//    range. A real obstacle in the core would have produced the reading, so it
+//    cannot collect core misses; a phantom from a random reflection does.
+//  - Cells without hit evidence also become free from the rest of the cone up
+//    to the reading (weaker), and from the freeBeamDeg gap filler (weaker
+//    still); that never erodes hit evidence.
+// p = (H + 1/2) / (H + M + 1), a Beta posterior, so a well-confirmed wall
+// needs proportionally many misses (specular ghosts) to fade, while a
+// one-scan phantom goes after one or two. H + M is capped (EVIDENCE_CAP) so
+// the map keeps adapting when something moves.
+//
+// States (kindOf): 'occupied' (confirmed: p >= P_OCC and hits from at least
+// two scans, or one head-on hit closer than NEAR_CM), 'suspect' (hit evidence
+// that is not confirmed, p >= 1/2), 'free' (p < P_FREE), 'unknown'.
+// Consumers that read log-odds use L, a view derived from the evidence:
+// confirmed > L_THRESH, suspect in (L_SUSPECT, L_THRESH], free < -L_THRESH.
+// stateOf()/cell() keep the three legacy states (a suspect cell is
+// 'unknown' there). Writes to L from outside (loading a saved map) are
+// imported as evidence on the next touch().
 
-const L_FREE = -0.7;
-const L_OCC = 1.2;
-const L_MIN = -4;
-const L_MAX = 4;
-export const L_THRESH = 0.5;   // |log-odds| above this is known (p < 0.38 or p > 0.62)
-export const L_SUSPECT = 0.15; // weak hit evidence (arc edges, eroded hits); the planner avoids it
-const EDGE_OCC = 0.35;  // occupied weight at the beam edge relative to the centre
-const WIDE_FREE = 0.5;  // free weight of rays outside the real beam
-const WIDE_REACH = 0.7; // free reach of rays outside the real beam, as a fraction of the range
-const EDGE_FREE_ON_HIT = 0.3;  // free weight of the beam edge on a cell with hit evidence
-const SURE_FREE_CM = 80;       // core free evidence on hit cells is full up to this range
-const FAR_FREE_ON_HIT = 0.3;   // ... and falls to this fraction at maxRange
+export const L_THRESH = 0.5;   // |L| above this is known
+export const L_SUSPECT = 0.15; // L above this (and up to L_THRESH) is a suspect cell
+const P_OCC = 0.65;            // confirmed occupied needs at least this
+const P_FREE = 0.4;            // free below this
+const PRIOR = 0.5;             // Beta prior per side
+const EVIDENCE_CAP = 12;       // H + M is scaled down to this
+const HIT_EDGE = 0.3;          // hit weight at the beam edge (1 at the centre)
+const HIT_COUNTS = 0.5;        // a hit at least this strong counts as a hit scan
+const NEAR_CM = 60;            // a head-on core hit closer than this confirms at once
+const MISS_MARGIN_CM = 8;      // misses on hit cells only this far short of the reading
+const MISS_FULL_CM = 50;       // hit and miss weights are 1 up to this range ...
+const MISS_FAR = 0.4;          // ... and fall to this at maxRange (far arcs are wide)
+const CONE_MISS = 0.4;         // miss weight of the cone outside the core (cells without hits)
+const WIDE_MISS = 0.12;        // gap filler outside the beam (cells without hits): free after 3 passes
+const WIDE_REACH = 0.7;        // gap filler reach, as a fraction of the range
+const CONTACT_CONFIRMS = 2;    // add(k, dl) with dl >= this is physical contact: confirmed
 
 // 1D squared distance transform of f (0 at sites, large elsewhere) into d.
 function edt1d(f, n, d, v, z) {
@@ -49,24 +73,79 @@ function edt1d(f, n, d, v, z) {
 const rad = (d) => (d * Math.PI) / 180;
 const deg = (r) => (r * 180) / Math.PI;
 const normDeg = (a) => { const r = ((((a + 180) % 360) + 360) % 360) - 180; return r === -180 ? 180 : r; };
+const logit = (p) => Math.log(p / (1 - p));
 
 export class GridMap {
-  constructor({ cellCm = 5, sizeCm = 800 } = {}) {
+  // decayAfterScans: evidence of cells not observed for this many scans fades
+  // by decayRate per scan toward unknown (0 = off).
+  constructor({ cellCm = 5, sizeCm = 800, decayAfterScans = 0, decayRate = 0.9 } = {}) {
     this.cellCm = cellCm;
     this.n = Math.ceil(sizeCm / cellCm);
     this.sizeCm = this.n * cellCm;
     this.half = this.sizeCm / 2;
-    this.L = new Float32Array(this.n * this.n);
+    const N = this.n * this.n;
+    this.L = new Float32Array(N);      // derived log-odds view (see above)
+    this.Lw = new Float32Array(N);     // L as last written here, to detect outside writes
+    this.H = new Float32Array(N);      // hit evidence
+    this.M = new Float32Array(N);      // miss evidence
+    this.S = new Uint16Array(N);       // scans with a hit of at least HIT_COUNTS
+    this.near = new Uint8Array(N);     // 1 = head-on hit closer than NEAR_CM
+    this.seen = new Int32Array(N);     // scan id of the last observation (0 = never)
+    this.hitSid = new Int32Array(N);   // per-scan bookkeeping: strongest hit / miss so far
+    this.hitW = new Float32Array(N);
+    this.missSid = new Int32Array(N);
+    this.missW = new Float32Array(N);
+    this.scans = 0;                    // scan ids handed out
+    this.openScan = 0;                 // id of the scan opened by beginScan(), or 0
+    this.decayAfterScans = decayAfterScans;
+    this.decayRate = decayRate;
     this.version = 0;
     this.cache = new Map();
   }
 
   clear() {
-    this.L.fill(0);
+    for (const a of [this.L, this.Lw, this.H, this.M, this.S, this.near, this.seen, this.hitSid, this.hitW, this.missSid, this.missW]) a.fill(0);
+    this.openScan = 0;
     this.touch();
   }
 
-  touch() { this.version++; this.cache.clear(); }
+  // Takes over another map's cells and evidence (same cellCm and sizeCm).
+  copyFrom(o) {
+    if (o.n !== this.n || o.cellCm !== this.cellCm) throw new Error('map size differs');
+    for (const f of ['L', 'Lw', 'H', 'M', 'S', 'near', 'seen']) this[f].set(o[f]);
+    this.hitSid.fill(0); this.missSid.fill(0);
+    this.scans = o.scans;
+    this.openScan = 0;
+    this.touch();
+  }
+
+  // Call after changing the map. Imports cells whose L was written from outside.
+  touch() {
+    const { L, Lw } = this;
+    for (let k = 0; k < L.length; k++) if (L[k] !== Lw[k]) this.importL(k);
+    this.version++;
+    this.cache.clear();
+  }
+
+  // Evidence from a bare log-odds value (old saved maps, tests that set L).
+  // L keeps the given value; the evidence matches its state, as if from a
+  // few scans, until new observations of the cell rewrite it.
+  importL(k) {
+    const l = this.L[k];
+    if (!Number.isFinite(l) || l === 0) {
+      this.H[k] = 0; this.M[k] = 0; this.S[k] = 0; this.near[k] = 0;
+      this.L[k] = 0;
+    } else {
+      let p = 1 / (1 + Math.exp(-Math.max(-8, Math.min(8, l))));
+      if (l > L_THRESH) p = Math.max(p, P_OCC + 0.01);
+      const n = 4;
+      this.H[k] = Math.max(0, p * (n + 2 * PRIOR) - PRIOR);
+      this.M[k] = Math.max(0, n - this.H[k]);
+      this.S[k] = l > L_THRESH ? 2 : l > 0 ? 1 : 0;
+      this.near[k] = 0;
+    }
+    this.Lw[k] = this.L[k];
+  }
 
   // cell index helpers; i = column (x), j = row (y)
   col(x) { return Math.floor((x + this.half) / this.cellCm); }
@@ -78,6 +157,24 @@ export class GridMap {
     return { x: (i + 0.5) * this.cellCm - this.half, y: (j + 0.5) * this.cellCm - this.half };
   }
 
+  // Occupancy probability from the evidence (0.5 = nothing known).
+  prob(k) { return (this.H[k] + PRIOR) / (this.H[k] + this.M[k] + 2 * PRIOR); }
+
+  confirmed(k) { return this.prob(k) >= P_OCC && (this.S[k] >= 2 || this.near[k] === 1); }
+
+  // 'occupied' | 'suspect' | 'free' | 'unknown'
+  kindOf(k) {
+    if (k < 0) return 'unknown';
+    if (this.H[k] + this.M[k] === 0) return 'unknown';
+    const p = this.prob(k);
+    if (this.H[k] > 0 && this.confirmed(k)) return 'occupied';
+    if (this.H[k] > 0 && p >= 0.5) return 'suspect';
+    return p < P_FREE ? 'free' : 'unknown';
+  }
+
+  kind(x, y) { return this.kindOf(this.index(x, y)); }
+
+  // Legacy three states from the L view: suspect cells are 'unknown'.
   stateOf(k) {
     const l = this.L[k];
     return l > L_THRESH ? 'occupied' : l < -L_THRESH ? 'free' : 'unknown';
@@ -88,77 +185,185 @@ export class GridMap {
     return k < 0 ? 'unknown' : this.stateOf(k);
   }
 
-  prob(k) { return 1 / (1 + Math.exp(-this.L[k])); }
+  // Caps the evidence and rewrites the L view of cell k.
+  update(k) {
+    const t = this.H[k] + this.M[k];
+    if (t > EVIDENCE_CAP) { const f = EVIDENCE_CAP / t; this.H[k] *= f; this.M[k] *= f; }
+    let l = 0;
+    if (this.H[k] + this.M[k] > 0) {
+      const kind = this.kindOf(k), lp = logit(this.prob(k));
+      if (kind === 'occupied') l = Math.max(L_THRESH + 0.01, lp);
+      else if (kind === 'suspect') l = Math.min(L_THRESH, Math.max(L_SUSPECT + 0.05, lp));
+      else if (kind === 'free') l = Math.min(-L_THRESH - 0.01, lp);
+      else l = Math.min(L_SUSPECT, Math.max(-L_THRESH, lp)) || -1e-3; // observed, undecided: never exactly 0
+    }
+    this.L[k] = l;
+    this.Lw[k] = this.L[k];
+  }
 
-  add(k, dl) { this.L[k] = Math.min(L_MAX, Math.max(L_MIN, this.L[k] + dl)); }
+  // One scan's hit / miss on cell k: only the strongest of each per scan counts.
+  hitCell(k, w, sid, near = false) {
+    if (this.hitSid[k] !== sid) { this.hitSid[k] = sid; this.hitW[k] = 0; }
+    if (w > this.hitW[k]) {
+      if (this.hitW[k] < HIT_COUNTS && w >= HIT_COUNTS) this.S[k] = Math.min(65535, this.S[k] + 1);
+      this.H[k] += w - this.hitW[k];
+      this.hitW[k] = w;
+    }
+    if (near) this.near[k] = 1;
+    this.seen[k] = sid;
+  }
 
-  // Marks a disc free, e.g. the robot's own footprint.
+  missCell(k, w, sid) {
+    if (this.missSid[k] !== sid) { this.missSid[k] = sid; this.missW[k] = 0; }
+    if (w > this.missW[k]) { this.M[k] += w - this.missW[k]; this.missW[k] = w; }
+    this.seen[k] = sid;
+  }
+
+  // Groups the following integrateScan / markFree calls into one scan.
+  beginScan() {
+    this.openScan = ++this.scans;
+    return this.openScan;
+  }
+
+  endScan() {
+    if (!this.openScan) return;
+    this.openScan = 0;
+    this.age();
+    this.touch();
+  }
+
+  // Raw evidence for compatibility: dl > 0 adds hits (dl >= CONTACT_CONFIRMS
+  // is a physical contact and confirms the cell), dl < 0 adds misses.
+  add(k, dl) {
+    if (k < 0 || !dl) return;
+    if (dl > 0) {
+      this.H[k] += dl;
+      if (dl >= CONTACT_CONFIRMS) this.S[k] = Math.max(this.S[k], 2);
+      else if (dl >= HIT_COUNTS) this.S[k] = Math.max(this.S[k], 1);
+    } else this.M[k] -= dl;
+    this.seen[k] = Math.max(this.seen[k], this.scans);
+    this.update(k);
+  }
+
+  // The robot's own footprint is free; hit cells under it get a weak miss
+  // only (a pose error must not wipe a known obstacle in one go).
   markFree(x, y, rCm = 9) {
+    const own = !this.openScan;
+    const sid = this.openScan || ++this.scans;
+    this.footprint(x, y, rCm, sid);
+    if (own) this.age();
+    this.touch();
+  }
+
+  footprint(x, y, rCm, sid) {
     const r = Math.ceil(rCm / this.cellCm);
     const ci = this.col(x), cj = this.row(y);
     for (let j = cj - r; j <= cj + r; j++) {
       for (let i = ci - r; i <= ci + r; i++) {
         if (!this.inside(i, j)) continue;
         const k = j * this.n + i, c = this.centre(k);
-        // a pose error must not wipe a known obstacle in one go
-        if (Math.hypot(c.x - x, c.y - y) <= rCm) this.add(k, (this.L[k] > 0 ? 0.5 : 2) * L_FREE);
+        if (Math.hypot(c.x - x, c.y - y) > rCm) continue;
+        this.missCell(k, this.H[k] > 0 ? 0.5 : 1, sid);
+        this.update(k);
       }
     }
-    this.touch();
   }
 
   // points: [{ angle, cm }] relative to pose.heading (as from scan()). The
-  // robot turns in place while scanning, so the sensor sits sensorOffsetCm
-  // along each beam's direction. freeBeamDeg (default beamDeg) widens only the
-  // free cone, e.g. to cover the gaps between coarse scan steps. The widened
-  // part was not looked at, so it says less: it counts WIDE_FREE (unknown
-  // after one pass, free after two overlapping ones) and reaches only
-  // WIDE_REACH of the range, so a wall seen at a slant or a box between two
-  // scan directions is not cleared through.
-  integrateScan(pose, points, { sensorOffsetCm = 6, beamDeg = 16, maxRangeCm = 250, freeBeamDeg = beamDeg, robotRadiusCm = 9 } = {}) {
-    const halfOcc = beamDeg / 2, halfFree = Math.max(freeBeamDeg, beamDeg) / 2;
+  // sensor sits sensorOffsetCm along each beam's direction. Readings at or
+  // beyond maxRangeCm mean nothing in range: misses up to maxRangeCm.
+  // freeBeamDeg (default beamDeg) widens the free cone for coarse step scans.
+  integrateScan(pose, points, { sensorOffsetCm = 6, beamDeg = 16, maxRangeCm = 250, freeBeamDeg = beamDeg, robotRadiusCm = 9, scanId } = {}) {
+    const own = !scanId && !this.openScan;
+    const sid = scanId || this.openScan || ++this.scans;
+    const hb = beamDeg / 2, hc = beamDeg / 4, hf = Math.max(freeBeamDeg, beamDeg) / 2;
+    const cell = this.cellCm, arc = cell * 0.71;
+    const missW = (d) => (d <= MISS_FULL_CM ? 1
+      : Math.max(MISS_FAR, 1 - ((1 - MISS_FAR) * (d - MISS_FULL_CM)) / Math.max(1, maxRangeCm - MISS_FULL_CM)));
+    const touched = new Set();
     for (const p of points ?? []) {
       const cm = p?.cm == null ? NaN : Number(p.cm);
       if (!Number.isFinite(cm) || cm < 0) continue;
-      const dir = (pose.heading ?? 0) + (Number(p.angle) || 0);
-      const sx = pose.x + sensorOffsetCm * Math.sin(rad(dir));
-      const sy = pose.y + sensorOffsetCm * Math.cos(rad(dir));
+      const dir = rad((pose.heading ?? 0) + (Number(p.angle) || 0));
+      const ux = Math.sin(dir), uy = Math.cos(dir);
+      const sx = pose.x + sensorOffsetCm * ux, sy = pose.y + sensorOffsetCm * uy;
       const hit = cm < maxRangeCm;
-      const range = hit ? cm : maxRangeCm;
-      // free: weight on cells without hit evidence; keep: weight on cells with it
-      const free = new Map(), keep = new Map(), occ = new Map();
-      // enough rays that neighbours are at most one cell apart at full range
-      const nRays = Math.max(3, Math.ceil(rad(2 * halfFree) * range / this.cellCm) + 1);
-      for (let r = 0; r < nRays; r++) {
-        const off = -halfFree + (2 * halfFree * r) / (nRays - 1);
-        const a = rad(dir + off);
-        const dx = Math.sin(a), dy = Math.cos(a);
-        const inBeam = Math.abs(off) <= halfOcc + 1e-9;
-        const inCore = Math.abs(off) <= halfOcc / 2 + 1e-9;
-        const wFree = inBeam ? 1 : WIDE_FREE;
-        const wKeep = inCore ? 1 : inBeam ? EDGE_FREE_ON_HIT : 0;
-        const freeTo = (hit ? range - this.cellCm : range) * (inBeam ? 1 : WIDE_REACH);
-        for (let t = 0; t <= freeTo; t += this.cellCm / 2) {
-          const k = this.index(sx + dx * t, sy + dy * t);
-          if (k < 0) continue;
-          if (!(free.get(k) >= wFree)) free.set(k, wFree);
-          const far = t <= SURE_FREE_CM ? 1
-            : Math.max(FAR_FREE_ON_HIT, 1 - ((1 - FAR_FREE_ON_HIT) * (t - SURE_FREE_CM)) / Math.max(1, maxRangeCm - SURE_FREE_CM));
-          const wk = wKeep * far;
-          if (!(keep.get(k) >= wk)) keep.set(k, wk);
-        }
-        if (hit && inBeam) {
-          const w = 1 - (1 - EDGE_OCC) * (halfOcc ? Math.abs(off) / halfOcc : 0);
-          const k = this.index(sx + dx * range, sy + dy * range);
-          if (k >= 0 && !(occ.get(k) >= w)) occ.set(k, w);
+      const R = hit ? cm : maxRangeCm;
+      // bounding box of the sector
+      let x0 = sx, x1 = sx, y0 = sy, y1 = sy;
+      for (let a = -hf; a <= hf + 1e-9; a += Math.max(1, hf / 4)) {
+        const t = dir + rad(a), ex = sx + (R + cell) * Math.sin(t), ey = sy + (R + cell) * Math.cos(t);
+        x0 = Math.min(x0, ex); x1 = Math.max(x1, ex); y0 = Math.min(y0, ey); y1 = Math.max(y1, ey);
+      }
+      const i0 = Math.max(0, this.col(x0)), i1 = Math.min(this.n - 1, this.col(x1));
+      const j0 = Math.max(0, this.row(y0)), j1 = Math.min(this.n - 1, this.row(y1));
+      for (let j = j0; j <= j1; j++) {
+        for (let i = i0; i <= i1; i++) {
+          const k = j * this.n + i;
+          const cx = (i + 0.5) * cell - this.half - sx, cy = (j + 0.5) * cell - this.half - sy;
+          const d = Math.hypot(cx, cy);
+          if (d > R + arc) continue;
+          // angle off the beam axis, less the cell's own angular radius (a beam
+          // through any part of a cell near the sensor counts)
+          const off = Math.max(0, Math.abs(deg(Math.atan2(cx * uy - cy * ux, cx * ux + cy * uy))) - deg(Math.atan2(cell / 2, Math.max(d, 1e-6))));
+          if (off > hf) continue;
+          const inBeam = off <= hb;
+          if (hit && inBeam && Math.abs(d - R) <= arc) {
+            this.hitCell(k, (1 - (1 - HIT_EDGE) * (hb ? off / hb : 0)) * missW(d), sid, off <= hc && R < NEAR_CM);
+            touched.add(k);
+            continue;
+          }
+          const bare = this.H[k] === 0, end = hit ? R - cell : R;
+          if (inBeam && off <= hc && d < (bare ? end : R - MISS_MARGIN_CM)) this.missCell(k, missW(d), sid);
+          else if (bare && inBeam && d < end) this.missCell(k, CONE_MISS * missW(d), sid);
+          else if (bare && !inBeam && d < R * WIDE_REACH) this.missCell(k, WIDE_MISS * missW(d), sid);
+          else continue;
+          touched.add(k);
         }
       }
-      for (const k of occ.keys()) free.delete(k);
-      for (const [k, w] of free) this.add(k, L_FREE * (this.L[k] > 0 ? keep.get(k) : w));
-      for (const [k, w] of occ) this.add(k, L_OCC * w);
     }
-    if (robotRadiusCm > 0) this.markFree(pose.x, pose.y, robotRadiusCm);
-    else this.touch();
+    for (const k of touched) this.update(k);
+    if (robotRadiusCm > 0) this.footprint(pose.x, pose.y, robotRadiusCm, sid);
+    if (own) this.age();
+    this.touch();
+  }
+
+  // Fades evidence of cells not observed for decayAfterScans scans.
+  age() {
+    if (!(this.decayAfterScans > 0)) return;
+    const r = this.decayRate, cut = this.scans - this.decayAfterScans;
+    for (let k = 0; k < this.H.length; k++) {
+      if (this.seen[k] >= cut || this.H[k] + this.M[k] === 0) continue;
+      this.H[k] *= r; this.M[k] *= r;
+      if (this.H[k] + this.M[k] < 0.05) { this.H[k] = 0; this.M[k] = 0; this.S[k] = 0; this.near[k] = 0; }
+      this.update(k);
+    }
+  }
+
+  // Removes hit evidence that one scan at most has seen and that is not
+  // confirmed (random reflections). Returns the number of cells cleaned.
+  cleanup() {
+    let n = 0;
+    for (let k = 0; k < this.H.length; k++) {
+      if (this.H[k] === 0 || this.S[k] > 1 || this.confirmed(k)) continue;
+      this.H[k] = 0; this.S[k] = 0; this.near[k] = 0;
+      this.update(k);
+      n++;
+    }
+    this.touch();
+    return n;
+  }
+
+  // For a tap inspector: evidence of the cell at (x, y).
+  cellInfo(x, y) {
+    const k = this.index(x, y);
+    if (k < 0) return null;
+    const c = this.centre(k), r = (v) => Math.round(v * 100) / 100;
+    return {
+      x: c.x, y: c.y, state: this.kindOf(k), p: r(this.prob(k)),
+      hits: r(this.H[k]), misses: r(this.M[k]), scans: this.S[k], near: this.near[k] === 1,
+      lastSeen: this.seen[k], scansAgo: this.seen[k] ? this.scans - this.seen[k] : null,
+    };
   }
 
   // Float32Array: distance in cm from each cell centre to the nearest cell
@@ -212,7 +417,7 @@ export class GridMap {
 
   isTraversable(x, y, opts = {}) { return this.traversableAt(this.index(x, y), opts); }
 
-  // Free cells with an unknown 4-neighbour, clustered 8-connected; centroids, largest first.
+  // Free cells with an unknown (not suspect) 4-neighbour, clustered 8-connected; centroids, largest first.
   frontiers({ minCells = 3 } = {}) {
     const n = this.n;
     const isF = new Uint8Array(n * n);
@@ -220,7 +425,7 @@ export class GridMap {
       for (let i = 1; i < n - 1; i++) {
         const k = j * n + i;
         if (this.L[k] >= -L_THRESH) continue;
-        const unk = (q) => Math.abs(this.L[q]) <= L_THRESH;
+        const unk = (q) => this.L[q] >= -L_THRESH && this.L[q] <= L_SUSPECT;   // suspect cells are evidence, not unknown
         if (unk(k - 1) || unk(k + 1) || unk(k - n) || unk(k + n)) isF[k] = 1;
       }
     }
@@ -249,12 +454,13 @@ export class GridMap {
     return out.sort((a, b) => b.size - a.size);
   }
 
-  // Visits every observed cell (log-odds != 0) with its centre, state and probability.
+  // Visits every observed cell with its centre, legacy state, probability and
+  // kind ('occupied' | 'suspect' | 'free' | 'unknown').
   forEachCell(fn) {
     for (let k = 0; k < this.L.length; k++) {
       if (this.L[k] === 0) continue;
       const c = this.centre(k);
-      fn(c.x, c.y, this.stateOf(k), this.prob(k));
+      fn(c.x, c.y, this.stateOf(k), this.prob(k), this.kindOf(k));
     }
   }
 
@@ -273,13 +479,14 @@ export class GridMap {
   }
 
   stats() {
-    let free = 0, occupied = 0;
+    let free = 0, occupied = 0, suspect = 0;
     for (let k = 0; k < this.L.length; k++) {
       if (this.L[k] < -L_THRESH) free++;
       else if (this.L[k] > L_THRESH) occupied++;
+      else if (this.L[k] > L_SUSPECT) suspect++;
     }
     const a = (this.cellCm * this.cellCm) / 1e4;
-    return { free, occupied, freeM2: free * a, knownM2: (free + occupied) * a };
+    return { free, occupied, suspect, freeM2: free * a, knownM2: (free + occupied) * a };
   }
 
   // Compact text for the LLM. Directions are relative to the robot heading.
@@ -309,17 +516,35 @@ export class GridMap {
       + `Nearest obstacles (cm, relative to heading): ${obs.join(', ') || 'none within 3 m'}. ${frText}.`;
   }
 
-  // Sparse persistence: only observed cells.
+  // Sparse persistence of the evidence: [k, H, M, S + 65536 * near, ...] for
+  // observed cells. Version 1 (log-odds only) is still read.
   toJSON() {
     const cells = [];
-    for (let k = 0; k < this.L.length; k++) if (this.L[k] !== 0) cells.push(k, Math.round(this.L[k] * 100) / 100);
-    return { v: 1, cellCm: this.cellCm, sizeCm: this.sizeCm, cells };
+    const r = (v) => Math.round(v * 100) / 100;
+    for (let k = 0; k < this.L.length; k++) {
+      if (this.H[k] + this.M[k] === 0) continue;
+      cells.push(k, r(this.H[k]), r(this.M[k]), this.S[k] + 65536 * this.near[k]);
+    }
+    return { v: 2, cellCm: this.cellCm, sizeCm: this.sizeCm, scans: this.scans, cells };
   }
 
   static fromJSON(o) {
     const m = new GridMap({ cellCm: o?.cellCm ?? 5, sizeCm: o?.sizeCm ?? 800 });
     const c = o?.cells ?? [];
-    for (let q = 0; q + 1 < c.length; q += 2) if (c[q] >= 0 && c[q] < m.L.length) m.L[c[q]] = c[q + 1];
+    if (o?.v === 2) {
+      m.scans = Number(o.scans) || 0;
+      for (let q = 0; q + 3 < c.length; q += 4) {
+        const k = c[q];
+        if (!(k >= 0 && k < m.L.length)) continue;
+        m.H[k] = Math.max(0, Number(c[q + 1]) || 0);
+        m.M[k] = Math.max(0, Number(c[q + 2]) || 0);
+        m.S[k] = (c[q + 3] % 65536) || 0;
+        m.near[k] = c[q + 3] >= 65536 ? 1 : 0;
+        m.update(k);
+      }
+    } else {
+      for (let q = 0; q + 1 < c.length; q += 2) if (c[q] >= 0 && c[q] < m.L.length) m.L[c[q]] = c[q + 1];
+    }
     m.touch();
     return m;
   }

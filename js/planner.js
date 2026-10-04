@@ -1,10 +1,12 @@
 // Path planning on a GridMap: A* (8-connected, octile heuristic) on cells,
 // line-of-sight simplification and conversion to turn + straight moves.
 //
-// Costs: cells within inflateCm of an occupied cell are blocked; cells near
-// it (up to CLEAR_CM further) and cells near weak hit evidence cost extra,
-// so paths keep their distance where there is room and still fit through
-// narrow gaps. Unknown cells cost UNKNOWN_COST times a free one.
+// Costs: cells within inflateCm of a confirmed obstacle are blocked; cells
+// near it (up to CLEAR_CM further) cost extra, so paths keep their distance
+// where there is room and still fit through narrow gaps. Suspect cells (hit
+// evidence that is not confirmed yet) and their inflation zone cost a lot,
+// rising toward the cell, so they are crossed only as a last resort. Unknown
+// cells cost UNKNOWN_COST times a free one.
 
 import { L_SUSPECT } from './gridmap.js';
 
@@ -14,7 +16,8 @@ const ESCAPE_COST = 5;    // inflated cells next to the start (robot already sit
 const SNAP_CM = 30;       // a blocked goal moves to the nearest traversable cell within this
 const CLEAR_CM = 15;      // soft margin beyond the inflation
 const CLEAR_COST = 2;     // extra cost at the inflation edge, falling to 0 over CLEAR_CM
-const SUSPECT_COST = 4;   // extra cost within inflateCm of weak hit evidence
+const SUSPECT_COST = 4;   // extra cost within inflateCm of a suspect cell ...
+const SUSPECT_CORE_COST = 20; // ... plus up to this much more toward the cell itself
 
 // The real mBot2 is about 18 cm wide with its wheels. Inflation is measured
 // between cell centres, so an obstacle surface can sit up to half a cell
@@ -68,9 +71,9 @@ function cellCost(map, k, { inflateCm, allowUnknown }, start) {
   if (s === 'occupied') return Infinity;
   if (s === 'unknown' && !allowUnknown) return Infinity;
   let cost = s === 'unknown' ? UNKNOWN_COST : 1;
-  const d = map.distanceField()[k];
-  if (d < inflateCm + CLEAR_CM) cost += CLEAR_COST * Math.min(1, (inflateCm + CLEAR_CM - d) / CLEAR_CM);
-  if (map.distanceField(L_SUSPECT)[k] <= inflateCm) cost += SUSPECT_COST;
+  const d = map.distanceField()[k], ds = map.distanceField(L_SUSPECT)[k];
+  if (ds < inflateCm + CLEAR_CM) cost += CLEAR_COST * Math.min(1, (inflateCm + CLEAR_CM - ds) / CLEAR_CM);
+  if (ds <= inflateCm && d > inflateCm) cost += SUSPECT_COST + SUSPECT_CORE_COST * (1 - ds / Math.max(1, inflateCm));
   if (!map.inflated(inflateCm)[k]) return cost;
   if (start) {
     const c = map.centre(k);
@@ -165,36 +168,34 @@ export function lineOfSight(map, a, b, { inflateCm = DEFAULT_INFLATE_CM, allowUn
   return true;
 }
 
-// Lowest clearance (cm to the nearest occupied cell) along the segment a-b.
-function segmentClearance(map, a, b) {
-  const df = map.distanceField();
-  const d = Math.hypot(b.x - a.x, b.y - a.y);
-  const steps = Math.max(1, Math.ceil(d / (map.cellCm / 2)));
-  let min = Infinity;
-  for (let s = 0; s <= steps; s++) {
-    const k = map.index(a.x + ((b.x - a.x) * s) / steps, a.y + ((b.y - a.y) * s) / steps);
-    min = Math.min(min, k < 0 ? 0 : df[k]);
-  }
-  return min;
-}
-
 // Greedy line-of-sight pruning: from each kept point jump to the farthest
-// visible one whose shortcut keeps the clearance the planned path had (up to
-// the soft margin), so simplification never cuts closer past an obstacle.
+// visible one whose shortcut keeps its distance from obstacles (confirmed or
+// suspect): every point of the shortcut must be as clear as the planned path
+// near the matching position (up to the soft margin), so simplification never
+// cuts closer past an obstacle than A* went.
 export function simplifyPath(path, map, opts = {}) {
   if (!path || path.length <= 2) return path ? [...path] : path;
   const want = (opts.inflateCm ?? DEFAULT_INFLATE_CM) + CLEAR_CM;
-  const clear = path.map((p, i) => (i ? segmentClearance(map, path[i - 1], p) : Infinity));
+  const df = map.distanceField(L_SUSPECT);
+  const at = (x, y) => { const k = map.index(x, y); return k < 0 ? 0 : df[k]; };
+  const clear = path.map((p) => at(p.x, p.y));
+  const W = 3;  // path points either side of the matching position
+  const keeps = (ia, ib) => {
+    const A = path[ia], B = path[ib];
+    const L = Math.hypot(B.x - A.x, B.y - A.y), steps = Math.max(1, Math.ceil(L / (map.cellCm / 2)));
+    for (let s = 0; s <= steps; s++) {
+      const j = Math.round(ia + ((ib - ia) * s) / steps);
+      let need = want;
+      for (let i = Math.max(ia, j - W); i <= Math.min(ib, j + W); i++) need = Math.min(need, clear[i]);
+      if (at(A.x + ((B.x - A.x) * s) / steps, A.y + ((B.y - A.y) * s) / steps) < need - map.cellCm / 2) return false;
+    }
+    return true;
+  };
   const out = [path[0]];
   let a = 0;
   while (a < path.length - 1) {
     let b = path.length - 1;
-    for (; b > a + 1; b--) {
-      if (!lineOfSight(map, path[a], path[b], opts, path[0])) continue;
-      let pathMin = Infinity;
-      for (let i = a + 1; i <= b; i++) pathMin = Math.min(pathMin, clear[i]);
-      if (segmentClearance(map, path[a], path[b]) >= Math.min(pathMin, want) - map.cellCm / 2) break;
-    }
+    while (b > a + 1 && !(lineOfSight(map, path[a], path[b], opts, path[0]) && keeps(a, b))) b--;
     out.push(path[b]);
     a = b;
   }

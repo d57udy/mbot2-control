@@ -152,7 +152,10 @@ test('readings at or beyond the ultrasonic range draw no wall', async () => {
   map.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 191 }], { maxRangeCm: 150, beamDeg: 16 });
   assert.equal(map.cell(0, 6 + 191), 'unknown', 'no obstacle at the far reading');
   assert.equal(map.cell(0, 100), 'free', 'free space up to the range');
+  // one echo makes a suspect obstacle; a second scan confirms it (evidence model v2)
   const fresh = new GridMap({ cellCm: 5, sizeCm: 800 });
   fresh.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 90 }], { maxRangeCm: 150, beamDeg: 16 });
-  assert.equal(fresh.cell(0, 6 + 90), 'occupied', 'a real echo inside the range is an obstacle');
+  assert.equal(fresh.kind(0, 6 + 90), 'suspect', 'one echo is not yet confirmed');
+  fresh.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 90 }], { maxRangeCm: 150, beamDeg: 16 });
+  assert.equal(fresh.kind(0, 6 + 90), 'occupied', 'a second scan confirms it');
 });

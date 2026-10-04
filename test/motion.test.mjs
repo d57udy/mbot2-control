@@ -329,3 +329,49 @@ test('turnInPlace stops on a stall (wheels blocked)', async () => {
   assert.equal(r.reason, 'stall');
   assert.equal(rpm, 0);
 });
+
+test('driveLeg learns the stop distance: legs stop overshooting (field: +3 to 4 cm per leg)', async () => {
+  const stub = () => {};
+  const sim = new SimRobot({ log: stub, onStatus: stub, timeScale: 10, stopCoastCm: 3.5, latencyMs: 150 });
+  const bus = { submit: async (c) => { if (c.cmd === 'drive') await sim.drive(c.args.left, c.args.right); else if (c.cmd === 'stop') await sim.stop(); return { ok: true }; } };
+  await sim.connect();
+  try {
+    const sample = makeSimSampler(sim);
+    const coast = { cm: 0 };
+    const errs = [];
+    for (let i = 0; i < 4; i++) {
+      sim.state.y = 190; sim.state.x = 150; sim.state.heading = -90; // fresh run-up along the room
+      const r = await driveLeg(bus, { cm: 35, sample, coast });
+      await sample.clock.sleep(400);
+      sim.tick();
+      assert.equal(r.reason, 'done');
+      errs.push(190 - sim.state.y - 35);
+    }
+    assert.ok(errs[0] > 2, `first leg overshoots ${errs[0].toFixed(1)}`);
+    assert.ok(Math.abs(errs[3]) < 1.5, `after learning ${errs.map((e) => e.toFixed(1))}`);
+    assert.ok(coast.cm > 2 && coast.cm < 6, `coast ${coast.cm}`);
+  } finally {
+    await sim.disconnect();
+  }
+});
+
+test('turnInPlace: large turns across +-180 with a slow link (field: -168 achieved -150)', async () => {
+  const stub = () => {};
+  // 250 ms: the slowest full poll measured on hardware (the turn uses the light ~120 ms one)
+  const sim = new SimRobot({ log: stub, onStatus: stub, timeScale: 10, yawInteger: true, latencyMs: 250 });
+  sim.state.heading = sim.startHeading + 168; // yaw reads 168, the turn crosses the wrap
+  const bus = { submit: async (c) => { if (c.cmd === 'drive') await sim.drive(c.args.left, c.args.right); else if (c.cmd === 'stop') await sim.stop(); return { ok: true }; } };
+  await sim.connect();
+  try {
+    const sample = makeSimSampler(sim);
+    for (const deg of [-168, 168, -175]) {
+      const h0 = sim.state.heading;
+      const r = await turnInPlace(bus, { deg, sample });
+      const truth = sim.state.heading - h0;
+      assert.equal(r.reason, 'done', `${deg}: ${r.reason} ${r.detail}`);
+      assert.ok(Math.abs(truth - deg) <= 3, `${deg}: turned ${truth.toFixed(1)}`);
+    }
+  } finally {
+    await sim.disconnect();
+  }
+});

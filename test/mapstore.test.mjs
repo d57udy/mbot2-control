@@ -47,7 +47,8 @@ test('save, list, load and delete with a fake localStorage', () => {
   const map = scannedMap();
   const r = saveMap('Wohnzimmer', map, { pose: { x: 40, y: 20, heading: 90 } }, { storage });
   assert.equal(r.ok, true);
-  assert.ok(r.bytes < 20000, `compact: ${r.bytes} bytes`);
+  // includes the per-cell hit/miss evidence since GridMap v2 (about 30 kB for a scanned room)
+  assert.ok(r.bytes < 60000, `compact: ${r.bytes} bytes`);
   storage.setItem('mbot.speed', '60'); // other keys are ignored
   storage.setItem(PREFIX + 'kaputt', '{nope');
   saveMap('Küche', new GridMap({ cellCm: 5, sizeCm: 800 }), {}, { storage });
@@ -116,4 +117,18 @@ test('import rejects malformed and other-version input with a clear error', asyn
   await assert.rejects(importMap(JSON.stringify({ ...good, cellCm: -1 })), /beschädigt/);
   await assert.rejects(importMap(JSON.stringify({ ...good, grid: good.grid.slice(0, 40) })), /beschädigt/);
   await assert.rejects(importMap(null), /Keine Kartendatei/);
+});
+
+test('saved maps keep hit/miss evidence (GridMap v2)', async () => {
+  const { GridMap } = await import('../js/gridmap.js');
+  const { serializeMap, parseMap } = await import('../js/mapstore.js');
+  const m = new GridMap({ cellCm: 5, sizeCm: 800 });
+  m.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 90 }], { maxRangeCm: 150, beamDeg: 25 });
+  m.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 90 }], { maxRangeCm: 150, beamDeg: 25 });
+  const a = m.cellInfo(0, 96);
+  const { map } = parseMap(JSON.stringify(serializeMap(m)));
+  const b = map.cellInfo(0, 96);
+  assert.equal(b.state, a.state);
+  assert.equal(b.scans, a.scans);
+  assert.ok(Math.abs(b.hits - a.hits) < 0.05);
 });
