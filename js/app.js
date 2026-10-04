@@ -28,7 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.5.4';
+export const APP_VERSION = '0.5.5';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -755,6 +755,29 @@ async function doScan(signal) {
   return result;
 }
 
+// One readable log line per navigator event, with the numbers needed to
+// diagnose real-robot runs (pose, leg results, corrections, crash reasons).
+const r0 = (v) => (Number.isFinite(v) ? Math.round(v) : '?');
+const poseText = (p) => (p ? `(${r0(p.x)}, ${r0(p.y)}, ${r0(p.heading)}°)` : '');
+function navEventText(e) {
+  switch (e.type) {
+    case 'plan': return `Nav Plan: ${e.path?.length ?? '?'} Punkte zum Ziel ${poseText(e.goal)}`;
+    case 'leg': return `Nav Etappe: Drehung ${r0(e.turnDeg)}°, geplant ${r0(e.cm)} cm${e.droveCm != null ? `, gefahren ${r0(e.droveCm)} cm` : ''}${e.reason ? `, Ende: ${e.reason}` : ''} ${poseText(e.pose)}`;
+    case 'turn': return `Nav Drehung: Ziel ${r0(e.target)}°, erreicht ${r0(e.achieved)}°${e.reason ? ` (${e.reason})` : ''}`;
+    case 'scan': return `Nav Scan${e.reason ? ` (${e.reason})` : ''}${e.method ? `, ${e.method}` : ''} bei ${poseText(e.pose)}`;
+    case 'localized': {
+      const c = e.correction ?? {};
+      return `Nav Korrektur: dx ${r0(c.dx)} cm, dy ${r0(c.dy)} cm, dh ${r0(c.dh)}°, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.applied === false || e.source === 'odom' ? ' (verworfen)' : ''}`;
+    }
+    case 'crash': return `! Nav Zusammenstoß: ${e.reason ?? ''}${e.details ? ` ${JSON.stringify(e.details)}` : ''}`;
+    case 'blocked': return `Nav Hindernis${e.note ? `: ${e.note}` : ''}, neuer Plan`;
+    case 'replan': return `Nav neuer Plan${e.note ? `: ${e.note}` : ''}`;
+    case 'arrived': return `Nav angekommen ${poseText(e.pose)}`;
+    case 'error': return `! Nav: ${e.note ?? e.message ?? ''}`;
+    default: return `Nav ${e.type}${e.note ? `: ${e.note}` : ''}`;
+  }
+}
+
 // --- map and navigation --------------------------------------------------------
 
 const map = new GridMap({ cellCm: 5, sizeCm: 800 });
@@ -768,10 +791,7 @@ const nav = new Navigator({
   useYaw: true, // gyro yaw confirmed clockwise positive on 44.01.013
   onEvent: (e) => {
     if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
-    if (e.type === 'leg') log(`Navigation: ${e.turnDeg ?? 0}° drehen, ${e.cm ?? '?'} cm fahren`);
-    if (e.type === 'blocked') log(`Navigation: Hindernis${e.note ? ` (${e.note})` : ''}, neuer Plan`);
-    if (e.type === 'arrived') log('Navigation: angekommen');
-    if (e.type === 'error') log(`! Navigation: ${e.note ?? e.message ?? ''}`);
+    log(navEventText(e));
     redrawMap();
     redrawSim();
   },
@@ -803,6 +823,7 @@ function redrawMap() {
   if (!canvas || !$('panel-scan').open) return;
   const pose = tracker.pose;
   mapView = mapControls.viewFor(pose);
+  $('opt-heading-up').checked = mapControls.headingUp; // a manual rotation ends heading-up
   drawMap(canvas, map, pose, {
     view: mapView,
     trail: tracker.trail,
@@ -852,7 +873,8 @@ const mapControls = attachMapControls($('map'), {
   getView: () => mapView,
   setView: (v) => { mapView = v; },
   onChange: scheduleMapDraw,
-  fit: () => fitView($('map'), map, tracker.pose),
+  fit: (rot) => fitView($('map'), map, tracker.pose, { rot }),
+  onCompass: () => { $('opt-heading-up').checked = false; scheduleMapDraw(); },
   onTap: (x, y) => {
     if (!mapView) return;
     const goal = screenToWorld($('map'), mapView, x, y);
@@ -864,6 +886,9 @@ const mapControls = attachMapControls($('map'), {
 });
 $('btn-map-fit').onclick = () => { mapControls.fit(); scheduleMapDraw(); };
 $('opt-follow').onchange = (e) => { mapControls.setFollow(e.target.checked); scheduleMapDraw(); };
+$('btn-map-rotl').onclick = () => { mapControls.rotateBy(-15); $('opt-heading-up').checked = false; scheduleMapDraw(); };
+$('btn-map-rotr').onclick = () => { mapControls.rotateBy(15); $('opt-heading-up').checked = false; scheduleMapDraw(); };
+$('opt-heading-up').onchange = (e) => { mapControls.setHeadingUp(e.target.checked); scheduleMapDraw(); };
 
 // --- map storage -----------------------------------------------------------
 

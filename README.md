@@ -20,7 +20,7 @@ Status: v0.5 (continuous scans, crash detection, scan matching, saved maps, inst
 
 **Simulator** runs everything without a robot.
 
-**Map controls**: drag to pan, pinch or mouse wheel to zoom, tap to set a goal. Maps can be saved on the device, exported as a JSON file and imported again.
+**Map controls**: drag to pan, pinch or mouse wheel to zoom, tap to set a goal. Rotate the map to match the room: twist with two fingers, right-drag or Shift+drag with the mouse, Shift+wheel (5° steps), or the ⟲ ⟳ buttons. "Roboter-Richtung oben" keeps the robot's heading pointing up; tapping the compass arrow (top right, points to "forward from the start") resets the rotation. Maps can be saved on the device, exported as a JSON file and imported again.
 
 ## Install on Android
 
@@ -44,7 +44,7 @@ Updates arrive when the app is opened online after a new version is published.
 | `js/voice.js` | Speech recognition wrapper and command parser |
 | `js/scan.js`, `js/radar.js` | Environment scan, open-direction finder, radar plot |
 | `js/pose.js`, `js/gridmap.js`, `js/planner.js`, `js/navigate.js`, `js/mapview.js` | Position tracking, occupancy map, A* route planning, navigator (go to, explore, go home), map drawing |
-| `js/mapcontrols.js` | Map zoom, pan, pinch, tap, fit and follow |
+| `js/mapcontrols.js` | Map zoom, pan, rotation, pinch and twist, tap, fit, follow and heading-up |
 | `js/mapstore.js` | Save, load, export and import maps (localStorage, JSON) |
 | `manifest.webmanifest`, `sw.js`, `icons/` | Installable app (PWA): manifest, offline cache, icons |
 | `js/tools.js`, `js/agent.js`, `js/tts.js` | LLM tool definitions and executor, Claude tool-use loop, speech output |
