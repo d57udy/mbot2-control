@@ -28,7 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.6.1';
+export const APP_VERSION = '0.6.2';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -138,14 +138,37 @@ $('btn-disconnect').onclick = async () => {
   if (robot?.kind === 'sim') $('sim').hidden = true;
 };
 
+// Robot calibration: one place for every direction setting, saved per device.
+const CAL_KEYS = { 'opt-mirrored': 'cal.mirrored', 'opt-swap': 'cal.swap', 'opt-turnrev': 'cal.turnrev', 'opt-yawrev': 'cal.yawrev' };
+for (const [id, key] of Object.entries(CAL_KEYS)) {
+  const saved = store.get(key, null);
+  if (saved !== null) $(id).checked = saved === '1';
+}
 function applyWheelSettings() {
+  for (const [id, key] of Object.entries(CAL_KEYS)) store.set(key, $(id).checked ? '1' : '0');
   if (robot?.wheels) {
     robot.wheels.mirrored = $('opt-mirrored').checked;
     robot.wheels.swap = $('opt-swap').checked;
+    robot.wheels.turnSign = $('opt-turnrev').checked ? -1 : 1;
+    robot.wheels.yawSign = $('opt-yawrev').checked ? -1 : 1;
   }
 }
-$('opt-mirrored').onchange = applyWheelSettings;
-$('opt-swap').onchange = applyWheelSettings;
+for (const id of Object.keys(CAL_KEYS)) $(id).onchange = applyWheelSettings;
+
+$('btn-calibrate').onclick = async () => {
+  showLog();
+  if (!robot?.connected || !robot.calibrate) { log('! Kalibrierung: erst mit dem echten Roboter verbinden'); return; }
+  $('btn-calibrate').disabled = true;
+  try {
+    const r = await robot.calibrate((line) => log(line));
+    if (r) {
+      $('opt-mirrored').checked = r.mirrored;
+      $('opt-swap').checked = r.swap;
+      $('opt-turnrev').checked = r.turnSign === -1;
+      applyWheelSettings();
+    }
+  } finally { $('btn-calibrate').disabled = false; }
+};
 $('opt-guard').onchange = () => { bus.guard = $('opt-guard').checked; };
 
 // --- sensors -----------------------------------------------------------

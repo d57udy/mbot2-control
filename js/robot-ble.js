@@ -107,7 +107,9 @@ export class BleRobot {
     this.eyeModeLogged = null;
     this.effectMs = {}; // measured effect durations, name -> ms
     // Wheel mapping: the motors are mirrored, so forward is EM1 +, EM2 -.
-    this.wheels = { swap: false, mirrored: true };
+    // Robot calibration (settings "Roboter-Kalibrierung"): motor mounting,
+    // connector swap, the firmware's mbot2.turn sign and the gyro sign.
+    this.wheels = { swap: false, mirrored: true, turnSign: FIRMWARE_TURN_SIGN, yawSign: 1 };
   }
 
   // --- connection -------------------------------------------------------
@@ -230,6 +232,57 @@ export class BleRobot {
 
   // Checks the sign and accuracy of the firmware's blocking mbot2.turn():
   // a +90 command should raise get_yaw() (clockwise positive) by about 90.
+  // Detects motor mounting, connector swap and the mbot2.turn sign, using the
+  // gyro (clockwise positive after yawSign) as the reference. Spins in place;
+  // with unmirrored motors the first step drives a few cm forward.
+  async calibrate(report) {
+    const ys = this.wheels.yawSign ?? 1;
+    const yaw = async () => Number(await this.query('cyberpi.get_yaw()', 2000)) * ys;
+    const dyaw = (a, b) => ((b - a + 540) % 360) - 180;
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+    const out = { ...this.wheels };
+    report('Kalibrierung: Roboter dreht sich kurz auf der Stelle (etwas Platz lassen)');
+    try {
+      // 1. same RPM on both motors: mirrored motors spin the robot, unmirrored drive straight
+      let y0 = await yaw();
+      await this.run('mbot2.drive_speed(25,25)');
+      await pause(700);
+      await this.stop();
+      await pause(400);
+      let d = dyaw(y0, await yaw());
+      out.mirrored = Math.abs(d) > 15;
+      report(`1. drive_speed(25,25): Drehung ${d}° → Motoren ${out.mirrored ? 'gespiegelt' : 'nicht gespiegelt'}`);
+      // 2. clockwise spin through the mapping: if the robot turns counterclockwise, left/right are swapped
+      this.wheels = { ...this.wheels, mirrored: out.mirrored, swap: false };
+      y0 = await yaw();
+      await this.drive(25, -25);
+      await pause(700);
+      await this.stop();
+      await pause(400);
+      d = dyaw(y0, await yaw());
+      out.swap = d < -15;
+      report(`2. Rechtsdrehung über die Zuordnung: ${d}° → Räder ${out.swap ? 'getauscht' : 'nicht getauscht'}`);
+      // 3. firmware turn: raw mbot2.turn(45) should turn clockwise
+      y0 = await yaw();
+      await this.query('mbot2.turn(45)', 6000);
+      await pause(300);
+      d = dyaw(y0, await yaw());
+      out.turnSign = d >= 0 ? 1 : -1;
+      report(`3. mbot2.turn(45): ${d}° → eingebaute Drehung ${out.turnSign === 1 ? 'normal' : 'umgekehrt'}`);
+      await this.query(`mbot2.turn(${-45 * out.turnSign})`, 6000); // back
+      if (Math.abs(d) < 20) report('! Drehung zu klein gemessen; Ergebnis bitte prüfen (Akku? Untergrund?)');
+    } catch (e) {
+      report(`! Kalibrierung abgebrochen: ${e.message.split(':')[0]}`);
+      await this.stop().catch(() => {});
+      return null;
+    } finally {
+      await this.stop().catch(() => {});
+    }
+    this.wheels = out;
+    report(`Kalibrierung fertig: gespiegelt ${out.mirrored}, getauscht ${out.swap}, Drehung ${out.turnSign === 1 ? 'normal' : 'umgekehrt'}, Gyro ${ys === 1 ? 'normal' : 'umgekehrt'}`);
+    return out;
+  }
+
   async turnTest(report) {
     const yaw = async () => Number(await this.query('cyberpi.get_yaw()', 2000));
     report('Dreh-Test: mbot2.turn(90), dann mbot2.turn(-90) (Roboter dreht sich auf der Stelle)');
@@ -418,7 +471,7 @@ export class BleRobot {
   // Dreh-Test 2026-10-04), opposite to the documentation; FIRMWARE_TURN_SIGN
   // keeps "+ = clockwise/right" for every caller.
   turn(deg, { wait = false, speed = 50 } = {}) {
-    const s = `mbot2.turn(${FIRMWARE_TURN_SIGN * deg},${speed})`;
+    const s = `mbot2.turn(${(this.wheels.turnSign ?? FIRMWARE_TURN_SIGN) * deg},${speed})`;
     return wait ? this.query(s, 2000 + Math.abs(deg) * 30 * (50 / speed)) : this.run(s);
   }
 
@@ -452,7 +505,7 @@ export class BleRobot {
   battery() { return this.query('cyberpi.get_battery()'); }
 
   // Gyro heading in degrees from the CyberPi IMU (sign and range UNVERIFIED on hardware).
-  yaw() { return this.query('cyberpi.get_yaw()'); }
+  async yaw() { return Number(await this.query('cyberpi.get_yaw()')) * (this.wheels.yawSign ?? 1); }
 
   distance() { return this.query('cyberpi.ultrasonic2.get(1)'); }
 

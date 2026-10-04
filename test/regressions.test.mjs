@@ -118,3 +118,26 @@ test('BLE turn compensates the firmware turn sign (+90 = clockwise)', async () =
   assert.equal(FIRMWARE_TURN_SIGN, -1);
   assert.deepEqual(sent, ['mbot2.turn(-90,40)', 'mbot2.turn(45,40)']);
 });
+
+test('calibration: joystick wheel mapping, turn sign and gyro sign', async () => {
+  const { parseSample } = await import('../js/motion.js');
+  const sent = [];
+  const r = new BleRobot({ log: stub, onStatus: stub });
+  r.run = async (s) => sent.push(s);
+  r.query = async (s) => { sent.push(s); return 90; };
+  // default (standard mBot2, firmware 44.01.013): joystick forward = EM1 +, EM2 -
+  await r.drive(40, 40);
+  await r.drive(30, -30);
+  await r.turn(90);
+  assert.deepEqual(sent.splice(0), ['mbot2.drive_speed(40,-40)', 'mbot2.drive_speed(30,30)', 'mbot2.turn(-90,50)']);
+  // connectors swapped, firmware turn normal, gyro reversed
+  Object.assign(r.wheels, { swap: true, turnSign: 1, yawSign: -1 });
+  await r.drive(40, 20);
+  await r.turn(90);
+  assert.equal(await r.yaw(), -90);
+  assert.deepEqual(sent.splice(0, 2), ['mbot2.drive_speed(20,-40)', 'mbot2.turn(90,50)']);
+  // encoders and yaw in samples follow the same calibration
+  const keys = ['encL', 'encR', 'yaw'];
+  assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true }), { distanceCm: undefined, encL: 100, encR: 100, yaw: 10, shake: undefined });
+  assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true, swap: true, yawSign: -1 }), { distanceCm: undefined, encL: -100, encR: -100, yaw: -10, shake: undefined });
+});

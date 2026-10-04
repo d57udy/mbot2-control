@@ -213,8 +213,13 @@
       </label>
       <label><input id="opt-helpers" type="checkbox"> Roboter-Helfer installieren (experimentell, startet den Roboter auf Firmware 44.01.013 neu)</label>
       <label><input id="opt-guard" type="checkbox" checked> Hindernis-Bremse (bremst ab 40 cm, Stopp bei 15 cm)</label>
+      <h3>Roboter-Kalibrierung</h3>
+      <p class="muted small">Gilt für Joystick, Tasten, Scans, Navigation und KI. Wird auf diesem Gerät gespeichert.</p>
       <label><input id="opt-mirrored" type="checkbox" checked> Motoren gespiegelt (Standard mBot2)</label>
-      <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen</label>
+      <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen (Motorstecker vertauscht)</label>
+      <label><input id="opt-turnrev" type="checkbox" checked> Eingebaute Drehung umgekehrt (mbot2.turn, Firmware 44.01.013)</label>
+      <label><input id="opt-yawrev" type="checkbox"> Gyro umgekehrt (nur bei anderer Firmware)</label>
+      <button id="btn-calibrate">Automatisch erkennen (Roboter dreht kurz)</button>
       <h3>KI (Gespräch)</h3>
       <label>API-Schlüssel <input id="ai-key" type="password" autocomplete="off" placeholder="sk-ant-…"></label>
       <label><input id="ai-remember" type="checkbox"> Schlüssel auf diesem Gerät merken</label>

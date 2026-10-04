@@ -89,13 +89,13 @@ export function buildSampleExpr(sensors) {
 }
 
 // Turns a reply list into a sample; mirrored/swap match robot.wheels.
-export function parseSample(keys, values, { mirrored = true, swap = false } = {}) {
+export function parseSample(keys, values, { mirrored = true, swap = false, yawSign = 1 } = {}) {
   const v = {};
   keys.forEach((k, i) => { v[k] = num(values?.[i]); });
   let encL = v.encL, encR = v.encR;
   if (swap) [encL, encR] = [encR, encL];
   if (mirrored && encR != null) encR = -encR;
-  const s = { distanceCm: v.distance, encL, encR, yaw: v.yaw, shake: v.shake };
+  const s = { distanceCm: v.distance, encL, encR, yaw: v.yaw != null ? v.yaw * yawSign : undefined, shake: v.shake };
   if (v.ax != null || v.ay != null || v.az != null) s.acc = { x: v.ax ?? 0, y: v.ay ?? 0, z: v.az ?? 0 };
   return s;
 }
@@ -118,7 +118,8 @@ export function makeBleSampler(robot, sensors = BLE_SENSORS, { fallback = BLE_SE
       values = await robot.query(cur.expr, timeoutMs);
     }
     if (!Array.isArray(values)) throw new Error(`unexpected sample reply ${values}`);
-    return { t: performance.now(), ...parseSample(cur.keys, values, sensors) };
+    // encoder and gyro mapping follow the robot calibration (settings)
+    return { t: performance.now(), ...parseSample(cur.keys, values, robot.wheels ?? {}) };
   };
   return sample;
 }
