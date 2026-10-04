@@ -141,3 +141,15 @@ test('calibration: joystick wheel mapping, turn sign and gyro sign', async () =>
   assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true }), { distanceCm: undefined, encL: 100, encR: 100, yaw: 10, shake: undefined });
   assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true, swap: true, yawSign: -1 }), { distanceCm: undefined, encL: -100, encR: -100, yaw: -10, shake: undefined });
 });
+
+test('readings at or beyond the ultrasonic range draw no wall', async () => {
+  const { GridMap } = await import('../js/gridmap.js');
+  const map = new GridMap({ cellCm: 5, sizeCm: 800 });
+  // the real sensor reports ~190 cm when it sees nothing
+  map.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 191 }], { maxRangeCm: 150, beamDeg: 16 });
+  assert.equal(map.cell(0, 6 + 191), 'unknown', 'no obstacle at the far reading');
+  assert.equal(map.cell(0, 100), 'free', 'free space up to the range');
+  const fresh = new GridMap({ cellCm: 5, sizeCm: 800 });
+  fresh.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 90 }], { maxRangeCm: 150, beamDeg: 16 });
+  assert.equal(fresh.cell(0, 6 + 90), 'occupied', 'a real echo inside the range is an obstacle');
+});

@@ -219,6 +219,10 @@
       <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen (Motorstecker vertauscht)</label>
       <label><input id="opt-turnrev" type="checkbox" checked> Eingebaute Drehung umgekehrt (mbot2.turn, Firmware 44.01.013)</label>
       <label><input id="opt-yawrev" type="checkbox"> Gyro umgekehrt (nur bei anderer Firmware)</label>
+      <label>Ultraschall-Reichweite (cm)
+        <input id="opt-maxrange" type="number" min="60" max="300" step="10" value="150" inputmode="numeric">
+      </label>
+      <p class="muted small">Messungen ab dieser Entfernung gelten als „nichts erkannt“: der Sensor meldet dann etwa 180 bis 200 cm, obwohl dort nichts ist. Kein Hindernis wird eingetragen.</p>
       <button id="btn-calibrate">Automatisch erkennen (Roboter dreht kurz)</button>
       <h3>KI (Gespräch)</h3>
       <label>API-Schlüssel <input id="ai-key" type="password" autocomplete="off" placeholder="sk-ant-…"></label>

@@ -28,7 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.6.3';
+export const APP_VERSION = '0.6.4';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -154,6 +154,20 @@ function applyWheelSettings() {
   }
 }
 for (const id of Object.keys(CAL_KEYS)) $(id).onchange = applyWheelSettings;
+
+// Ultrasonic range: readings at or beyond it mean "nothing detected" (the
+// sensor reports about 180 to 200 cm then, 2026-10-04 field test), so the map
+// marks free space up to it and no obstacle.
+function maxRange() {
+  const v = Number($('opt-maxrange').value);
+  return Number.isFinite(v) ? Math.min(300, Math.max(60, v)) : 150;
+}
+$('opt-maxrange').value = store.get('cal.maxrange', '150');
+$('opt-maxrange').onchange = () => {
+  $('opt-maxrange').value = maxRange();
+  store.set('cal.maxrange', String(maxRange()));
+  nav.maxRangeCm = maxRange();
+};
 
 $('btn-calibrate').onclick = async () => {
   showLog();
@@ -753,7 +767,7 @@ async function relocateOnMap(signal) {
   } else {
     points = (await scan(bus, { steps: nav.steps, signal, makeCommand: mk })).points;
   }
-  const beams = points.filter((p) => p.cm != null && p.cm > 2 && p.cm < 300);
+  const beams = points.filter((p) => p.cm != null && p.cm > 2 && p.cm < maxRange());
   const t0 = performance.now();
   const res = beams.length >= 6 ? relocalize(map, resampleSweep(beams, 10)) : null;
   const ms = Math.round(performance.now() - t0);
@@ -763,7 +777,7 @@ async function relocateOnMap(signal) {
     return null;
   }
   tracker.reset(res.pose);
-  map.integrateScan(res.pose, points, { beamDeg: 16, maxRangeCm: 250, freeBeamDeg: 16 });
+  map.integrateScan(res.pose, points, { beamDeg: 16, maxRangeCm: maxRange(), freeBeamDeg: 16 });
   tracker.applyTurn(turned);
   relocalizePending = false;
   mapScan = { pose: res.pose, points };
@@ -818,6 +832,7 @@ let mapScan = null; // { pose, points } of the last scan, drawn on the map
 
 const nav = new Navigator({
   bus, map, pose: tracker, scan,
+  maxRangeCm: maxRange(),
   useYaw: true, // gyro yaw confirmed clockwise positive on 44.01.013
   onEvent: (e) => {
     if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
@@ -898,6 +913,8 @@ function navResult(label, r) {
   redrawSim();
 }
 
+let lastTapAt = 0;
+
 // Zoom (wheel, pinch), pan (drag), tap = drive there. Auto-fit until the user zooms or pans.
 const mapControls = attachMapControls($('map'), {
   getView: () => mapView,
@@ -907,6 +924,9 @@ const mapControls = attachMapControls($('map'), {
   onCompass: () => { $('opt-heading-up').checked = false; scheduleMapDraw(); },
   onTap: (x, y) => {
     if (!mapView) return;
+    const now = performance.now();
+    if (now - lastTapAt < 400) return; // some phones deliver one tap twice
+    lastTapAt = now;
     const goal = screenToWorld($('map'), mapView, x, y);
     goal.x = Math.round(goal.x); goal.y = Math.round(goal.y);
     if (needsLocation()) return;

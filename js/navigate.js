@@ -210,7 +210,7 @@ export class Navigator {
   // Scan matching around the odometry pose (wider when uncertain), fused with
   // odometry. Returns the new pose, or null if nothing was applied.
   relocalize(loc, guess, points) {
-    const beams = (points ?? []).filter((p) => p.cm != null && p.cm > 0 && p.cm < NO_ECHO_CM);
+    const beams = (points ?? []).filter((p) => p.cm != null && p.cm > 0 && p.cm < Math.min(NO_ECHO_CM, this.maxRangeCm));
     if (beams.length < 4) return null;
     try {
       const wide = this.poseUncertain;
