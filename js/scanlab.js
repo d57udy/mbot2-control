@@ -10,7 +10,9 @@ const wrap180 = (d) => ((d + 540) % 360) - 180;
 // Points { angle, cm } from a sample log, assuming the distance value is
 // latencyMs older than the reply that carried it. Angle 0 = heading at the
 // first sample, clockwise positive (the sampler applies the gyro calibration).
-export function pointsFromLog(log, latencyMs = 45, { maxCm = 300 } = {}) {
+// refYaw: express angles relative to this gyro heading instead (to overlay
+// several sweeps in one frame, e.g. the first sweep's start heading).
+export function pointsFromLog(log, latencyMs = 45, { maxCm = 300, refYaw = null } = {}) {
   const track = [];
   let rot = 0, prev = null;
   for (const s of log) {
@@ -20,6 +22,8 @@ export function pointsFromLog(log, latencyMs = 45, { maxCm = 300 } = {}) {
     track.push({ t: s.t, rot });
   }
   if (track.length < 2) return [];
+  const first = log.find((s) => Number.isFinite(s.yaw))?.yaw ?? 0;
+  const offset = refYaw == null ? 0 : wrap180(first - refYaw);
   const rotAt = (t) => {
     if (t <= track[0].t) return track[0].rot;
     for (let i = 1; i < track.length; i++) {
@@ -31,7 +35,7 @@ export function pointsFromLog(log, latencyMs = 45, { maxCm = 300 } = {}) {
   const pts = [];
   for (const s of log) {
     if (!Number.isFinite(s.cm) || s.cm <= 2) continue;
-    pts.push({ angle: norm(rotAt(s.t - latencyMs)), cm: Math.min(s.cm, maxCm) });
+    pts.push({ angle: norm(rotAt(s.t - latencyMs) + offset), cm: Math.min(s.cm, maxCm) });
   }
   return pts;
 }

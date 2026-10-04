@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.6.5';
+export const APP_VERSION = '0.6.6';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -1011,19 +1011,21 @@ let labSuggest = null;
 
 function latency() {
   const v = Number($('opt-latency').value);
-  return Number.isFinite(v) ? Math.min(400, Math.max(-100, v)) : 45;
+  return Number.isFinite(v) ? Math.min(400, Math.max(-100, v)) : 120;
 }
-$('opt-latency').value = store.get('cal.latency', '45');
+$('opt-latency').value = store.get('cal.latency2', '120'); // 120 ms measured 2026-10-04
 SWEEP_DEFAULTS.latencyMs = latency();
 $('opt-latency').onchange = () => {
   SWEEP_DEFAULTS.latencyMs = latency();
-  store.set('cal.latency', String(latency()));
+  store.set('cal.latency2', String(latency()));
   renderLab();
 };
 
 function renderLab() {
   const L = latency(), range = maxRange();
-  const scans = labScans.map((s, i) => ({ ...s, points: pointsFromLog(s.log, L), color: LAB_COLORS[i % LAB_COLORS.length] }));
+  // one frame for all sweeps: 0° = heading at the start of the first sweep
+  const refYaw = labScans[0]?.log.find((x) => Number.isFinite(x.yaw))?.yaw ?? null;
+  const scans = labScans.map((s, i) => ({ ...s, points: pointsFromLog(s.log, L, { refYaw }), color: LAB_COLORS[i % LAB_COLORS.length] }));
   drawOverlay($('lab-plot'), scans, { rangeCm: range });
   const lines = scans.map((s, i) => {
     const post = findPost(s.points, { rangeCm: range });
@@ -1052,6 +1054,7 @@ async function labSweep(dir) {
   await runScanTask(async (signal) => {
     const r = await sweepScan(bus, { sample, makeCommand: bus.stamped(), signal, speedDegS: 45 * dir });
     tracker.applyTurn(r.turnedDeg ?? 0); // sweeps send drive frames, which no pose listener counts
+    if (r.reversed) log('! Der Roboter dreht sich andersherum als befohlen: Einstellungen → Roboter-Kalibrierung → „Automatisch erkennen“ ausführen (wahrscheinlich „Räder tauschen“).');
     labScans.push({ dir, log: r.sampleLog, durationMs: r.durationMs, samples: r.samples });
     if (labScans.length > 4) labScans.shift();
     log(`Scan-Labor: Sweep ${dir > 0 ? '↻' : '↺'} mit ${r.samples} Messungen`);

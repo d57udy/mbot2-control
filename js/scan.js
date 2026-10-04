@@ -268,7 +268,8 @@ export function resampleSweep(points, binDeg = 3) {
 // apart; the wait before each sample always yields to timers, so a sampler
 // that answers at once cannot starve the drive stream.
 // Defaults the app can tune at runtime (Scan-Labor: measured sensor latency).
-export const SWEEP_DEFAULTS = { latencyMs: 45 };
+// latencyMs: measured 2026-10-04 with a bottle and a cw/ccw sweep pair (about 120 ms).
+export const SWEEP_DEFAULTS = { latencyMs: 120 };
 
 export async function sweepScan(bus, {
   sample, makeCommand = defaultMakeCommand, signal, speedDegS = 45, onPoint, maxDurationMs = 20000,
@@ -313,6 +314,7 @@ export async function sweepScan(bus, {
     return rot;
   };
 
+  let reversed = false; // physical spin opposite to the command
   let method = null, sign = null, refSign = dir, n = 0, prevYaw = null, yawRaw = 0, enc0 = null;
   const track = [], pending = [], raw = [];
   let rotation = 0;
@@ -350,7 +352,12 @@ export async function sweepScan(bus, {
     if (method === 'time') r = commandedRotation(t);
     if (r != null) {
       track.push({ t, rot: r });
-      if (sign == null && Math.abs(r) >= signDetectDeg) sign = Math.sign(r) * refSign;
+      // The gyro is calibrated (settings) and is the truth: never flip it. If
+      // the robot spins against the command, report it (wheel mapping wrong).
+      if (sign == null && Math.abs(r) >= signDetectDeg) {
+        sign = 1;
+        if (method === 'yaw' && Math.sign(r) !== refSign) reversed = true;
+      }
       rotation = Math.max(rotation, Math.abs(r));
       remainingDeg = targetDeg - rotation;
     }
@@ -405,6 +412,7 @@ export async function sweepScan(bus, {
     points,
     durationMs: Math.round(now() - t0),
     method: 'sweep',
+    reversed,
     sampleLog,
     latencyMs,
     speedDegS,

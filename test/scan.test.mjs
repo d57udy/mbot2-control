@@ -353,21 +353,21 @@ test('sweepScan: without compensation the same latency shifts the angles', async
   assert.ok(mean > 5, `mean error ${mean}`);
 });
 
-test('sweepScan: detects a reversed gyro sign', async () => {
+test('sweepScan: trusts the calibrated gyro and reports a spin against the command', async () => {
+  // gyro and spin disagree (field test 2026-10-04: swapped wheel mapping); the
+  // angles follow the gyro, never a guessed flip, and the sweep says so
   const w = sweepWorld({ yawSign: -1, yawOffset: -100 });
   const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
-  assert.equal(r.yawSign, -1);
-  assert.ok(r.totalTurnDeg >= 380, `turned ${r.totalTurnDeg}`);
+  assert.equal(r.reversed, true);
+  assert.equal(r.yawSign, 1);
   assert.equal(r.coverageDeg, 360);
-  const err = angleErrors(r.points);
-  assert.ok(Math.max(...err) <= 3, `max error ${Math.max(...err)}`);
 });
 
 test('sweepScan: counterclockwise with negative speed', async () => {
-  const w = sweepWorld({ yawSign: -1 });
+  const w = sweepWorld();
   const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, speedDegS: -45 });
   assert.ok(w.drives.every((d) => d.left < 0 && d.right === -d.left));
-  assert.equal(r.yawSign, -1);
+  assert.equal(r.reversed, false);
   assert.ok(r.totalTurnDeg <= -380, `turned ${r.totalTurnDeg}`);
   assert.ok(r.turnedDeg < 0 && r.turnedDeg > -60, `net ${r.turnedDeg}`);
   const err = angleErrors(r.points);

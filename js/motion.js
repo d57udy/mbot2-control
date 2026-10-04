@@ -44,6 +44,8 @@ export const MOTION = {
   twistDeg: 10,       // yaw change on a straight leg
   wheelDeg: 8,        // encoder-implied heading change on a straight leg
   settleMs: 150,      // wait after a stop before the final reading, so the coast is counted
+  coastGain: 0.7,     // how fast the learned stop distance follows the measured overshoot
+  maxCoastCm: 10,
   backoffCm: 5,
   backoffRpm: 25,
   timeoutFactor: 2.5, // of the nominal leg time
@@ -92,9 +94,11 @@ export function buildSampleExpr(sensors) {
 export function parseSample(keys, values, { mirrored = true, swap = false, yawSign = 1 } = {}) {
   const v = {};
   keys.forEach((k, i) => { v[k] = num(values?.[i]); });
+  // raw: encL = EM1, encR = EM2. EM2 is the mirrored motor, so un-mirror it
+  // first, then map motors to sides (swap: EM1 is the right wheel)
   let encL = v.encL, encR = v.encR;
-  if (swap) [encL, encR] = [encR, encL];
   if (mirrored && encR != null) encR = -encR;
+  if (swap) [encL, encR] = [encR, encL];
   const s = { distanceCm: v.distance, encL, encR, yaw: v.yaw != null ? v.yaw * yawSign : undefined, shake: v.shake };
   if (v.ax != null || v.ay != null || v.az != null) s.acc = { x: v.ax ?? 0, y: v.ay ?? 0, z: v.az ?? 0 };
   return s;
@@ -218,8 +222,11 @@ function abortError(msg = 'leg aborted') {
 // caller checks signal itself.
 export async function driveLeg(bus, {
   cm, speed = 40, makeCommand = defaultMakeCommand, signal, sample, sensors, onSample,
-  stopAtCm = 20, clock, yawSign = 1, cmPerDeg = CM_PER_DEG, opts = {},
+  stopAtCm = 20, clock, yawSign = 1, cmPerDeg = CM_PER_DEG, opts = {}, coast,
 } = {}) {
+  // coast: { cm } learned stop distance, shared across legs by the caller.
+  // The leg aims coast.cm short of the target; after each completed leg the
+  // estimate moves toward the measured overshoot (field: 3 to 4 cm per leg).
   const o = { ...MOTION, ...opts };
   const mk = makeCommand;
   if (!sample && sensors && bus.robot?.query) sample = makeBleSampler(bus.robot, sensors);
@@ -235,7 +242,7 @@ export async function driveLeg(bus, {
   const target = Math.max(0, Number(cm) || 0);
   const vNom = (speed / 60) * WHEEL_CM;
   const samples = [];
-  let reason = null, detail = null, details = null, note, contactCm = null, backedCm = 0;
+  let reason = null, detail = null, details = null, note, contactCm = null, backedCm = 0, overshootCm = null;
   let base = null, last = null, cmdCm = 0, tPrev = null, errors = 0, cancelled = false;
 
   const send = async (l, r) => {
@@ -287,8 +294,9 @@ export async function driveLeg(bus, {
     const timeout = (target / Math.max(vNom, 1)) * 1000 * o.timeoutFactor + o.rampMs + 1000;
     const period = 1000 / o.hz;
     let rpm = 0;
+    const coastCm = clamp(Number(coast?.cm) || 0, 0, Math.max(0, target - 1));
     while (!reason) {
-      const left = target - last.drivenCm;
+      const left = target - coastCm - last.drivenCm;
       if (left <= o.doneCm) { reason = 'done'; break; }
       const d = last.distanceCm;
       if (d != null && d > 0 && d < NO_ECHO_CM && d < stopAtCm) { reason = 'obstacle'; break; }
@@ -318,6 +326,10 @@ export async function driveLeg(bus, {
     await stop();
     await clock.sleep(o.settleMs);
     await readSafe(0);
+    if (reason === 'done' && coast && last.hasEnc) {
+      overshootCm = last.drivenCm - target;
+      coast.cm = clamp(coastCm + overshootCm * o.coastGain, 0, o.maxCoastCm);
+    }
     if (reason === 'crash' || reason === 'stall') {
       // back off so the robot can turn without scraping the obstacle
       const from = last.drivenCm;
@@ -347,7 +359,7 @@ export async function driveLeg(bus, {
   return {
     ok: reason === 'done',
     droveCm: last ? last.drivenCm : 0,
-    reason, detail, details, note, cancelled, contactCm, backedCm, samples,
+    reason, detail, details, note, cancelled, contactCm, backedCm, overshootCm, samples,
     encHeading: last?.hasEnc ? last.encHeading : null,
     yawDelta: last?.yawDelta ?? null,
   };
@@ -362,6 +374,7 @@ export const TURN = {
   reverseDeg: 8,      // rotation against the command that proves a reversed spin
   maxPasses: 4,       // first pass plus corrections
   hz: 10,             // at most this many polls per second (BLE is slower anyway)
+  spinUpMs: 600,      // no stall verdict this soon after a pass starts
 };
 
 // Closed-loop turn in place: streams spin `drive` commands (leg: true) and
@@ -436,13 +449,15 @@ export async function turnInPlace(bus, {
     await read(0, 0);
     if (last.turned == null) { reason = 'nosensor'; return finish(); }
     const t0 = clock.now();
-    const timeout = (Math.abs(target) / rate(o.creepRpm + 4)) * 1000 + 3000;
+    // room for the turn at creep speed plus every correction pass on a slow link
+    const timeout = (Math.abs(target) / rate(o.creepRpm)) * 1000 + o.maxPasses * 3000;
     while (passes < o.maxPasses && !reason) {
       const remaining0 = target - last.turned;
       if (Math.abs(remaining0) <= o.tolDeg) { reason = 'done'; break; }
       passes++;
       const dir = Math.sign(remaining0); // +1 clockwise
       const startTurned = last.turned;
+      const passStart = clock.now();
       let prev = last;
       while (true) {
         if (signal?.aborted) throw abortError();
@@ -454,7 +469,11 @@ export async function turnInPlace(bus, {
         if (remaining <= 0.5 + w * (dt * 0.75 + o.coastS)) break;
         // correction passes creep slower: they start close to the target
         const creep = passes > 1 ? Math.max(3, o.creepRpm / 2) : o.creepRpm;
-        const rpm = Math.round(creep + (o.rpm - creep) * clamp((remaining - o.tolDeg) / o.slowDeg, 0, 1));
+        // slow down early enough for the poll interval: at 100 deg/s and a 300 ms
+        // poll a fixed 40 deg zone is crossed in one sample, the stop then fires
+        // 20 to 30 deg early and only correction passes can save the turn
+        const slowDeg = Math.max(o.slowDeg, w * dt * 3);
+        const rpm = Math.round(creep + (o.rpm - creep) * clamp((remaining - o.tolDeg) / slowDeg, 0, 1));
         const l = dir * spinSign * rpm, r = -dir * spinSign * rpm;
         const tick = clock.now();
         await send(l, r);
@@ -470,7 +489,8 @@ export async function turnInPlace(bus, {
           passes--; // the reversal does not count as a correction pass
           break;
         }
-        const c = detectCrash(samples, { ...o, straight: false, headingFrac: 0.25 });
+        // wheels lag at the start of a spin: judge stalls only after spin-up
+        const c = clock.now() - passStart > o.spinUpMs ? detectCrash(samples, { ...o, straight: false, headingFrac: 0.25 }) : { crash: false };
         if (c.crash && c.reason !== 'heading') {
           reason = c.reason === 'stall' ? 'stall' : 'crash';
           detail = c.reason;

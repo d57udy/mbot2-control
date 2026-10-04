@@ -139,7 +139,7 @@ test('calibration: joystick wheel mapping, turn sign and gyro sign', async () =>
   // encoders and yaw in samples follow the same calibration
   const keys = ['encL', 'encR', 'yaw'];
   assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true }), { distanceCm: undefined, encL: 100, encR: 100, yaw: 10, shake: undefined });
-  assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true, swap: true, yawSign: -1 }), { distanceCm: undefined, encL: -100, encR: -100, yaw: -10, shake: undefined });
+  assert.deepEqual(parseSample(keys, [100, -100, 10], { mirrored: true, swap: true, yawSign: -1 }), { distanceCm: undefined, encL: 100, encR: 100, yaw: -10, shake: undefined });
 });
 
 test('readings at or beyond the ultrasonic range draw no wall', async () => {
