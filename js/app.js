@@ -28,7 +28,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.5.3';
+export const APP_VERSION = '0.5.4';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -717,7 +717,7 @@ async function relocateOnMap(signal) {
   const mk = bus.stamped();
   let points, turned = 0;
   if (nav.scanMode === 'sweep' && nav.sample) {
-    const r = await sweepScan(bus, { sample: nav.sample, makeCommand: mk, signal });
+    const r = await sweepScan(bus, { sample: nav.sweepSample ?? nav.sample, makeCommand: mk, signal });
     points = resampleSweep(r.points, 5);
     turned = r.turnedDeg ?? 0;
   } else {
@@ -817,10 +817,12 @@ $('panel-scan').addEventListener('toggle', redrawMap);
 
 // Sensor sampler for navigation legs (crash detection) and sweeps.
 function attachSampler() {
-  if (!robot) { nav.sample = undefined; nav.legMode = 'straight'; return; }
+  if (!robot) { nav.sample = nav.sweepSample = undefined; nav.legMode = 'straight'; return; }
   nav.sample = robot.kind === 'sim'
     ? makeSimSampler(robot)
     : makeBleSampler(robot, BLE_SENSORS, { fallback: BLE_SENSORS_MIN, log });
+  // sweeps need speed more than detail: distance + yaw is one ~120 ms round trip
+  nav.sweepSample = robot.kind === 'sim' ? nav.sample : makeBleSampler(robot, BLE_SENSORS_MIN, { log });
   // the navigator picks its leg mode at construction; it is created before any robot connects
   nav.legMode = nav.sample ? 'drive' : 'straight';
 }

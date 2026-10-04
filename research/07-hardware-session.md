@@ -22,3 +22,16 @@ Consequences in the code:
 - Eye effects use direct calls with a brightness argument where the firmware needs one.
 
 Open: whether the eye effects now all play, the line-sensor polarity, wheel direction (mirrored), and the remaining UAT items.
+
+## Follow-up 2026-10-04 (phone, Sensor-Test and Encoder-Test)
+
+| Sensor | Result |
+|---|---|
+| `cyberpi.get_yaw()` | 0 at rest, 90 after turning the robot 90° clockwise by hand: **clockwise positive**, degrees |
+| `cyberpi.get_rotation('z')` | same as yaw |
+| `cyberpi.get_acc('x'/'y'/'z')` | about [-0.1, 0.3, -9.6] at rest, m/s² |
+| `cyberpi.get_gyro(axis)` | deg/s, about 0 at rest |
+| `cyberpi.get_shakeval()` | 0 at rest |
+| `mbot2.EM_get_angle("EM1"/"EM2")` and `(1/2)` | both forms work; during `drive_speed(30,-30)`: 97/-104 after 0.5 s, 245/-247 after stop (wheel degrees, EM2 negative forward) |
+| `mbot2.EM_get_speed(1/2)` | 29.6/-29.6 at 30 RPM, 0 after stop |
+| One combined poll (8 values) | 150 to 270 ms per round trip |

@@ -52,14 +52,11 @@ export const SENSOR_EXPR = {
   shake: 'cyberpi.get_shakeval()',
 };
 
-// Confirmed on firmware 44.01.013 (research/07): distance, yaw (clockwise
-// positive, degrees), acceleration (m/s², z = -9.6 at rest), shake.
-// Encoders exist but the port form is not confirmed yet, so they stay out:
-// a wrong form reads 0 and would look like a stall on every leg.
-export const BLE_SENSORS = {
-  distance: SENSOR_EXPR.distance, yaw: SENSOR_EXPR.yaw,
-  ax: SENSOR_EXPR.ax, ay: SENSOR_EXPR.ay, az: SENSOR_EXPR.az, shake: SENSOR_EXPR.shake,
-};
+// All confirmed on firmware 44.01.013 (research/07): distance, yaw (clockwise
+// positive, degrees), acceleration (m/s², z = -9.6 at rest), shake, and the
+// encoders: EM_get_angle("EM1"/"EM2") in wheel degrees, EM1 positive and EM2
+// negative when driving forward (mirrored motors), 245° after about 1.2 s at 30 RPM.
+export const BLE_SENSORS = { ...SENSOR_EXPR };
 export const BLE_SENSORS_MIN = { distance: SENSOR_EXPR.distance, yaw: SENSOR_EXPR.yaw };
 
 const FIELDS = ['distance', 'encL', 'encR', 'ax', 'ay', 'az', 'yaw', 'shake'];
