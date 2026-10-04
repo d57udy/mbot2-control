@@ -54,7 +54,7 @@ const pathLen = (p) => p.slice(1).reduce((s, q, i) => s + dist(p[i], q), 0);
 
 export class Navigator {
   constructor({ bus, map, pose, scan, onEvent, steps = 12, safetyCm = 20, inflateCm = DEFAULT_INFLATE_CM, maxLegCm = 40,
-    legsPerScan = Infinity, rescanCm = 120, settleMs, useYaw = false, beamDeg = 16, maxRangeCm = 250,
+    legsPerScan = Infinity, rescanCm = 120, taskScanCm = 50, settleMs, useYaw = false, beamDeg = 16, maxRangeCm = 250,
     sampler, sample = sampler, sweepSample, legMode = sample ? 'drive' : 'straight', turnMode = sample ? 'gyro' : 'blocking', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.7, stopAtCm = 15 }) {
     // sampler (alias sample): js/motion.js sampler for legs and sweeps; with one,
     // scans default to 'sweep' = continuous rotation, else 'step' = stop-and-measure
@@ -67,6 +67,8 @@ export class Navigator {
     // legsPerScan adds scans every n legs (off by default).
     this.turnMode = turnMode;
     this.rescanCm = rescanCm;
+    this.taskScanCm = taskScanCm; // goTo/goHome scan first ('task-start') after moving this far since the last scan
+    this.droveSinceScan = 0;
     this.spinSign = 1; // learned if clockwise wheel commands turn the robot counterclockwise
     this.turnSign = 1; // learned if mbot2.turn(+deg) turns counterclockwise (needs the gyro)
     this.sweepDegS = sweepDegS;
@@ -161,6 +163,7 @@ export class Navigator {
     if (this.selfPose) this.pose.applyTurn(Math.round(360 / this.steps) * this.steps - 360);
     await this.correctYaw(mk, signal);
     this.scannedAt = at;
+    this.droveSinceScan = 0;
     this.emit({ type: 'scan', reason, pose: at, points: res.points, method: 'step' });
     return { ok: true, points: res.points };
   }
@@ -188,8 +191,18 @@ export class Navigator {
     this.pose.applyTurn(normDeg(res.turnedDeg ?? 0)); // relocalize() already moved the estimate if it matched
     await this.correctYaw(mk, signal);
     this.scannedAt = at;
+    this.droveSinceScan = 0;
     this.emit({ type: 'scan', reason, pose: at, points: mapPoints, method: 'sweep', samples: res.samples, turnedDeg: res.turnedDeg });
     return { ok: true, points: mapPoints, method: 'sweep' };
+  }
+
+  // Movement since the last scan: the larger of the leg path driven by this
+  // navigator and the straight-line distance from the scan pose (which also
+  // covers joystick or button moves the navigator did not drive). Infinity
+  // if there was never a scan.
+  movedSinceScan() {
+    if (!this.scannedAt) return Infinity;
+    return Math.max(this.droveSinceScan ?? 0, dist(this.scannedAt, this.pose.pose));
   }
 
   mapKnown() { return (this.map.stats?.().knownM2 ?? 0) > 0.3; }
@@ -413,7 +426,8 @@ export class Navigator {
     goal = { x: Number(goal.x), y: Number(goal.y) };
     if (!Number.isFinite(goal.x) || !Number.isFinite(goal.y)) return { ok: false, reached: false, pose: this.pose.pose, legs: 0, note: 'invalid goal' };
     this.goal = goal;
-    let legs = 0, sinceScan = 0, droveSinceScan = 0, blocked = 0, crashes = 0, scannedHere = false;
+    // a scan just taken here (e.g. scanHere before goTo) counts for this task
+    let legs = 0, sinceScan = 0, blocked = 0, crashes = 0, scannedHere = this.movedSinceScan() < 5;
     const done = (ok, reached, note) => {
       const r = { ok, reached, pose: this.pose.pose, legs, note };
       if (reached) this.emit({ type: 'arrived', ...r, goal });
@@ -422,7 +436,7 @@ export class Navigator {
     // Scans (and with them relocalization) only when they add something:
     // unknown cells ahead, a blocked or shortened leg, a crash, an uncertain
     // pose, or every legsPerScan legs if that is set.
-    const rescan = async (reason) => { await this.doScan(mk, signal, reason); sinceScan = 0; droveSinceScan = 0; scannedHere = true; };
+    const rescan = async (reason) => { await this.doScan(mk, signal, reason); sinceScan = 0; scannedHere = true; };
     const crashed = async (where, r) => {
       crashes++;
       if (where === 'leg') this.addContact((r.backedCm ?? 0) + FRONT_CM);
@@ -434,7 +448,10 @@ export class Navigator {
       return true;
     };
     await this.ensureYawRef(mk, signal);
-    if (!this.knowsSurroundings()) await rescan('unknown surroundings');
+    // one scan at the start of a task when the map around the robot is thin
+    // or the robot moved since the last scan (thin obstacles such as table legs
+    // are only seen when a beam happens to hit them)
+    if (!this.knowsSurroundings() || this.movedSinceScan() > this.taskScanCm) await rescan('task-start');
     for (let attempt = 0; legs < maxLegs && attempt < maxLegs * 3; attempt++) {
       this.checkAbort(signal);
       if (this.poseUncertain && !scannedHere) { await rescan('pose uncertain'); continue; }
@@ -487,7 +504,7 @@ export class Navigator {
       if (lr.reason === 'error') return done(false, false, `straight failed: ${lr.note ?? ''}`.trim());
       legs++;
       sinceScan++;
-      droveSinceScan += Math.abs(lr.droveCm ?? 0);
+      this.droveSinceScan += Math.abs(lr.droveCm ?? 0);
       scannedHere = false;
       this.emit({ type: 'leg', leg: legs, turnDeg: m.turnDeg, cm, droveCm: lr.droveCm, reason: lr.reason, detail: lr.detail ?? null,
         readingCm: reading, pose: this.pose.pose, samples: lr.samples ?? null });
@@ -499,7 +516,7 @@ export class Navigator {
       if (dist(this.pose.pose, goal) <= tolCm) continue;
       if (lr.reason === 'obstacle' || shortened) await rescan(lr.reason === 'obstacle' ? 'obstacle during leg' : 'leg shortened');
       else if (sinceScan >= this.legsPerScan) await rescan('periodic');
-      else if (droveSinceScan >= this.rescanCm) await rescan('distance since last scan');
+      else if (this.droveSinceScan >= this.rescanCm) await rescan('distance since last scan');
     }
     const d = dist(this.pose.pose, goal);
     return done(d <= tolCm, d <= tolCm, d <= tolCm ? 'arrived' : `gave up after ${legs} legs, ${Math.round(d)} cm from the goal`);

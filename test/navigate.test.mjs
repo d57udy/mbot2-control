@@ -34,6 +34,23 @@ async function setup({ attach = false, timeScale = 30, simOpts = {}, ...opts } =
 }
 
 const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// Smallest distance from a map-frame path to a real obstacle surface (sim frame).
+function trueClearance(path, obstacles) {
+  let min = Infinity;
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1], b = path[i], L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    for (let t = 0; t <= L; t += 1) {
+      const sx = a.x + ((b.x - a.x) * t) / L + 150, sy = 100 - (a.y + ((b.y - a.y) * t) / L);
+      for (const o of obstacles) {
+        const dd = o.kind === 'circle' ? Math.hypot(sx - o.x, sy - o.y) - o.r
+          : Math.hypot(sx - Math.min(o.x + o.w, Math.max(o.x, sx)), sy - Math.min(o.y + o.h, Math.max(o.y, sy)));
+        min = Math.min(min, dd);
+      }
+    }
+  }
+  return min;
+}
 const angErr = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
 
 describe('navigator with SimRobot', { concurrency: true }, () => {
@@ -81,7 +98,9 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
   });
 
   test('explore grows the known area without contact', async () => {
-    const { sim, nav, map, truth, pose, track } = await setup({ steps: 8 });
+    // timeScale 15: at 30, event-loop stalls under the parallel sim tests let a
+    // leg run on for centimetres before its stop lands (1 run in 20 came within 1 cm)
+    const { sim, nav, map, truth, pose, track } = await setup({ steps: 8, timeScale: 15 });
     try {
       await nav.scanHere({});
       const before = map.stats().knownM2;
@@ -216,6 +235,57 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
       }
     });
   }
+
+  // Without periodic scans the table leg was never hit by a beam before the
+  // home plan (6.6 cm from it). goHome now scans first when the robot moved
+  // more than taskScanCm since the last scan. Sweep scans only: a step scan
+  // has blind gaps between its beams (45 deg apart at 8 steps, 16 deg wide)
+  // where a 4 cm leg can hide, so one scan cannot guarantee seeing it.
+  for (const mode of ['sweep']) {
+    test(`task-start scan keeps the home route clear of the table leg (${mode} scans)`, async () => {
+      const { sim, nav, events } = await setup({});
+      try {
+        await nav.scanHere({});
+        const r = await nav.goTo({ x: 110, y: 75 });
+        assert.equal(r.ok, true, r.note);
+        const before = events.length;
+        const moved = nav.movedSinceScan();
+        const h = await nav.goHome({});
+        assert.equal(h.ok, true, h.note);
+        const after = events.slice(before);
+        // scanned first if the robot had moved more than 50 cm since the last scan
+        if (moved > 50) assert.equal(after.find((e) => e.type === 'scan')?.reason, 'task-start');
+        else assert.notEqual(after.find((e) => e.type === 'scan')?.reason, 'task-start');
+        const plans = after.filter((e) => e.type === 'plan').map((e) => e.path);
+        assert.ok(plans.length);
+        for (const path of plans) {
+          const c = trueClearance(path, sim.obstacles);
+          assert.ok(c > 10, `home plan ${c.toFixed(1)} cm from an obstacle`);
+        }
+        assert.ok(!events.some((e) => e.type === 'scan' && /periodic/.test(e.reason)), 'no periodic scans');
+      } finally {
+        await sim.disconnect();
+      }
+    });
+  }
+
+  // The driver now compensates the firmware's reversed mbot2.turn, so turns
+  // arrive with the right sign and only a scale error: the learned turn sign
+  // must stay 1 (no double compensation).
+  test('blocking turns with the right sign and 10 % error keep turnSign 1', async () => {
+    const { sim, nav, events, pose, truth } = await setup({ attach: true, useYaw: true, turnMode: 'blocking', timeScale: 10,
+      simOpts: { turnError: 0.1, yawInteger: true, yawMode: 'unbounded', latencyMs: 150 } });
+    try {
+      const r = await nav.goTo({ x: 110, y: 70 }, { tolCm: 10 });
+      assert.equal(r.ok, true, r.note);
+      assert.equal(nav.turnSign, 1);
+      assert.ok(!events.some((e) => e.type === 'warning'), JSON.stringify(events.filter((e) => e.type === 'warning')));
+      assert.ok(events.some((e) => e.type === 'turn' && Math.abs(e.target) >= 20), 'made a real turn');
+      assert.ok(angErr(truth().heading, pose.pose.heading) < 3, 'gyro keeps the heading');
+    } finally {
+      await sim.disconnect();
+    }
+  });
 
   test('yaw correction keeps the heading on the gyro', async () => {
     const { sim, nav, pose, truth } = await setup({ useYaw: true });
