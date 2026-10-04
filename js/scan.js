@@ -267,9 +267,12 @@ export function resampleSweep(points, binDeg = 3) {
 // so a fast simulator keeps its time base. Samples are at least minSampleMs
 // apart; the wait before each sample always yields to timers, so a sampler
 // that answers at once cannot starve the drive stream.
+// Defaults the app can tune at runtime (Scan-Labor: measured sensor latency).
+export const SWEEP_DEFAULTS = { latencyMs: 45 };
+
 export async function sweepScan(bus, {
   sample, makeCommand = defaultMakeCommand, signal, speedDegS = 45, onPoint, maxDurationMs = 20000,
-  latencyMs = 45, targetDeg = 380, keepaliveMs = 300, rampMs = 300, signDetectDeg = 20,
+  latencyMs = SWEEP_DEFAULTS.latencyMs, targetDeg = 380, keepaliveMs = 300, rampMs = 300, signDetectDeg = 20,
   sampleTimeoutMs = 2000, minSampleMs = 0, mergeDeg = 1, minCm = 2, wheelCm = WHEEL_DIAMETER_CM, trackCm = TRACK_CM,
 } = {}) {
   if (typeof sample !== 'function') throw new Error('sweepScan needs a sample() function');
@@ -319,9 +322,11 @@ export async function sweepScan(bus, {
     raw.push({ ...point, rot: angle });
     onPoint?.(point, raw.length - 1);
   };
+  const sampleLog = []; // raw readings for diagnosis (Scan-Labor export)
   const ingest = (s) => {
     n++;
     const t = fin(s?.t) ? Number(s.t) : now();
+    sampleLog.push({ t: Math.round(t - t0), yaw: s?.yaw, cm: s?.distanceCm, encL: s?.encL, encR: s?.encR });
     const hasEnc = fin(s?.encL) && fin(s?.encR);
     if (!method) {
       method = fin(s?.yaw) ? 'yaw' : hasEnc ? 'encoder' : 'time';
@@ -400,6 +405,9 @@ export async function sweepScan(bus, {
     points,
     durationMs: Math.round(now() - t0),
     method: 'sweep',
+    sampleLog,
+    latencyMs,
+    speedDegS,
     rotationSource: method ?? 'time',
     yawSign: method === 'yaw' ? sign : null,
     // measured rotation from the start heading to rest, including the coast

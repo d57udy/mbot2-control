@@ -174,3 +174,5 @@ details input[type="password"] { flex: 1; font: inherit; color: var(--text); bac
 #map-name { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
 .file-btn { border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; cursor: pointer; }
 .file-btn input { display: none; }
+#lab-plot { width: 100%; max-width: 360px; aspect-ratio: 1; display: block; margin: 8px auto; }
+#lab-text { white-space: pre-wrap; font-size: 12px; margin: 6px 0; }

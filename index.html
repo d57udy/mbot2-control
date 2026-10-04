@@ -136,6 +136,24 @@
           <label class="inline file-btn">Datei importieren <input id="map-import" type="file" accept="application/json,.json"></label>
         </div>
       </details>
+      <details class="nested" id="panel-lab">
+        <summary>Scan-Labor (Messfehler finden)</summary>
+        <p class="muted small">Flasche o.ä. genau 60 cm vor den Roboter stellen (Maßband), sonst nichts im Umkreis von 1 m. Dann je ein Sweep in beide Richtungen, ohne den Roboter zu bewegen. Die Auswertung zeigt, wo die Flasche erscheint, und berechnet die Zeitkorrektur.</p>
+        <div class="row">
+          <button id="btn-lab-cw">↻ Sweep im Uhrzeigersinn</button>
+          <button id="btn-lab-ccw">↺ Sweep gegen den Uhrzeigersinn</button>
+        </div>
+        <canvas id="lab-plot" width="480" height="480"></canvas>
+        <pre id="lab-text" class="small"></pre>
+        <div class="row">
+          <label class="inline">Zeitkorrektur (ms) <input id="opt-latency" type="number" min="-100" max="400" step="5" value="45" inputmode="numeric"></label>
+          <button id="btn-lab-apply" class="small-btn">Gemessenen Wert übernehmen</button>
+        </div>
+        <div class="row">
+          <button id="btn-lab-copy">Scan-Daten kopieren</button>
+          <button id="btn-lab-clear" class="small-btn">Leeren</button>
+        </div>
+      </details>
       <details class="nested">
         <summary>Letzter Scan (Radar)</summary>
         <canvas id="radar" width="480" height="480"></canvas>

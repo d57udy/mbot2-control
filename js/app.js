@@ -3,6 +3,8 @@ import { SimRobot, SIM_ROOM, SIM_OBSTACLES } from './robot-sim.js';
 import { drawSim } from './sim-view.js';
 import { scan, findOpenings, describeScan, driveToward, sweepScan, resampleSweep } from './scan.js';
 import { relocalize } from './localize.js';
+import { SWEEP_DEFAULTS } from './scan.js';
+import { pointsFromLog, findPost, postLatency, estimateLatency, drawOverlay, LAB_COLORS } from './scanlab.js';
 import { drawRadar } from './radar.js';
 import { GridMap } from './gridmap.js';
 import { PoseTracker } from './pose.js';
@@ -28,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.6.4';
+export const APP_VERSION = '0.6.5';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -1001,6 +1003,82 @@ refreshMapList();
 $('scan-steps').onchange = applyScanMode; // also used by map taps, Nach Hause and AI tools
 applyScanMode();
 $('btn-scan').onclick = () => runScanTask((signal) => doScan(signal));
+
+// --- Scan-Labor --------------------------------------------------------------
+
+const labScans = []; // { dir: 1 | -1, log, durationMs, samples }, at most 4
+let labSuggest = null;
+
+function latency() {
+  const v = Number($('opt-latency').value);
+  return Number.isFinite(v) ? Math.min(400, Math.max(-100, v)) : 45;
+}
+$('opt-latency').value = store.get('cal.latency', '45');
+SWEEP_DEFAULTS.latencyMs = latency();
+$('opt-latency').onchange = () => {
+  SWEEP_DEFAULTS.latencyMs = latency();
+  store.set('cal.latency', String(latency()));
+  renderLab();
+};
+
+function renderLab() {
+  const L = latency(), range = maxRange();
+  const scans = labScans.map((s, i) => ({ ...s, points: pointsFromLog(s.log, L), color: LAB_COLORS[i % LAB_COLORS.length] }));
+  drawOverlay($('lab-plot'), scans, { rangeCm: range });
+  const lines = scans.map((s, i) => {
+    const post = findPost(s.points, { rangeCm: range });
+    const name = ['blau', 'rot', 'grün', 'orange'][i];
+    return `${name}: ${s.dir > 0 ? '↻' : '↺'} ${s.samples} Messungen in ${(s.durationMs / 1000).toFixed(1)} s` +
+      (post ? `, Objekt vorne bei ${post.angle}° / ${post.cm} cm, Breite ${post.widthDeg}°` : ', vorne nichts erkannt');
+  });
+  labSuggest = null;
+  const cw = labScans.findLast((s) => s.dir > 0), ccw = labScans.findLast((s) => s.dir < 0);
+  if (cw && ccw) {
+    const p = postLatency(cw.log, ccw.log, { rangeCm: range });
+    const e = estimateLatency(cw.log, ccw.log, { rangeCm: range }).best;
+    if (p) lines.push(`Flasche: ↻ ${p.cw.angle}° / ↺ ${p.ccw.angle}° (ohne Korrektur) → Zeitkorrektur ${p.latencyMs} ms bei ${p.rateDegS}°/s`);
+    if (e) lines.push(`Gesamtvergleich: beste Übereinstimmung bei ${e.latencyMs} ms (Abweichung ${e.mismatchCm} cm)`);
+    labSuggest = p?.latencyMs ?? e?.latencyMs ?? null;
+  }
+  lines.push(`Angezeigt mit Zeitkorrektur ${L} ms, Reichweite ${range} cm.`);
+  $('lab-text').textContent = lines.join('\n');
+  $('btn-lab-apply').disabled = labSuggest == null;
+}
+
+async function labSweep(dir) {
+  if (!robot?.connected) { log('! Scan-Labor: erst verbinden'); return; }
+  const sample = nav.sweepSample ?? nav.sample;
+  if (!sample) { log('! Scan-Labor: kein Sensor-Zugriff'); return; }
+  await runScanTask(async (signal) => {
+    const r = await sweepScan(bus, { sample, makeCommand: bus.stamped(), signal, speedDegS: 45 * dir });
+    tracker.applyTurn(r.turnedDeg ?? 0); // sweeps send drive frames, which no pose listener counts
+    labScans.push({ dir, log: r.sampleLog, durationMs: r.durationMs, samples: r.samples });
+    if (labScans.length > 4) labScans.shift();
+    log(`Scan-Labor: Sweep ${dir > 0 ? '↻' : '↺'} mit ${r.samples} Messungen`);
+    renderLab();
+    redrawMap();
+  });
+}
+$('btn-lab-cw').onclick = () => labSweep(1);
+$('btn-lab-ccw').onclick = () => labSweep(-1);
+$('btn-lab-clear').onclick = () => { labScans.length = 0; renderLab(); };
+$('btn-lab-apply').onclick = () => {
+  if (labSuggest == null) return;
+  $('opt-latency').value = labSuggest;
+  $('opt-latency').onchange();
+  log(`Zeitkorrektur auf ${labSuggest} ms gesetzt (gilt für alle Sweeps).`);
+};
+$('btn-lab-copy').onclick = async () => {
+  const data = {
+    app: APP_VERSION, at: new Date().toISOString(), latencyMs: latency(), rangeCm: maxRange(),
+    calibration: robot?.wheels ?? null,
+    scans: labScans.map((s) => ({ dir: s.dir, durationMs: s.durationMs, samples: s.samples, log: s.log })),
+  };
+  const text = JSON.stringify(data);
+  try { await navigator.clipboard.writeText(text); log(`Scan-Daten kopiert (${Math.round(text.length / 1024)} kB).`); }
+  catch { try { await navigator.share({ title: 'mBot2 Scan-Daten', text }); } catch { log('! Kopieren nicht möglich'); } }
+};
+renderLab();
 $('btn-explore').onclick = () => !needsLocation() && runScanTask(async (signal) => {
   applyScanMode();
   const r = await nav.explore({ signal, maxMoves: 6 });
