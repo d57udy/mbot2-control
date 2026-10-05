@@ -60,7 +60,7 @@ const pathLen = (p) => p.slice(1).reduce((s, q, i) => s + dist(p[i], q), 0);
 
 export class Navigator {
   constructor({ bus, map, pose, scan, onEvent, steps = 12, safetyCm = 20, inflateCm = DEFAULT_INFLATE_CM, maxLegCm = 40,
-    legsPerScan = Infinity, rescanCm = 120, taskScanCm = 50, settleMs, useYaw = false, beamDeg = 16, maxRangeCm = 250,
+    legsPerScan = Infinity, rescanCm = 120, taskScanCm = 50, settleMs, useYaw = false, beamDeg = 25, maxRangeCm = 250,
     sampler, sample = sampler, sweepSample, legMode = sample ? 'drive' : 'straight', turnMode = sample ? 'gyro' : 'blocking', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.7, stopAtCm = 15 }) {
     // sampler (alias sample): js/motion.js sampler for legs and sweeps; with one,
     // scans default to 'sweep' = continuous rotation, else 'step' = stop-and-measure
