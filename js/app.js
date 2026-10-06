@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.7.1';
+export const APP_VERSION = '0.7.2';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -831,6 +831,23 @@ function navEventText(e) {
   }
 }
 
+// Run recording: every navigator event with the pose estimate and the scan
+// points, so a real run can be replayed offline to tune localization.
+const recording = [];
+const R2 = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : v);
+function record(e) {
+  const pose = tracker.pose;
+  const entry = { t: Math.round(performance.now()), type: e.type, est: { x: R2(pose.x), y: R2(pose.y), h: R2(pose.heading) } };
+  for (const [k, v] of Object.entries(e)) {
+    if (k === 'type' || k === 'samples') continue;
+    if (k === 'points' && Array.isArray(v)) entry.points = v.map((p) => [R2(p.angle), R2(p.cm)]);
+    else if (k === 'path' && Array.isArray(v)) entry.path = v.map((p) => [R2(p.x), R2(p.y)]);
+    else entry[k] = v;
+  }
+  recording.push(entry);
+  if (recording.length > 2000) recording.shift();
+}
+
 // --- map and navigation --------------------------------------------------------
 
 const map = new GridMap({ cellCm: 5, sizeCm: 800 });
@@ -846,6 +863,7 @@ const nav = new Navigator({
   useYaw: true, // gyro yaw confirmed clockwise positive on 44.01.013
   onEvent: (e) => {
     if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
+    record(e);
     log(navEventText(e));
     redrawMap();
     redrawSim();
@@ -931,6 +949,24 @@ function showCellInfo({ x, y }) {
   log(text);
 }
 $('opt-tapinfo').onchange = () => { if (!$('opt-tapinfo').checked) $('map-info').hidden = true; };
+$('btn-rec-copy').onclick = async () => {
+  const data = {
+    app: APP_VERSION, at: new Date().toISOString(), calibration: robot?.wheels ?? null,
+    rangeCm: maxRange(), latencyMs: latency(), events: recording,
+  };
+  const text = JSON.stringify(data);
+  try { await navigator.clipboard.writeText(text); log(`Fahrt-Aufzeichnung kopiert (${recording.length} Ereignisse, ${Math.round(text.length / 1024)} kB).`); }
+  catch {
+    // too big for the clipboard on some phones: offer it as a file
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    a.download = `mbot2-fahrt-${new Date().toISOString().slice(0, 16).replace(':', '')}.json`;
+    a.click();
+    log('Fahrt-Aufzeichnung als Datei gespeichert.');
+  }
+};
+$('btn-rec-clear').onclick = () => { recording.length = 0; log('Fahrt-Aufzeichnung geleert.'); };
+
 $('btn-map-cleanup').onclick = () => {
   const removed = map.cleanup?.() ?? 0;
   log(`Karte aufgeräumt: ${removed} unbestätigte Zellen entfernt.`);
