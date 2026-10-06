@@ -10,7 +10,7 @@ import { GridMap } from './gridmap.js';
 import { PoseTracker } from './pose.js';
 import { Navigator } from './navigate.js';
 import { makeBleSampler, makeSimSampler, BLE_SENSORS, BLE_SENSORS_MIN } from './motion.js';
-import { drawMap, fitView, screenToWorld } from './mapview.js';
+import { drawMap, fitView, screenToWorld, mapLegend } from './mapview.js';
 import { attachMapControls } from './mapcontrols.js';
 import { saveMap, listMaps, loadMap, deleteMap, exportMap, importMap } from './mapstore.js';
 import { CommandBus, makeCommand, LIMITS, LED_EFFECTS, EYE_EFFECTS } from './bus.js';
@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.7.4';
+export const APP_VERSION = '0.8.0';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -822,6 +822,15 @@ function navEventText(e) {
     case 'warning': return e.kind === 'slip'
       ? `Nav Radschlupf (kein Zusammenstoß): Räder ${r0(e.slip?.encHeading)}°, Gyro ${r0(e.slip?.yawDelta)}°`
       : `! Nav Hinweis: ${e.note ?? e.kind ?? ''}`;
+    case 'scan-accepted': {
+      const c = e.correction ?? {};
+      return `Nav Scan übernommen${e.ref === 'anchor' ? ' (gegen Startscan)' : ''}: Korrektur dx ${r0(c.dx)} cm, dy ${r0(c.dy)} cm, dh ${r0(c.dh)}°, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.axes ? `, bestimmt: ${[].concat(e.axes).join('/')}` : ''}`;
+    }
+    case 'scan-pending': return `Nav Scan nicht übernommen (${e.reason ?? '?'}), ${e.pending ?? '?'} wartend${e.frozen ? ', Karte eingefroren' : ''}`;
+    case 'map-frozen': return e.frozen ? 'Nav: Karte eingefroren (nur Ortung, keine Einträge)' : 'Nav: Karte wieder offen';
+    case 'heading-snap': return `Nav Wandausrichtung: ${r0(e.correctionDeg)}° (${e.walls?.length ?? e.walls ?? '?'} Wände)${e.applied === false ? ' (nicht angewandt)' : ''}`;
+    case 'heading-axes': return `Nav Raumachsen festgelegt${e.axisDeg != null ? `: ${r0(e.axisDeg)}°` : ''}`;
+    case 'heading-slip': return `Nav Gyro/Rad-Abweichung: ${e.note ?? ''}`;
     case 'home-check': return `Nav Heimkontrolle ${e.attempt ?? ''}: Abweichung ${r0(e.residualCm)} cm, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.applied === false ? ' (nicht übernommen)' : ''}`;
     case 'contacts-cleared': return `Nav: ${e.count} Zusammenstoß-Markierung(en) entfernt (Strecke frei befahren)`;
     case 'backoff': return `Nav: zurücksetzen und neu scannen${e.note ? ` (${e.note})` : ''}`;
@@ -855,6 +864,8 @@ const map = new GridMap({ cellCm: 5, sizeCm: 800 });
 const tracker = new PoseTracker();
 tracker.attach(bus); // turn/straight from any source (buttons, AI, navigator) update the pose
 let mapView = null;
+let recentScans = []; // newest first, drawn fading
+let mapFrozen = false;
 let mapScan = null; // { pose, points } of the last scan, drawn on the map
 
 const nav = new Navigator({
@@ -863,7 +874,11 @@ const nav = new Navigator({
   beamDeg: 25, // measured with a bottle (Scan-Labor, 2026-10-04)
   useYaw: true, // gyro yaw confirmed clockwise positive on 44.01.013
   onEvent: (e) => {
-    if (e.type === 'scan') mapScan = { pose: e.pose, points: e.points };
+    if (e.type === 'scan') {
+      mapScan = { pose: e.pose, points: e.points };
+      recentScans = [{ pose: e.pose, points: e.points }, ...recentScans].slice(0, 3);
+    }
+    if (e.type === 'map-frozen') mapFrozen = !!e.frozen;
     record(e);
     log(navEventText(e));
     redrawMap();
@@ -904,11 +919,29 @@ function redrawMap() {
     path: nav.lastPath,
     goal: nav.goal,
     frontiers: map.frontiers({ minCells: 4 }),
-    lastScan: mapScan,
+    recentScans: recentScans.length ? recentScans : (mapScan ? [mapScan] : []),
+    pendingScans: nav.pendingScans ?? [],
+    frozen: mapFrozen || !!nav.mapFrozen,
   });
   $('map-text').textContent = map.bounds ? map.describe(pose) : 'Karte: noch leer. Scannen füllt sie; auf die Karte tippen fährt dorthin.';
 }
 $('panel-scan').addEventListener('toggle', redrawMap);
+
+// Legend for the map colours (rebuilt when light/dark mode changes)
+function renderLegend() {
+  const ul = $('map-legend');
+  ul.textContent = '';
+  for (const e of mapLegend()) {
+    const li = document.createElement('li'), sw = document.createElement('span');
+    sw.className = `swatch legend-${e.style}`;
+    if (e.style === 'hollow' || e.style === 'border') sw.style.borderColor = e.colour; else sw.style.background = e.css;
+    if (e.alpha) sw.style.opacity = e.alpha;
+    li.append(sw, ' ', e.label);
+    ul.append(li);
+  }
+}
+renderLegend();
+try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { renderLegend(); redrawMap(); }); } catch { /* old browsers */ }
 
 // Sensor sampler for navigation legs (crash detection) and sweeps.
 function attachSampler() {
@@ -916,6 +949,8 @@ function attachSampler() {
   nav.sample = robot.kind === 'sim'
     ? makeSimSampler(robot)
     : makeBleSampler(robot, BLE_SENSORS, { fallback: BLE_SENSORS_MIN, log });
+  // the simulator reads distance and yaw at the same instant: no latency to compensate
+  nav.sweepLatencyMs = robot.kind === 'sim' ? 0 : undefined;
   // sweeps need speed more than detail: distance + yaw is one ~120 ms round trip
   nav.sweepSample = robot.kind === 'sim' ? nav.sample : makeBleSampler(robot, BLE_SENSORS_MIN, { log });
   // the navigator picks its leg mode at construction; it is created before any robot connects
@@ -924,7 +959,12 @@ function attachSampler() {
 
 function resetMap() {
   attachSampler();
+  recentScans = [];
+  mapFrozen = false;
+  if (nav.pendingScans) nav.pendingScans.length = 0;
+  nav.mapFrozen = $('opt-freeze')?.checked ?? false;
   map.clear();
+  nav.resetLocalization?.();
   tracker.reset();
   nav.lastPath = null;
   nav.goal = null;
@@ -976,6 +1016,7 @@ $('btn-map-cleanup').onclick = () => {
 
 $('btn-map-clear').onclick = () => { resetMap(); log('Karte gelöscht; die aktuelle Position ist der neue Start.'); };
 $('opt-yaw').onchange = () => { nav.useYaw = $('opt-yaw').checked; };
+$('opt-freeze').onchange = () => { nav.mapFrozen = $('opt-freeze').checked; mapFrozen = nav.mapFrozen; redrawMap(); };
 
 function navResult(label, r) {
   if (!r) return;
@@ -1029,7 +1070,10 @@ function adoptMap(loaded, label) {
     return;
   }
   map.copyFrom(loaded.map); // grid plus hit/miss evidence
-  nav.resetAnchors?.(); // the start reference scan belongs to the session that took it
+  // anchors, pending scans, pose uncertainty, gyro bias and room axes belong to the session
+  if (nav.resetLocalization) nav.resetLocalization(); else nav.resetAnchors?.();
+  if (nav.pendingScans) nav.pendingScans.length = 0;
+  recentScans = [];
   tracker.reset();
   nav.lastPath = null;
   nav.goal = null;

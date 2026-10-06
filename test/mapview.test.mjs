@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { drawMap, fitView, screenToWorld, worldToScreen, compassOf, compassHit } from '../js/mapview.js';
+import { drawMap, fitView, screenToWorld, worldToScreen, compassOf, compassHit, colours, occupiedColour, isDark, mapLegend, OCC_P_LO, OCC_P_HI } from '../js/mapview.js';
 import { zoomAt, panBy, pinchView, rotateBy, wheelFactor, createMapGestures, attachMapControls, LIMITS } from '../js/mapcontrols.js';
 
 // Records every call and property set; any method name works.
@@ -406,4 +406,130 @@ test('heading-up mode keeps the robot heading up and its screen position, follow
   c.rotateBy(-5);
   assert.equal(c.headingUp, false);
   close(view.rot, 25);
+});
+
+// --- confidence colours and scan overlays (v0.8) ---
+
+const fakeCss = (vars) => ({ getPropertyValue: (n) => vars[n] ?? '' });
+const lum = (h) => { const n = parseInt(h.slice(1), 16); return 0.2126 * (n >> 16) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255); };
+const fillsOf = (calls) => {
+  // [fillStyle, globalAlpha, rectCount] for every fill() that follows rect() calls
+  const out = [];
+  let style = null, alpha = 1, rects = 0;
+  for (const [k, a, b] of calls) {
+    if (k === 'set' && a === 'fillStyle') style = b;
+    if (k === 'set' && a === 'globalAlpha') alpha = b;
+    if (k === 'beginPath') rects = 0;
+    if (k === 'rect') rects++;
+    if (k === 'fill' && rects) out.push([style, alpha, rects]);
+  }
+  return out;
+};
+
+test('colours: light and dark fallbacks, CSS variables win, gradient is monotonic', () => {
+  const light = colours(fakeCss({}));
+  assert.equal(isDark(light.bg), false);
+  const dark = colours(fakeCss({ '--bg': '#14181f' }));
+  assert.equal(isDark(dark.bg), true);
+  assert.notEqual(light.occHi, dark.occHi);
+  assert.equal(colours(fakeCss({ '--map-suspect': '#123456' })).suspect, '#123456');
+  // light: lighter at low confidence, near-black at high; dark: the reverse
+  let prev = Infinity;
+  for (let p = OCC_P_LO; p <= OCC_P_HI + 1e-9; p += 0.05) {
+    const l = lum(occupiedColour(p, light));
+    assert.ok(l < prev, `light gradient at ${p}`);
+    prev = l;
+  }
+  assert.ok(lum(occupiedColour(0.95, light)) < 40);
+  assert.ok(lum(occupiedColour(0.65, light)) > 150);
+  assert.ok(lum(occupiedColour(0.95, dark)) > lum(occupiedColour(0.65, dark)));
+  assert.equal(occupiedColour(0.2, light), occupiedColour(OCC_P_LO, light)); // clamped
+  assert.equal(occupiedColour(NaN, light), occupiedColour(OCC_P_HI, light));
+  assert.equal(occupiedColour(0.8, colours(fakeCss({ '--map-occ-lo': 'rgb(0, 0, 0)', '--map-occ-hi': '#ffffff' }))).length, 7);
+});
+
+test('drawMap: confirmed cells by confidence, suspect and contact in their own colours', () => {
+  const canvas = fakeCanvas();
+  const c = colours();
+  const cells = [
+    { x: 0, y: 0, state: 'occupied', p: 0.65, kind: 'occupied' }, { x: 5, y: 0, state: 'occupied', p: 0.95, kind: 'occupied' },
+    { x: 10, y: 0, state: 'unknown', p: 0.55, kind: 'suspect' }, { x: 15, y: 0, state: 'occupied', p: 0.9, kind: 'contact' },
+    { x: 20, y: 0, state: 'free', p: 0.1, kind: 'free' },
+  ];
+  const map = { cellCm: 5, bounds: null, forEachCell(fn) { for (const q of cells) fn(q.x, q.y, q.state, q.p, q.kind); } };
+  drawMap(canvas, map, null, { view: { cx: 0, cy: 0, cmPerPx: 1 } });
+  const fills = fillsOf(canvas.ctx.calls);
+  const styles = fills.map(([st]) => st);
+  assert.ok(styles.includes(occupiedColour(0.65, c)));
+  assert.ok(styles.includes(occupiedColour(0.95, c)));
+  assert.notEqual(occupiedColour(0.65, c), occupiedColour(0.95, c));
+  assert.ok(styles.includes(c.suspect) && styles.includes(c.contact) && styles.includes(c.surface));
+  assert.equal(fills.reduce((n, f) => n + f[2], 0), 5);
+  // suspect and contact are drawn after (over) the confirmed cells
+  assert.ok(styles.indexOf(c.contact) > styles.indexOf(occupiedColour(0.95, c)));
+});
+
+function scanCalls(opts) {
+  const canvas = fakeCanvas();
+  drawMap(canvas, null, null, { view: { cx: 0, cy: 0, cmPerPx: 1 }, ...opts });
+  return canvas.ctx.calls;
+}
+const scan = (x, n = 3) => ({ pose: { x, y: 0, heading: 0 }, points: Array.from({ length: n }, (_, i) => ({ angle: i * 90, cm: 30 })) });
+
+test('drawMap: latest scan in the accent colour, fading with age', () => {
+  const c = colours();
+  const alphaOfDots = (calls) => {
+    let alpha = 1, style = null; const out = [];
+    for (const [k, a, b] of calls) {
+      if (k === 'set' && a === 'globalAlpha') alpha = b;
+      if (k === 'set' && a === 'fillStyle') style = b;
+      if (k === 'fill' && style === c.accent) out.push(alpha);
+    }
+    return out;
+  };
+  assert.deepEqual(alphaOfDots(scanCalls({ lastScan: scan(0) })), [1, 1, 1]);
+  assert.deepEqual(alphaOfDots(scanCalls({ lastScan: { ...scan(0), age: 1 } })), [0.55, 0.55, 0.55]);
+  assert.deepEqual(alphaOfDots(scanCalls({ lastScan: { ...scan(0), age: 3 } })), []);
+  // recentScans: newest first, older ones drawn first and fainter
+  const a = alphaOfDots(scanCalls({ recentScans: [scan(0, 1), scan(20, 1), scan(40, 1), scan(60, 1)] }));
+  assert.deepEqual(a, [0.25, 0.55, 1]);
+});
+
+test('drawMap: pending scans are grey hollow points with dashed rays and a label', () => {
+  const c = colours();
+  const calls = scanCalls({ pendingScans: [scan(0, 2), { pose: null, points: [] }], lastScan: scan(50, 1) });
+  assert.ok(calls.some(([k, t]) => k === 'fillText' && t === 'nicht übernommen'));
+  assert.equal(calls.filter(([k, t]) => k === 'fillText' && t === 'nicht übernommen').length, 1);
+  // hollow: the pending points are stroked arcs, not filled
+  let style = null, strokeArcs = 0, fillArcs = 0, arc = false, dashed = false;
+  for (const [k, a, b] of calls) {
+    if (k === 'set' && a === 'strokeStyle') style = b;
+    if (k === 'setLineDash' && a.length && style === c.pending) dashed = true;
+    if (k === 'arc') arc = true;
+    if (k === 'beginPath') arc = false;
+    if (k === 'stroke' && arc && style === c.pending) strokeArcs++;
+    if (k === 'fill' && arc && style === c.pending) fillArcs++;
+  }
+  assert.equal(strokeArcs, 2);
+  assert.equal(fillArcs, 0);
+  assert.ok(dashed);
+});
+
+test('drawMap: frozen draws a dashed border and a badge; legend lists every map colour', () => {
+  const on = scanCalls({ frozen: true }), off = scanCalls({});
+  assert.ok(on.some(([k, t]) => k === 'fillText' && t === 'Karte eingefroren'));
+  assert.ok(on.some(([k]) => k === 'strokeRect'));
+  assert.ok(!off.some(([k, t]) => k === 'fillText' && t === 'Karte eingefroren'));
+  const legend = mapLegend({ css: fakeCss({ '--bg': '#14181f' }) });
+  const keys = legend.map((e) => e.key);
+  for (const k of ['free', 'unknown', 'occupied', 'suspect', 'contact', 'scan', 'pending', 'frozen']) assert.ok(keys.includes(k), k);
+  for (const e of legend) {
+    assert.equal(typeof e.label, 'string');
+    assert.match(e.colour, /^#|^rgb/);
+    assert.ok(['fill', 'gradient', 'dot', 'hollow', 'border'].includes(e.style));
+    assert.ok(e.css);
+  }
+  const occ = legend.find((e) => e.key === 'occupied');
+  assert.match(occ.css, /^linear-gradient/);
+  assert.ok(lum(occ.colour2) > lum(occ.colour)); // dark mode: brighter = more certain
 });

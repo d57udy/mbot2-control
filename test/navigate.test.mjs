@@ -18,7 +18,8 @@ const stub = () => {};
 // Sim at its default start (150, 100) facing up (-90) = map origin, heading 0.
 // Map x = sim x - 150, map y = 100 - sim y, map heading = sim heading + 90.
 async function setup({ attach = false, timeScale = 15, simOpts = {}, ...opts } = {}) {
-  opts = { localize: false, ...opts };
+  // the sim reads distance and yaw at the same instant: no sweep latency to compensate
+  opts = { localize: false, sweepLatencyMs: 0, ...opts };
   const sim = new SimRobot({ log: stub, onStatus: stub, timeScale, ...simOpts });
   const bus = new CommandBus({ log: stub });
   bus.setRobot(sim);

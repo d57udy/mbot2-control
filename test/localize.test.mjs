@@ -144,13 +144,13 @@ test('localize: real sim scans, map built by integration, match after drift', as
   for (const truth of [{ x: 30, y: -20, heading: 15 }, { x: -40, y: 20, heading: -70 }]) {
     const pts = await simScan(sim, truth, 36);
     const guess = { x: truth.x - 15, y: truth.y + 5, heading: truth.heading + 10 };
-    const r = matchScan(m, guess, pts);
+    const r = matchScan(m, guess, pts, { maxRangeCm: 250 });   // the map was built with the 250 cm default
     assert.ok(d(r.pose, truth) < 5, `pose ${JSON.stringify(r.pose)} truth ${JSON.stringify(truth)}`);
     assert.ok(angErr(r.pose.heading, truth.heading) < 3, `heading ${r.pose.heading}`);
     assert.ok(r.confidence > 0.4, `confidence ${r.confidence}`);
-    // 12 beams as the navigator scans: still close
-    const r12 = matchScan(m, guess, await simScan(sim, truth, 12));
-    assert.ok(d(r12.pose, truth) < 8 && angErr(r12.pose.heading, truth.heading) < 5, JSON.stringify(r12));
+    // 12 beams as a step scan: close, or at least not claiming to be sure
+    const r12 = matchScan(m, guess, await simScan(sim, truth, 12), { maxRangeCm: 250 });
+    assert.ok(r12.confidence < 0.5 || (d(r12.pose, truth) < 8 && angErr(r12.pose.heading, truth.heading) < 5), JSON.stringify(r12));
   }
   const g = relocalize(m, await simScan(sim, { x: 30, y: -20, heading: 15 }, 36));
   assert.ok(d(g.pose, { x: 30, y: -20 }) < 6 && angErr(g.pose.heading, 15) < 4, JSON.stringify(g));
@@ -236,7 +236,9 @@ function realisticSensor(sim, { beamDeg = 25, specDeg = 55, noiseCm = 1.5, false
 
 // Field-like odometry errors on a SimRobot instance: per-leg encoder scale
 // (slip, sigma slipSigma, right wheel 3 % more), encoder noise, integer yaw,
-// 120 ms sensor latency, 3 cm coasting after a stop, and gyro drift.
+// 120 ms sensor latency, 3 cm coasting after a stop, and gyro drift. The sim
+// reads distance and yaw in the same instant, so sweeps use sweepLatencyMs 0
+// (the hardware default of 120 ms would turn every sweep by about 5 deg).
 function fieldErrors(sim, { rand, slipSigma = 0.04, driftDegMin = 2 }) {
   Object.assign(sim, { encNoiseDeg: 1, yawInteger: true, latencyMs: 120, stopCoastCm: 3 });
   const gauss = () => (rand() + rand() + rand() + rand() - 2) * 1.73;
@@ -272,7 +274,7 @@ test('localize: mission with odometry and gyro drift returns home within 8 cm', 
   const map = new GridMap({});
   const pose = new PoseTracker();
   const events = [];
-  const nav = new Navigator({ bus, map, pose, scan, settleMs: 0, sample: makeSimSampler(sim), useYaw: true, beamDeg: 25, maxRangeCm: 150,
+  const nav = new Navigator({ bus, map, pose, scan, settleMs: 0, sample: makeSimSampler(sim), useYaw: true, beamDeg: 25, maxRangeCm: 150, sweepLatencyMs: 0,
     onEvent: (e) => events.push(e) });
   const truth = () => ({ x: sim.state.x - 150, y: 100 - sim.state.y, heading: ((sim.state.heading + 90) % 360 + 540) % 360 - 180 });
   try {
@@ -297,4 +299,215 @@ test('localize: mission with odometry and gyro drift returns home within 8 cm', 
   } finally {
     await sim.disconnect();
   }
+});
+
+test('localize: matchScan covariance: a corridor fixes heading and cross-track, leaves along-track open', () => {
+  const corridor = (x, y) => Math.abs(x) < 40 && Math.abs(y) < 390;
+  const m = mapOf(corridor);
+  const truth = { x: 10, y: 0, heading: 20 };
+  const pts = castScan(corridor, truth, 72);
+  const r = matchScan(m, { x: 18, y: 12, heading: 26 }, pts, { maxRangeCm: 150 });
+  assert.equal(r.axes.heading, true, JSON.stringify(r.cov));
+  assert.equal(r.axes.cross, true);
+  assert.equal(r.axes.along, false);
+  assert.ok(Math.abs(r.pose.x - truth.x) < 4 && angErr(r.pose.heading, truth.heading) < 3, JSON.stringify(r.pose));
+  // the long axis of the ellipse runs along the corridor (+-y)
+  assert.ok(Math.abs(Math.abs(r.cov.axisDeg) - 90) > 60, `axis ${r.cov.axisDeg}`);
+  assert.ok(r.cov.major > 2 * r.cov.minor);
+  assert.ok(r.confidence < 0.3);
+  // an asymmetric room determines everything
+  const l = matchScan(mapOf(lRoom), { x: 30, y: -24, heading: 31 }, castScan(lRoom, { x: 20, y: -30, heading: 25 }, 72), { maxRangeCm: 150 });
+  assert.deepEqual(l.axes, { heading: true, cross: true, along: true });
+  assert.ok(l.confidence > 0.6 && d(l.pose, { x: 20, y: -30 }) < 4, JSON.stringify(l));
+});
+
+test('localize: matchScan uses valid readings only and refuses too few', () => {
+  const m = mapOf(lRoom);
+  const truth = { x: 20, y: -30, heading: 25 };
+  const pts = castScan(lRoom, truth, 72);
+  // no-echo (190 = nothing in range) and failed reads carry no weight
+  const noisy = pts.map((p, i) => (i % 3 === 0 ? { ...p, cm: 190 } : i % 3 === 1 && i % 2 ? { ...p, cm: null } : p));
+  const a = matchScan(m, truth, noisy, { maxRangeCm: 150 });
+  assert.ok(a.valid < pts.length && d(a.pose, truth) < 5, JSON.stringify(a.pose));
+  const few = matchScan(m, truth, pts.slice(0, 10), { maxRangeCm: 150, minValid: 20 });
+  assert.equal(few.confidence, 0);
+  assert.equal(few.reason, 'few readings');
+  assert.equal(matchScan(new GridMap({}), truth, pts).reason, 'empty map');
+  // speed: the largest window
+  const t0 = performance.now();
+  matchScan(m, truth, pts, { maxRangeCm: 150, xyWindowCm: 80, angWindowDeg: 45 });
+  assert.ok(performance.now() - t0 < 150, `${performance.now() - t0} ms`);
+});
+
+// Scripted bus for gating tests: scans read from a scripted table of points.
+function scriptedNav({ localizer, onEvent }) {
+  const bus = { stamped: () => (cmd, args) => ({ cmd, args }), stop: async () => ({ ok: true }) };
+  let script = [];
+  bus.submit = async (c) => {
+    if (c.cmd === 'read') return { ok: true, value: script.shift() ?? 300 };
+    return { ok: true };
+  };
+  const map = new GridMap({});
+  const nav = new Navigator({ bus, map, pose: new PoseTracker(), scan, settleMs: 0, steps: 12, localize: true, localizer, onEvent, maxRangeCm: 150 });
+  return { nav, map, setScript: (s) => { script = [...s]; } };
+}
+
+test('localize: map gating: a rejected scan is pending, not written; frozen maps stay unchanged', async () => {
+  const events = [];
+  let reply = null;
+  const localizer = { matchScan: (map, guess) => reply(guess) };
+  const { nav, map, setScript } = scriptedNav({ localizer, onEvent: (e) => events.push(e) });
+  // a box room seen from the start: 12 readings, all walls within range
+  const room = [60, 70, 90, 120, 90, 70, 60, 70, 90, 120, 90, 70];
+  setScript(room);
+  await nav.scanHere({});                                   // empty map: bootstrap, written
+  const v0 = map.version, H0 = map.H.reduce((a, b) => a + b, 0);
+  assert.ok(H0 > 0 && nav.anchors.length === 1);
+  // an ambiguous match (nothing determined): pending, no hits written
+  reply = (g) => ({ pose: g, confidence: 0, cov: { major: 40, minor: 30, sigmaDeg: 20, axisDeg: 0 }, axes: { heading: false, cross: false, along: false } });
+  nav.pose.x += 30;                                         // far from the anchor
+  setScript(room.map((c) => c - 20));
+  await nav.scanHere({});
+  assert.equal(map.H.reduce((a, b) => a + b, 0), H0, 'no hits written');
+  assert.equal(nav.pendingScans.length, 1);
+  const pend = events.find((e) => e.type === 'scan-pending');
+  assert.ok(pend && /ambiguous/.test(pend.reason) && pend.pose, JSON.stringify(pend));
+  // the next accepted scan is written and the pending one is retried
+  let calls = 0;
+  reply = (g) => { calls++; return { pose: { ...g, x: g.x - 2 }, confidence: 0.9, cov: { major: 3, minor: 2, sigmaDeg: 1, axisDeg: 0, xx: 9, yy: 4, xy: 0, hh: 1 }, axes: { heading: true, cross: true, along: true } }; };
+  setScript(room.map((c) => c - 20));
+  await nav.scanHere({});
+  assert.ok(map.H.reduce((a, b) => a + b, 0) > H0, 'accepted scan written');
+  assert.ok(events.some((e) => e.type === 'scan-accepted' && !e.pending && e.cov));
+  assert.ok(events.some((e) => e.type === 'scan-accepted' && e.pending), 'pending scan retried and written');
+  assert.equal(nav.pendingScans.length, 0);
+  assert.ok(calls >= 2);
+  // frozen: accepted or not, nothing is written; events tell the UI
+  nav.mapFrozen = true;
+  assert.deepEqual(events.at(-1), { type: 'map-frozen', frozen: true });
+  const H1 = map.H.reduce((a, b) => a + b, 0), M1 = map.M.reduce((a, b) => a + b, 0);
+  setScript(room.map((c) => c - 20));
+  await nav.scanHere({});
+  assert.equal(map.H.reduce((a, b) => a + b, 0), H1);
+  assert.equal(map.M.reduce((a, b) => a + b, 0), M1);
+  reply = (g) => ({ pose: g, confidence: 0, cov: { major: 40, minor: 30, sigmaDeg: 20, axisDeg: 0 }, axes: { heading: false, cross: false, along: false } });
+  setScript(room);
+  await nav.scanHere({});
+  assert.equal(nav.pendingScans.length, 0, 'frozen: nothing buffered for writing');
+  nav.mapFrozen = false;
+  assert.deepEqual(events.at(-1), { type: 'map-frozen', frozen: false });
+  assert.ok(v0 > 0);
+});
+
+// Field failure (v0.7.x): rotational drift on the way home, a rescan near a
+// known door is rejected, the sweep was written anyway at the drifted pose,
+// the door was mapped a second time and the robot hit it again and again.
+test('localize: drift through a door and home: no duplicate door, no collision, home within 8 cm', async () => {
+  const rand = rng(2);
+  // two rooms: a partition (sim x 180..185) from the top wall down to y 120, the door below it
+  const OBST = [
+    { kind: 'box', x: 180, y: 0, w: 5, h: 120, label: 'partition' },
+    { kind: 'box', x: 20, y: 0, w: 70, h: 40, label: 'sofa' },
+    { kind: 'circle', x: 60, y: 160, r: 12, label: 'pouf' },
+    { kind: 'circle', x: 250, y: 60, r: 4, label: 'table leg' },
+  ];
+  const START = { x: 110, y: 120 };
+  const sim = new SimRobot({ log: () => {}, onStatus: () => {}, timeScale: 20, obstacles: OBST });
+  Object.assign(sim.state, START);
+  fieldErrors(sim, { rand, driftDegMin: 2 });   // field: about 1.5 to 2 deg/min
+  realisticSensor(sim, { rand });
+  let impacts = 0, last = null;
+  sim.onChange = () => { if (sim.impact && sim.impact !== last) { last = sim.impact; impacts++; } };
+  const bus = new CommandBus({ log: () => {} });
+  bus.setRobot(sim);
+  await sim.connect();
+  const map = new GridMap({});
+  const events = [];
+  const nav = new Navigator({ bus, map, pose: new PoseTracker(), scan, settleMs: 0, sample: makeSimSampler(sim), useYaw: true, beamDeg: 25, maxRangeCm: 150, sweepLatencyMs: 0,
+    onEvent: (e) => events.push(e) });
+  const truth = () => ({ x: sim.state.x - START.x, y: START.y - sim.state.y, heading: ((sim.state.heading + 90) % 360 + 540) % 360 - 180 });
+  try {
+    await nav.scanHere({});
+    for (const g of [{ x: 60, y: -45 }, { x: 140, y: -40 }, { x: 150, y: 30 }]) {   // the last one 31 cm from the table leg
+      const r = await nav.goTo(g);
+      assert.equal(r.reached, true, r.note);
+    }
+    const h = await nav.goHome({});
+    assert.equal(h.ok, true, h.note);
+    const t = truth();
+    assert.ok(Math.hypot(t.x, t.y) < 8, `home ${JSON.stringify(t)}`);
+    assert.equal(impacts, 0, 'no collision');
+    assert.ok(!events.some((e) => e.type === 'crash'));
+    // no second door: confirmed cells near the partition lie on a real surface
+    const surf = (sx, sy) => {
+      let dd = Math.min(sx, sy, 300 - sx, 200 - sy);
+      for (const o of OBST) dd = Math.min(dd, o.kind === 'circle' ? Math.hypot(sx - o.x, sy - o.y) - o.r : Math.hypot(sx - Math.min(o.x + o.w, Math.max(o.x, sx)), sy - Math.min(o.y + o.h, Math.max(o.y, sy))));
+      return dd;
+    };
+    // a second door would be a confirmed copy offset by the drift (field: about
+    // 30 cm); heading drift that is not corrected yet leaves a 12 to 20 cm band.
+    // (Elsewhere the 25 deg cone leaves arcs between close surfaces and in front
+    // of oblique walls, e.g. the table leg and the wall; those are not counted.)
+    let far = 0, band = 0;
+    const farAt = [];
+    map.forEachCell((x, y, s, p, kind) => {
+      const sx = x + START.x, sy = START.y - y, dd = surf(sx, sy);
+      // a copy of the partition, shifted by the drift: near its line and above its end
+      if (kind !== 'occupied' || Math.abs(sx - 182) >= 30 || sy > 140) return;
+      if (dd > 20) { far++; farAt.push([Math.round(sx), Math.round(sy), Math.round(dd)]); }
+      else if (dd > 12) band++;
+    });
+    assert.equal(far, 0, `confirmed cells at the door far from any surface (sim x, y, cm) ${JSON.stringify(farAt)}`);
+    assert.ok(band <= 12, `cells in the drift band at the door ${band}`);
+    // the way home ran on a frozen map
+    const frz = events.filter((e) => e.type === 'map-frozen').map((e) => e.frozen);
+    assert.deepEqual(frz, [true, false]);
+  } finally {
+    await sim.disconnect();
+  }
+});
+
+// The field mechanism without timing: sweeps near a known door from drifted
+// poses (heading 10 deg, 15 to 20 cm off, while the pose sigma claims a few cm)
+// are either corrected before they are written or held back; writing them at
+// the drifted pose, as v0.7 did after a rejected match, maps the door twice.
+test('localize: drifted sweeps at a known door are corrected or held back, never written as a second door', async () => {
+  // two rooms, partition x 30..35 from y -100 up to y 20, door y 20..100
+  const rooms = (x, y) => Math.abs(x) < 150 && Math.abs(y) < 100 && !(x > 30 && x < 35 && y < 20);
+  const truths = [{ x: 10, y: 40, heading: 0 }, { x: 0, y: 55, heading: 30 }, { x: 15, y: 30, heading: -40 }, { x: 5, y: 45, heading: 90 }];
+  const drift = (t, i) => ({ x: t.x + 12 + i, y: t.y - 10, heading: t.heading + 10 });
+  const ghosts = (m) => {
+    let n = 0;
+    m.forEachCell((x, y, s, p, kind) => {
+      if (kind !== 'occupied') return;
+      const dWall = Math.min(150 - Math.abs(x), 100 - Math.abs(y), y < 20 ? Math.max(30 - x, x - 35, 0) : Math.hypot(x < 30 ? 30 - x : x > 35 ? x - 35 : 0, y - 20));
+      if (dWall > 10) n++;
+    });
+    return n;
+  };
+  // v0.7 behaviour (control): written at the drifted pose, twice
+  const old = mapOf(rooms);
+  for (const [i, t] of truths.entries()) for (let r = 0; r < 2; r++) old.integrateScan(drift(t, i), castScan(rooms, t, 72), { beamDeg: 25, maxRangeCm: 150 });
+  assert.ok(ghosts(old) > 3, `control: ghosts ${ghosts(old)}`);
+  // v0.8: match, then write at the corrected pose or hold back
+  const events = [];
+  const { nav, map } = scriptedNav({ localizer: await import('../js/localize.js'), onEvent: (e) => events.push(e) });
+  map.copyFrom(mapOf(rooms));
+  const loc = await import('../js/localize.js');
+  for (let r = 0; r < 2; r++) {
+    for (const [i, t] of truths.entries()) {
+      const guess = drift(t, i);
+      nav.pose.reset(guess);
+      nav.unc = { xy: 4, th: 2 };                       // the gyro believes the heading
+      const pts = castScan(rooms, t, 72);
+      const res = nav.relocalize(loc, guess, pts, { minValid: 20 });
+      const at = res.pose;
+      if (nav.gate(res, at, pts, 'test')) {
+        map.integrateScan(at, pts, { beamDeg: 25, maxRangeCm: 150 });
+        assert.ok(d(at, t) < 6 && angErr(at.heading, t.heading) < 4, `written at ${JSON.stringify(at)}, truth ${JSON.stringify(t)}`);
+      }
+    }
+  }
+  assert.equal(ghosts(map), 0, `ghosts ${ghosts(map)}`);
+  assert.ok(events.filter((e) => e.type === 'scan-accepted').length >= 4, 'most drifted sweeps are corrected');
 });

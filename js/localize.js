@@ -152,17 +152,163 @@ function search(map, f, beams, c, { xyWindowCm, xyStepCm, angWindowDeg, angStepD
 
 const roundPose = (p) => ({ x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, heading: Math.round(normDeg(p.heading) * 10) / 10 });
 
-// Searches a window around guess. confidence 0..1 combines the fit (mean
-// score per beam) and the lead over the best pose more than distinctCm or
-// distinctDeg away inside the window (low in corridors and featureless walls).
+// Matching field (cached per map version): f = Gaussian of the distance to
+// the nearest confirmed cell, suspect cells at MATCH_SUSPECT; ll = tempered
+// log(floor + (1 - floor) f), the per-reading log-likelihood with a uniform
+// floor for random readings and new obstacles (a bounded, robust cost),
+// with f taken relative to the map's strongest evidence.
+const MATCH_FLOOR = 0.1;
+const MATCH_SUSPECT = 0.4;   // suspect cells: a duplicate from one bad sweep must not attract matches
+const TEMPER = 0.8;          // neighbouring readings share overlapping cones: temper their product (calibrated: sigma ~ RMS error in the sim)
+const AXIS_CM = 9, AXIS_DEG = 5; // a component is determined if its sigma (tempered surface) is within this
+function matchField(map, sigmaCm) {
+  const key = `mf${sigmaCm}`;
+  let m = map.cache.get(key);
+  if (m) return m;
+  const d = map.distanceField(L_THRESH), ds = map.distanceField(L_SUSPECT);
+  const f = new Float32Array(d.length), ll = new Float32Array(d.length);
+  const cap = 3 * sigmaCm, g = (x) => (x < cap ? Math.exp(-(x * x) / (2 * sigmaCm * sigmaCm)) : 0);
+  let peak = 0;
+  for (let k = 0; k < d.length; k++) {
+    f[k] = Math.max(g(d[k]), MATCH_SUSPECT * g(ds[k]));
+    if (f[k] > peak) peak = f[k];
+  }
+  // relative to the strongest evidence: a map of suspect cells only (a fresh
+  // map, an anchor scan) matches as sharply as a confirmed one
+  for (let k = 0; k < d.length; k++) ll[k] = TEMPER * Math.log(MATCH_FLOOR + (1 - MATCH_FLOOR) * (peak ? f[k] / peak : 0));
+  m = { f, ll, peak, low: TEMPER * Math.log(MATCH_FLOOR) };
+  map.cache.set(key, m);
+  return m;
+}
+
+// Valid readings only: no echo (>= maxRangeCm) and failed reads say nothing
+// (specular dropouts are not free space).
+function validBeams(points, { sensorOffsetCm = 6, maxRangeCm = 150, minCm = 2 } = {}) {
+  const out = [];
+  for (const p of points ?? []) {
+    const cm = p?.cm == null ? NaN : Number(p.cm);
+    if (Number.isFinite(cm) && cm >= minCm && cm < maxRangeCm) out.push({ a: Number(p.angle) || 0, r: sensorOffsetCm + cm });
+  }
+  return out;
+}
+
+// Correlative scan-to-map matching (Olson 2009, with Karto's odometry prior).
+// Every pose of the window (xyStepCm, angStepDeg) is scored with integer
+// lookups; the best is refined with bilinear lookups. The score surface,
+// as probabilities exp(score - best), gives the pose covariance, which
+// captures both noise and ambiguity: a corridor or a door wall gives a long
+// ellipse (along-track undetermined) while heading and cross-track stay
+// tight. Returns
+//   { pose, score, confidence, cov: { xx, xy, yy, hh, major, minor, axisDeg, sigmaDeg },
+//     axes: { heading, cross, along }, valid, support, fit, runnerUp, reason? }
+// sigmas in cm / deg; axisDeg is the direction of the major (least certain)
+// axis, clockwise from +y; axes say which components are well determined.
+// confidence (0..1) is high only when all three are. The prior penalises
+// distance from the guess (sigmas priorCm / priorDeg, default a third of the
+// window) with Karto-style floors (0.5 / 0.9), so it breaks ties without
+// overruling the sensor.
 export function matchScan(map, guess, points, { xyWindowCm = 40, xyStepCm = 5, angWindowDeg = 20, angStepDeg = 2,
-  distinctCm = 20, distinctDeg = 20, sigmaCm = SIGMA_CM, ...beamOpts } = {}) {
-  const beams = prepare(points, beamOpts);
+  sigmaCm = SIGMA_CM, minValid = 8, priorCm, priorDeg, nmsCm = 15, nmsDeg = 5, ...beamOpts } = {}) {
   const g = { x: guess.x, y: guess.y, heading: guess.heading ?? 0 };
-  if (!beams.hits.length) return { pose: roundPose(g), score: 0, confidence: 0 };
-  const f = likelihoodField(map, sigmaCm);
-  const { best, runner } = search(map, f, beams, g, { xyWindowCm, xyStepCm, angWindowDeg, angStepDeg, distinctCm, distinctDeg });
-  return { pose: roundPose(best), score: best.score, confidence: confidence(beams, best.score, runner?.score) };
+  const beams = validBeams(points, beamOpts);
+  const none = (reason) => ({ pose: roundPose(g), score: 0, confidence: 0, cov: null, axes: { heading: false, cross: false, along: false }, valid: beams.length, support: 0, fit: 0, runnerUp: null, reason });
+  if (beams.length < Math.max(1, minValid)) return none('few readings');
+  const { f, ll, peak, low } = matchField(map, sigmaCm);
+  if (!(peak > 0)) return none('empty map');
+  const n = map.n, cell = map.cellCm, half = map.half;
+  const step = Math.max(1, Math.round(xyStepCm / cell));          // in cells
+  const nX = Math.max(1, Math.round(xyWindowCm / (step * cell)));
+  const nA = Math.max(1, Math.round(angWindowDeg / angStepDeg));
+  const pCm = priorCm ?? Math.max(5, xyWindowCm / 3), pDeg = priorDeg ?? Math.max(2, angWindowDeg / 3);
+  const W = 2 * nX + 1, A = 2 * nA + 1;
+  const S = new Float32Array(A * W * W);
+  const gi = Math.floor((g.x + half) / cell), gj = Math.floor((g.y + half) / cell);
+  const fx0 = g.x - ((gi + 0.5) * cell - half), fy0 = g.y - ((gj + 0.5) * cell - half); // guess offset in its cell
+  let bestK = 0, bestS = -Infinity;
+  const di = new Int32Array(beams.length), dj = new Int32Array(beams.length);
+  for (let a = -nA; a <= nA; a++) {
+    const h = g.heading + a * angStepDeg;
+    for (let b = 0; b < beams.length; b++) {
+      const t = rad(h + beams[b].a);
+      di[b] = Math.round((fx0 + beams[b].r * Math.sin(t)) / cell);
+      dj[b] = Math.round((fy0 + beams[b].r * Math.cos(t)) / cell);
+    }
+    const priorA = Math.log(Math.max(0.9, Math.exp(-0.5 * ((a * angStepDeg) / pDeg) ** 2)));
+    for (let j = -nX; j <= nX; j++) {
+      for (let i = -nX; i <= nX; i++) {
+        const ci = gi + i * step, cj = gj + j * step;
+        let sc = 0;
+        for (let b = 0; b < beams.length; b++) {
+          const ii = ci + di[b], jj = cj + dj[b];
+          sc += ii < 0 || jj < 0 || ii >= n || jj >= n ? low : ll[jj * n + ii];
+        }
+        const dcm = Math.hypot(i, j) * step * cell;
+        sc += priorA + Math.log(Math.max(0.5, Math.exp(-0.5 * (dcm / pCm) ** 2)));
+        const k = ((a + nA) * W + (j + nX)) * W + (i + nX);
+        S[k] = sc;
+        if (sc > bestS) { bestS = sc; bestK = k; }
+      }
+    }
+  }
+  const unpack = (k) => {
+    const i = (k % W) - nX, j = (Math.floor(k / W) % W) - nX, a = Math.floor(k / (W * W)) - nA;
+    return { dx: i * step * cell, dy: j * step * cell, dh: a * angStepDeg };
+  };
+  // covariance of the score surface (Olson): p = exp(s - best)
+  let sw = 0, mx = 0, my = 0, mh = 0, xx = 0, xy = 0, yy = 0, hh = 0, runner = null;
+  const b0 = unpack(bestK);
+  for (let k = 0; k < S.length; k++) {
+    const u = unpack(k), w = Math.exp(S[k] - bestS);
+    sw += w; mx += w * u.dx; my += w * u.dy; mh += w * u.dh;
+    xx += w * u.dx * u.dx; xy += w * u.dx * u.dy; yy += w * u.dy * u.dy; hh += w * u.dh * u.dh;
+    // runner-up: best pose outside the suppression neighbourhood of the peak
+    if ((Math.abs(u.dx - b0.dx) > nmsCm || Math.abs(u.dy - b0.dy) > nmsCm || Math.abs(u.dh - b0.dh) > nmsDeg) && (!runner || S[k] > runner.s)) runner = { s: S[k], ...u };
+  }
+  mx /= sw; my /= sw; mh /= sw;
+  const minVar = (step * cell) ** 2 / 4, minH = angStepDeg ** 2 / 4;
+  const cxx = xx / sw - mx * mx + minVar, cyy = yy / sw - my * my + minVar, cxy = xy / sw - mx * my, chh = hh / sw - mh * mh + minH;
+  const tr = cxx + cyy, det = cxx * cyy - cxy * cxy, disc = Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
+  const major = Math.sqrt(tr / 2 + disc), minor = Math.sqrt(Math.max(0, tr / 2 - disc));
+  // major axis direction (clockwise from +y, i.e. atan2(x, y))
+  const ex = Math.abs(cxy) > 1e-9 ? tr / 2 + disc - cyy : cxx >= cyy ? 1 : 0, ey = Math.abs(cxy) > 1e-9 ? cxy : cxx >= cyy ? 0 : 1;
+  const axisDeg = normDeg((Math.atan2(ex, ey) * 180) / Math.PI);
+  const sigmaDeg = Math.sqrt(chh);
+  // refine the peak with bilinear lookups
+  let best = { x: g.x + b0.dx, y: g.y + b0.dy, heading: g.heading + b0.dh };
+  const llAt = (x, y) => TEMPER * Math.log(MATCH_FLOOR + (1 - MATCH_FLOOR) * sample(map, f, x, y) / peak);
+  const scoreAtPose = (p) => {
+    let sc = 0;
+    for (const bm of beams) { const t = rad(p.heading + bm.a); sc += llAt(p.x + bm.r * Math.sin(t), p.y + bm.r * Math.cos(t)); }
+    return sc;
+  };
+  let bestFine = scoreAtPose(best);
+  for (let st = (step * cell) / 2, sa = angStepDeg / 2, r = 0; r < 3; r++, st /= 2, sa /= 2) {
+    const c0 = best;
+    for (let a = -1; a <= 1; a++) for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+      const p = { x: c0.x + i * st, y: c0.y + j * st, heading: c0.heading + a * sa };
+      const sc = scoreAtPose(p);
+      if (sc > bestFine) { bestFine = sc; best = p; }
+    }
+  }
+  // support: readings that land near mapped structure; fit: their mean field, relative to the map's peak
+  let support = 0, fsum = 0;
+  for (const bm of beams) {
+    const t = rad(best.heading + bm.a), v = sample(map, f, best.x + bm.r * Math.sin(t), best.y + bm.r * Math.cos(t));
+    if (v > 0.05 * peak) { support++; fsum += v / peak; }
+  }
+  const fit = support ? fsum / support : 0;
+  const axes = { heading: sigmaDeg <= AXIS_DEG, cross: minor <= AXIS_CM, along: major <= AXIS_CM };
+  const gate = (v, good, bad) => clamp01((bad - v) / (bad - good));
+  const enough = support >= Math.max(minValid, beams.length * 0.3) ? 1 : 0;
+  const confidence = Math.round(enough * clamp01((fit - 0.2) / 0.4) * gate(major, 6, 20) * gate(sigmaDeg, 3, 9) * 1000) / 1000;
+  const r1 = (v) => Math.round(v * 10) / 10;
+  return {
+    pose: roundPose(best), score: bestFine, confidence,
+    cov: { xx: r1(cxx), xy: r1(cxy), yy: r1(cyy), hh: r1(chh), major: r1(major), minor: r1(minor), axisDeg: r1(axisDeg), sigmaDeg: r1(sigmaDeg) },
+    axes, valid: beams.length, support, fit: Math.round(fit * 100) / 100,
+    runnerUp: runner ? { pose: roundPose({ x: g.x + runner.dx, y: g.y + runner.dy, heading: g.heading + runner.dh }), score: runner.s - bestS } : null,
+    ...(enough ? {} : { reason: 'little structure' }),
+  };
 }
 
 // Global search for a loaded map: every free cell with room for the robot

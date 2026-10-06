@@ -85,8 +85,13 @@ export class SimRobot {
   //   encNoiseDeg   uniform noise on each encoder reading
   //   latencyMs     sensor query round trip for makeSimSampler (read halfway)
   //   stopCoastCm   distance a linear motion rolls on after stop()
+  //   gyroDriftDegPerMin  gyro bias: the yaw reading drifts this much per
+  //                 minute of simulated time, moving or not
+  //   floorJumps    [{ atCm, deg }]: after atCm of driving the body turns by
+  //                 deg (threshold, rug edge); the gyro sees it, the encoders do not
   constructor({ log, onStatus, onChange, timeScale = 1, obstacles = OBSTACLES, room = ROOM, encScale = [1, 1],
-    turnError = 0, yawMode = 'wrap', yawInteger = false, encNoiseDeg = 0, latencyMs = 0, stopCoastCm = 0 }) {
+    turnError = 0, yawMode = 'wrap', yawInteger = false, encNoiseDeg = 0, latencyMs = 0, stopCoastCm = 0,
+    gyroDriftDegPerMin = 0, floorJumps = [] }) {
     this.kind = 'sim';
     this.timeScale = timeScale;
     this.obstacles = obstacles;
@@ -101,7 +106,10 @@ export class SimRobot {
     this.startHeading = this.state.heading;
     this.enc = [0, 0];      // cumulative wheel angles in degrees, forward-positive
     this.encScale = encScale;
-    Object.assign(this, { turnError, yawMode, yawInteger, encNoiseDeg, latencyMs, stopCoastCm });
+    Object.assign(this, { turnError, yawMode, yawInteger, encNoiseDeg, latencyMs, stopCoastCm, gyroDriftDegPerMin });
+    this.floorJumps = floorJumps.map((j) => ({ ...j, done: false }));
+    this.odoCm = 0;          // distance driven, for floorJumps
+    this.gyroT0 = this.simSecs();
     this.impact = null;     // { at: sim seconds, ms2 } of the last collision
     this.motion = null; // {vLin cm/s, vAng deg/s, until}
     this.connected = false;
@@ -152,6 +160,8 @@ export class SimRobot {
         break;
       }
       this.turnWheels((m.vLin * dt) / n, 0);
+      this.odoCm += Math.abs((m.vLin * dt) / n);
+      for (const j of this.floorJumps) if (!j.done && this.odoCm >= j.atCm) { j.done = true; s.heading += j.deg; }
       s.x = x; s.y = y;
     }
     this.onChange?.(s);
@@ -230,7 +240,8 @@ export class SimRobot {
   async yaw() { return this.yawNow(); }
 
   yawNow() {
-    const raw = this.state.heading - this.startHeading;
+    const drift = (this.gyroDriftDegPerMin * (this.simSecs() - this.gyroT0)) / 60;
+    const raw = this.state.heading - this.startHeading + drift;
     const d = this.yawMode === 'unbounded' ? raw : ((raw % 360) + 540) % 360 - 180;
     return this.yawInteger ? Math.round(d) : Math.round(d * 10) / 10;
   }

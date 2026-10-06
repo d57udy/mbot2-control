@@ -15,14 +15,71 @@ const FALLBACK = {
   '--bg': '#f4f5f7', '--surface': '#ffffff', '--border': '#d5d9e0', '--text': '#1b1f27',
   '--muted': '#667085', '--accent': '#2f6fde', '--stop': '#d92d20', '--ok': '#12805c', '--warn': '#b54708' };
 
-function colours() {
-  let css = null;
+// Map colours: optional CSS variables, else derived for light or dark mode
+// (from the brightness of --bg). Confirmed obstacles run from occLo at
+// p = OCC_P_LO to occHi at OCC_P_HI: light grey-blue to near-black on a light
+// page, dim grey-blue to near-white on a dark one.
+const MAP_FALLBACK = {
+  light: { '--map-occ-lo': '#a9bbd0', '--map-occ-hi': '#11151c', '--map-suspect': '#f79009', '--map-contact': '#d92d20', '--map-pending': '#8a94a6' },
+  dark: { '--map-occ-lo': '#4b5d78', '--map-occ-hi': '#f2f4f7', '--map-suspect': '#fdb022', '--map-contact': '#f04438', '--map-pending': '#7d8799' },
+};
+export const OCC_P_LO = 0.65;
+export const OCC_P_HI = 0.95;
+const OCC_STEPS = 12; // gradient buckets, enough to look continuous
+
+function rgbOf(col) {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(col).trim());
+  if (m) { const n = parseInt(m[1], 16); return [n >> 16, (n >> 8) & 255, n & 255]; }
+  const r = /rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/i.exec(String(col));
+  return r ? [Number(r[1]), Number(r[2]), Number(r[3])] : null;
+}
+
+const hex = (rgb) => `#${rgb.map((v) => Math.round(Math.min(255, Math.max(0, v))).toString(16).padStart(2, '0')).join('')}`;
+
+export function isDark(bg) {
+  const rgb = rgbOf(bg);
+  return !!rgb && 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2] < 128;
+}
+
+// Colour of a confirmed obstacle cell with probability p (clamped to the range).
+export function occupiedColour(p, c = colours()) {
+  const t = finite(p) ? Math.min(1, Math.max(0, (p - OCC_P_LO) / (OCC_P_HI - OCC_P_LO))) : 1;
+  const a = rgbOf(c.occLo), b = rgbOf(c.occHi);
+  if (!a || !b) return t < 0.5 ? c.occLo : c.occHi;
+  return hex(a.map((v, i) => v + (b[i] - v) * t));
+}
+
+export function colours(css = null) {
   try {
-    if (typeof document !== 'undefined' && typeof getComputedStyle === 'function') css = getComputedStyle(document.documentElement);
+    if (!css && typeof document !== 'undefined' && typeof getComputedStyle === 'function') css = getComputedStyle(document.documentElement);
   } catch { /* no DOM */ }
+  const get = (name, fb) => css?.getPropertyValue?.(name)?.trim() || fb;
   const out = {};
-  for (const [name, fb] of Object.entries(FALLBACK)) out[name.slice(2)] = css?.getPropertyValue(name).trim() || fb;
+  for (const [name, fb] of Object.entries(FALLBACK)) out[name.slice(2)] = get(name, fb);
+  const mode = MAP_FALLBACK[isDark(out.bg) ? 'dark' : 'light'];
+  out.occLo = get('--map-occ-lo', mode['--map-occ-lo']);
+  out.occHi = get('--map-occ-hi', mode['--map-occ-hi']);
+  out.suspect = get('--map-suspect', mode['--map-suspect']);
+  out.contact = get('--map-contact', mode['--map-contact']);
+  out.pending = get('--map-pending', mode['--map-pending']);
   return out;
+}
+
+// Legend entries for an HTML legend. style: 'fill' (colour square), 'gradient'
+// (colour -> colour2), 'dot' (filled point with a ray), 'hollow' (open point,
+// dashed ray), 'border' (dashed outline). css is a ready background value.
+export function mapLegend({ css = null } = {}) {
+  const c = colours(css);
+  return [
+    { key: 'free', label: 'Frei', colour: c.surface, style: 'fill', css: c.surface },
+    { key: 'unknown', label: 'Unbekannt', colour: c.bg, style: 'fill', css: c.bg },
+    { key: 'occupied', label: 'Hindernis (heller = unsicherer)', colour: c.occLo, colour2: c.occHi, style: 'gradient', css: `linear-gradient(90deg, ${c.occLo}, ${c.occHi})` },
+    { key: 'suspect', label: 'Hindernis, einmal gesehen', colour: c.suspect, style: 'fill', alpha: 0.55, css: c.suspect },
+    { key: 'contact', label: 'Anstoß (vorübergehend)', colour: c.contact, style: 'fill', alpha: 0.7, css: c.contact },
+    { key: 'scan', label: 'Letzter Scan', colour: c.accent, style: 'dot', css: c.accent },
+    { key: 'pending', label: 'Scan nicht übernommen', colour: c.pending, style: 'hollow', css: c.pending },
+    { key: 'frozen', label: 'Karte eingefroren', colour: c.warn, style: 'border', css: c.warn },
+  ];
 }
 
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
@@ -114,7 +171,12 @@ export function fitView(canvas, map, pose, { marginCm = 40, minSpanCm = 200, rot
 // Screen direction of a heading (clockwise from up), y down.
 const dir = (deg) => { const a = (deg * Math.PI) / 180; return { x: Math.sin(a), y: -Math.cos(a) }; };
 
-export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastScan, view } = {}) {
+// opts: view, path, goal, frontiers, trail;
+//   lastScan { pose, points, age? }: the latest accepted scan (accent, fades with age 0..2);
+//   recentScans [{ pose, points, age? }]: newest first, instead of lastScan, age defaults to the index;
+//   pendingScans [{ pose, points }]: rejected sweeps, grey hollow points, dashed rays, "nicht übernommen";
+//   frozen: true draws a dashed border and the badge "Karte eingefroren".
+export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastScan, recentScans, pendingScans, frozen = false, view } = {}) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   const c = colours();
@@ -135,7 +197,7 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
   const cpx = cellCm / v.cmPerPx + 0.5; // slight overlap hides seams
   if (map?.forEachCell) {
     const free = [];
-    const occ = [[], [], [], []];
+    const occ = Array.from({ length: OCC_STEPS + 1 }, () => []); // by p, OCC_P_LO .. OCC_P_HI
     const suspect = []; // hit evidence not yet confirmed by a second scan (evidence model v2)
     const contact = []; // crash contacts: temporary, expire after a few scans
     map.forEachCell((x, y, state, p, kind) => {
@@ -146,8 +208,8 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
       if (kind === 'contact') contact.push(q);
       else if (kind === 'suspect') suspect.push(q);
       else if (state === 'occupied') {
-        const k = finite(p) && p >= 0 && p <= 1 ? Math.min(3, Math.max(0, Math.floor((p - 0.5) * 8))) : 3;
-        occ[k].push(q);
+        const t = finite(p) ? (p - OCC_P_LO) / (OCC_P_HI - OCC_P_LO) : 1;
+        occ[Math.round(Math.min(1, Math.max(0, t)) * OCC_STEPS)].push(q);
       } else free.push(q);
     });
     // cells are drawn axis-aligned in a context turned about the canvas centre
@@ -161,9 +223,9 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
       ctx.fill();
     };
     fill(free, c.surface, 1);
-    fill(suspect, c.warn, 0.45);
-    fill(contact, c.stop, 0.55);
-    occ.forEach((list, k) => fill(list, c.text, 0.4 + k * 0.2));
+    occ.forEach((list, k) => fill(list, occupiedColour(OCC_P_LO + ((OCC_P_HI - OCC_P_LO) * k) / OCC_STEPS, c), 1));
+    fill(suspect, c.suspect, 0.55);
+    fill(contact, c.contact, 0.7);
     ctx.globalAlpha = 1;
     if (rot) ctx.restore();
   }
@@ -209,23 +271,45 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
   ctx.textBaseline = 'bottom';
   ctx.fillText('1 m', sx + 4 * dpr, sy - 3 * dpr);
 
-  // last scan rays from the pose they were taken at
-  const sp = lastScan?.pose;
-  if (sp && finite(sp.x) && finite(sp.y) && Array.isArray(lastScan.points)) {
-    ctx.strokeStyle = c.accent;
-    ctx.fillStyle = c.accent;
-    ctx.lineWidth = dpr;
+  // scans: pending (not integrated) first, then the accepted ones on top, newest last
+  const scanRays = (scan, { colour, alpha, hollow }) => {
+    const sp = scan?.pose;
+    if (!sp || !finite(sp.x) || !finite(sp.y) || !Array.isArray(scan.points)) return false;
+    const o = P(sp.x, sp.y);
     const dot = Math.max(2 * dpr, 2 / v.cmPerPx);
-    for (const p of lastScan.points) {
+    ctx.strokeStyle = colour;
+    ctx.fillStyle = colour;
+    ctx.lineWidth = dpr;
+    ctx.setLineDash(hollow ? [3 * dpr, 3 * dpr] : []);
+    for (const p of scan.points) {
       if (!finite(p?.cm) || !finite(p?.angle)) continue;
       const d = sdir((sp.heading ?? 0) + p.angle);
-      const o = P(sp.x, sp.y);
       const r0 = SENSOR_CM / v.cmPerPx, r1 = (SENSOR_CM + Math.min(p.cm, NO_ECHO_CM)) / v.cmPerPx;
-      ctx.globalAlpha = 0.35;
+      ctx.globalAlpha = alpha * (hollow ? 0.5 : 0.35);
       ctx.beginPath(); ctx.moveTo(o.x + d.x * r0, o.y + d.y * r0); ctx.lineTo(o.x + d.x * r1, o.y + d.y * r1); ctx.stroke();
-      ctx.globalAlpha = 1;
-      if (p.cm < NO_ECHO_CM) { ctx.beginPath(); ctx.arc(o.x + d.x * r1, o.y + d.y * r1, dot, 0, Math.PI * 2); ctx.fill(); }
+      if (p.cm >= NO_ECHO_CM) continue;
+      ctx.globalAlpha = alpha;
+      ctx.beginPath(); ctx.arc(o.x + d.x * r1, o.y + d.y * r1, dot * (hollow ? 1.3 : 1), 0, Math.PI * 2);
+      if (hollow) { ctx.setLineDash([]); ctx.stroke(); ctx.setLineDash([3 * dpr, 3 * dpr]); } else ctx.fill();
     }
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    return true;
+  };
+  for (const scan of Array.isArray(pendingScans) ? pendingScans : []) {
+    if (!scanRays(scan, { colour: c.pending, alpha: 0.9, hollow: true })) continue;
+    const o = P(scan.pose.x, scan.pose.y);
+    ctx.font = `${font}px system-ui`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = c.pending;
+    ctx.fillText('nicht übernommen', o.x + 8 * dpr, o.y - 10 * dpr);
+  }
+  const accepted = Array.isArray(recentScans) ? recentScans : lastScan ? [lastScan] : [];
+  for (let i = accepted.length - 1; i >= 0; i--) {
+    const age = finite(accepted[i]?.age) ? accepted[i].age : i;
+    if (age >= 3) continue; // fresh for this and the next two scans
+    scanRays(accepted[i], { colour: c.accent, alpha: [1, 0.55, 0.25][Math.max(0, Math.floor(age))], hollow: false });
   }
 
   // frontiers
@@ -301,6 +385,28 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
+  }
+
+  // frozen: the map is not being updated (dashed border and a badge, top left)
+  if (frozen) {
+    ctx.strokeStyle = c.warn;
+    ctx.lineWidth = 2 * dpr;
+    ctx.setLineDash([8 * dpr, 6 * dpr]);
+    ctx.strokeRect(dpr, dpr, w - 2 * dpr, h - 2 * dpr);
+    ctx.setLineDash([]);
+    const text = 'Karte eingefroren', pad = 6 * dpr;
+    ctx.font = `${font}px system-ui`;
+    const tw = ctx.measureText?.(text)?.width || text.length * font * 0.55;
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = c.surface;
+    ctx.fillRect(8 * dpr, 8 * dpr, tw + 2 * pad, font + 2 * pad);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = dpr;
+    ctx.strokeRect(8 * dpr, 8 * dpr, tw + 2 * pad, font + 2 * pad);
+    ctx.fillStyle = c.warn;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 8 * dpr + pad, 8 * dpr + pad + font / 2);
   }
   ctx.restore();
 }

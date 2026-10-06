@@ -26,7 +26,7 @@
 // the map keeps adapting when something moves.
 //
 // States (kindOf): 'occupied' (confirmed: p >= P_OCC and hits from at least
-// two scans, or one head-on hit closer than NEAR_CM), 'suspect' (hit evidence
+// two scans; one sweep alone never confirms), 'suspect' (hit evidence
 // that is not confirmed, p >= 1/2), 'free' (p < P_FREE), 'unknown'.
 // Consumers that read log-odds use L, a view derived from the evidence:
 // confirmed > L_THRESH, suspect in (L_SUSPECT, L_THRESH], free < -L_THRESH.
@@ -51,7 +51,7 @@ const PRIOR = 0.5;             // Beta prior per side
 const EVIDENCE_CAP = 12;       // H + M is scaled down to this
 const HIT_EDGE = 0.3;          // hit weight at the beam edge (1 at the centre)
 const HIT_COUNTS = 0.5;        // a hit at least this strong counts as a hit scan
-const NEAR_CM = 60;            // a head-on core hit closer than this confirms at once
+const NEAR_CM = 60;            // a head-on core hit closer than this is flagged (cellInfo near)
 const MISS_MARGIN_CM = 8;      // misses on hit cells only this far short of the reading
 const MISS_FULL_CM = 50;       // hit and miss weights are 1 up to this range ...
 const MISS_FAR = 0.4;          // ... and fall to this at maxRange (far arcs are wide)
@@ -100,7 +100,7 @@ export class GridMap {
     this.H = new Float32Array(N);      // hit evidence
     this.M = new Float32Array(N);      // miss evidence
     this.S = new Uint16Array(N);       // scans with a hit of at least HIT_COUNTS
-    this.near = new Uint8Array(N);     // 1 = head-on hit closer than NEAR_CM
+    this.near = new Uint8Array(N);     // 1 = head-on hit closer than NEAR_CM (informational)
     this.seen = new Int32Array(N);     // scan id of the last observation (0 = never)
     this.hitSid = new Int32Array(N);   // per-scan bookkeeping: strongest hit / miss so far
     this.hitW = new Float32Array(N);
@@ -176,7 +176,8 @@ export class GridMap {
   // Occupancy probability from the evidence (0.5 = nothing known).
   prob(k) { return (this.H[k] + PRIOR) / (this.H[k] + this.M[k] + 2 * PRIOR); }
 
-  confirmed(k) { return this.prob(k) >= P_OCC && (this.S[k] >= 2 || this.near[k] === 1); }
+  // Hits from two scans: one sweep alone (even a bad one) cannot confirm a cell.
+  confirmed(k) { return this.prob(k) >= P_OCC && this.S[k] >= 2; }
 
   // 'occupied' | 'suspect' | 'free' | 'unknown'
   // 'contact' | 'occupied' | 'suspect' | 'free' | 'unknown'

@@ -177,3 +177,9 @@ details input[type="password"] { flex: 1; font: inherit; color: var(--text); bac
 #lab-plot { width: 100%; max-width: 360px; aspect-ratio: 1; display: block; margin: 8px auto; }
 #lab-text { white-space: pre-wrap; font-size: 12px; margin: 6px 0; }
 .map-info { margin: 4px 0; padding: 6px 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; list-style: none; padding: 0; margin: 4px 0; }
+.legend .swatch { display: inline-block; width: 14px; height: 10px; border-radius: 2px; vertical-align: middle; border: 1px solid var(--border); }
+.legend-gradient { width: 28px !important; }
+.legend-dot { border-radius: 50% !important; width: 8px !important; height: 8px !important; }
+.legend-hollow { background: none !important; border: 1.5px solid; border-radius: 50% !important; width: 8px !important; height: 8px !important; }
+.legend-border { background: none !important; border: 2px dashed; }

@@ -42,20 +42,22 @@ test('gridmap: a far hit is suspect after one scan, confirmed after a second one
   assert.ok(b.minY < 0 && b.maxY >= 105 && b.minX < -5 && b.maxX > 5);
 });
 
-test('gridmap: a head-on hit closer than 60 cm is confirmed at once', () => {
+test('gridmap: one scan never confirms, not even a close head-on hit (v0.8)', () => {
   const m = new GridMap({});
   m.integrateScan(O, [{ angle: 0, cm: 40 }]);
-  assert.equal(m.kind(0, 46), 'occupied');
+  assert.equal(m.kind(0, 46), 'suspect');
   assert.equal(m.cellInfo(0, 46).near, true);
+  m.integrateScan(O, [{ angle: 0, cm: 40 }]);
+  assert.equal(m.kind(0, 46), 'occupied');
   // the arc edges are not head-on
   assert.equal(m.kind(Math.sin((7 * Math.PI) / 180) * 46, Math.cos((7 * Math.PI) / 180) * 46), 'suspect');
 });
 
 test('gridmap: heading and angle rotate the beam clockwise; failed reads are ignored', () => {
   const m = new GridMap({});
-  m.integrateScan({ x: 0, y: 0, heading: 90 }, [{ angle: 0, cm: 50 }, { angle: 90, cm: 40 }, { angle: 180, cm: null }]);
+  for (let i = 0; i < 2; i++) m.integrateScan({ x: 0, y: 0, heading: 90 }, [{ angle: 0, cm: 50 }, { angle: 90, cm: 40 }, { angle: 180, cm: null }]);
   assert.equal(m.cell(30, 0), 'free');           // heading 90 = right
-  assert.equal(m.cell(56, 0), 'occupied');       // head-on and close: confirmed
+  assert.equal(m.cell(56, 0), 'occupied');       // two scans: confirmed
   assert.equal(m.cell(0, -46), 'occupied');      // 90 + 90 = behind the start
   assert.equal(m.cell(-30, 0), 'unknown');       // null reading
 });
@@ -164,7 +166,8 @@ test('gridmap: a well-confirmed wall survives specular ghosts', () => {
 
 test('gridmap: cleanup removes unconfirmed single-scan hits only', () => {
   const m = new GridMap({});
-  m.integrateScan(O, [{ angle: 0, cm: 100 }, { angle: 90, cm: 40 }]);   // far: suspect, near: confirmed
+  m.integrateScan(O, [{ angle: 0, cm: 100 }]);   // one scan: suspect
+  for (let i = 0; i < 2; i++) m.integrateScan(O, [{ angle: 90, cm: 40 }]);   // two scans: confirmed
   m.integrateScan({ x: 0, y: 0, heading: 180 }, [{ angle: 0, cm: 120 }]);
   m.integrateScan({ x: 0, y: 0, heading: 180 }, [{ angle: 0, cm: 120 }]); // two scans: confirmed
   assert.equal(m.kind(0, 106), 'suspect');
@@ -179,6 +182,7 @@ test('gridmap: cleanup removes unconfirmed single-scan hits only', () => {
 
 test('gridmap: cellInfo, aging, legacy log-odds writes and add()', () => {
   const m = new GridMap({ decayAfterScans: 2, decayRate: 0.5 });
+  m.beginScan(); m.integrateScan(O, [{ angle: 0, cm: 40 }]); m.endScan();
   m.integrateScan(O, [{ angle: 0, cm: 40 }]);
   const c = m.cellInfo(0, 46);
   assert.deepEqual(Object.keys(c).sort(), ['contact', 'contactAge', 'evidence', 'hits', 'lastSeen', 'misses', 'near', 'p', 'scans', 'scansAgo', 'state', 'x', 'y'].sort());
@@ -271,7 +275,7 @@ test('gridmap: describe is compact and relative to the heading', () => {
 test('gridmap: clear, forEachCell, JSON round trip (v2 evidence, v1 read)', () => {
   const m = new GridMap({});
   m.integrateScan(O, [{ angle: 30, cm: 80 }]);
-  m.integrateScan(O, [{ angle: 0, cm: 40 }]);
+  for (let i = 0; i < 2; i++) m.integrateScan(O, [{ angle: 0, cm: 40 }]);
   const v = m.version;
   const j = JSON.parse(JSON.stringify(m));
   assert.equal(j.v, 2);
@@ -397,7 +401,7 @@ test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and 
     if (d > 8 && d <= 20 && kind === 'occupied') bias++;
   });
   // wall points within range of a pose with a confirmed cell within 5 cm
-  let wall = 0, wallOk = 0;
+  let wall = 0, wallOk = 0, wallSeen = 0;
   const pts = [];
   for (let t = -145; t <= 145; t += 5) pts.push({ x: t, y: ROOM.y0 }, { x: t, y: ROOM.y1 });
   for (let t = -95; t <= 95; t += 5) pts.push({ x: ROOM.x0, y: t }, { x: ROOM.x1, y: t });
@@ -405,14 +409,23 @@ test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and 
   for (const q of pts) {
     if (!poses.some((p) => Math.hypot(q.x - p.x, q.y - p.y) < 120)) continue;
     wall++;
-    let ok = false;
-    for (let dx = -5; dx <= 5; dx += 5) for (let dy = -5; dy <= 5; dy += 5) if (m.kind(q.x + dx, q.y + dy) === 'occupied') ok = true;
+    let ok = false, seen = false;
+    for (let dx = -5; dx <= 5; dx += 5) {
+      for (let dy = -5; dy <= 5; dy += 5) {
+        const k = m.kind(q.x + dx, q.y + dy);
+        if (k === 'occupied') ok = true;
+        if (k === 'occupied' || k === 'suspect') seen = true;
+      }
+    }
     if (ok) wallOk++;
+    if (seen) wallSeen++;
   }
   assert.equal(phantoms.occupied.length, 0, `confirmed phantoms ${JSON.stringify(phantoms.occupied)}`);
   assert.ok(phantoms.suspect.length <= 8, `suspect phantoms ${phantoms.suspect.length}`);
   assert.ok(bias <= 20, `confirmed cells in front of surfaces ${bias}`);
-  assert.ok(wallOk / wall > 0.7, `walls confirmed ${wallOk}/${wall}`);
+  // one sweep never confirms: wall stretches seen from one pose only stay suspect
+  assert.ok(wallOk / wall > 0.6, `walls confirmed ${wallOk}/${wall}`);
+  assert.ok(wallSeen / wall > 0.85, `walls seen ${wallSeen}/${wall}`);
   // nothing of the removed chair is left confirmed
   m.forEachCell((x, y, s, p, kind) => {
     if (kind === 'occupied') assert.ok(!(x > CHAIR.x0 - 3 && x < CHAIR.x1 + 3 && y > CHAIR.y0 - 3 && y < CHAIR.y1 + 3), `chair cell ${x},${y}`);
