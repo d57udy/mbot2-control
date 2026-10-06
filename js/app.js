@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.7.3';
+export const APP_VERSION = '0.7.4';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -815,13 +815,14 @@ function navEventText(e) {
     case 'scan': return `Nav Scan${e.reason ? ` (${e.reason})` : ''}${e.method ? `, ${e.method}` : ''} bei ${poseText(e.pose)}`;
     case 'localized': {
       const c = e.correction ?? {};
-      return `Nav Korrektur: dx ${r0(c.dx)} cm, dy ${r0(c.dy)} cm, dh ${r0(c.dh)}°, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.applied === false || e.source === 'odom' ? ' (verworfen)' : ''}`;
+      return `Nav Korrektur${e.ref === 'anchor' ? ' (gegen Startscan)' : ''}: dx ${r0(c.dx)} cm, dy ${r0(c.dy)} cm, dh ${r0(c.dh)}°, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.applied === false || e.source === 'odom' ? ' (verworfen)' : ''}`;
     }
     case 'crash': return `! Nav Zusammenstoß: ${e.reason ?? ''}${e.details ? ` ${JSON.stringify(e.details)}` : ''}`;
     case 'blocked': return `Nav Hindernis${e.note ? `: ${e.note}` : ''}, neuer Plan`;
     case 'warning': return e.kind === 'slip'
       ? `Nav Radschlupf (kein Zusammenstoß): Räder ${r0(e.slip?.encHeading)}°, Gyro ${r0(e.slip?.yawDelta)}°`
       : `! Nav Hinweis: ${e.note ?? e.kind ?? ''}`;
+    case 'home-check': return `Nav Heimkontrolle ${e.attempt ?? ''}: Abweichung ${r0(e.residualCm)} cm, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.applied === false ? ' (nicht übernommen)' : ''}`;
     case 'contacts-cleared': return `Nav: ${e.count} Zusammenstoß-Markierung(en) entfernt (Strecke frei befahren)`;
     case 'backoff': return `Nav: zurücksetzen und neu scannen${e.note ? ` (${e.note})` : ''}`;
     case 'replan': return `Nav neuer Plan${e.note ? `: ${e.note}` : ''}`;
@@ -1028,6 +1029,7 @@ function adoptMap(loaded, label) {
     return;
   }
   map.copyFrom(loaded.map); // grid plus hit/miss evidence
+  nav.resetAnchors?.(); // the start reference scan belongs to the session that took it
   tracker.reset();
   nav.lastPath = null;
   nav.goal = null;

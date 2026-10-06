@@ -13,10 +13,17 @@
 // rescan and relocalize. Every scan with a known map is matched against it
 // first (js/localize.js, loaded lazily; skipped if missing) and integrated at
 // the corrected pose.
+//
+// Anchors: the first scan of a map (taken at the start) is kept as the
+// reference scan. A later scan within ANCHOR_CM of an anchor is matched
+// against that scan alone (scan to scan), not against the accumulated map,
+// which carries the odometry drift it was built with; a confident anchor
+// match sets x, y and the heading (gyro drift) fully. goHome ends with such a
+// check at the start and drives a short correction leg if needed.
 
 import { makeCommand } from './bus.js';
 import { planPath, simplifyPath, pathToMoves, DEFAULT_INFLATE_CM } from './planner.js';
-import { L_SUSPECT } from './gridmap.js';
+import { L_SUSPECT, GridMap } from './gridmap.js';
 import { driveLeg, turnInPlace } from './motion.js';
 import { sweepScan, resampleSweep } from './scan.js';
 
@@ -33,6 +40,14 @@ const MIN_BLIND_LEG_CM = 12; // after a scan here, at most this far along an uns
 const EDGE_CM = 15;        // unknown cells this close to obstacle evidence count as an unseen edge
 const MAX_FIX_CM = 30;     // largest position correction a routine scan match may apply
 const MAX_FIX_DEG = 30;    // largest heading correction (without a gyro) a routine match may apply
+const MATCH_BIN_DEG = 5;   // sweep points are resampled to this for matching
+const ANCHOR_CM = 60;      // match against an anchor scan within this distance
+const ANCHOR_MIN_CONF = 0.5; // an anchor match below this falls back to the map
+const HEADING_CONF = 0.8;  // a map match this confident nudges the gyro heading ...
+const HEADING_GAIN = 0.3;  // ... by this fraction of its heading difference ...
+const HEADING_STEP = 2;    // ... at most this many degrees per scan
+const HOME_TOL_CM = 3;     // home check: drive a correction leg beyond this residual
+const HOME_FIXES = 2;      // at most this many correction legs
 
 let localizer; // undefined = not tried, null = unavailable
 async function loadLocalizer() {
@@ -62,7 +77,7 @@ const pathLen = (p) => p.slice(1).reduce((s, q, i) => s + dist(p[i], q), 0);
 export class Navigator {
   constructor({ bus, map, pose, scan, onEvent, steps = 12, safetyCm = 20, inflateCm = DEFAULT_INFLATE_CM, maxLegCm = 40,
     legsPerScan = Infinity, rescanCm = 120, taskScanCm = 50, settleMs, useYaw = false, beamDeg = 25, maxRangeCm = 250,
-    sampler, sample = sampler, sweepSample, legMode = sample ? 'drive' : 'straight', turnMode = sample ? 'gyro' : 'blocking', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.7, stopAtCm = 15 }) {
+    sampler, sample = sampler, sweepSample, legMode = sample ? 'drive' : 'straight', turnMode = sample ? 'gyro' : 'blocking', legRpm = 40, scanMode = sample ? 'sweep' : 'step', sweepDegS = 45, motionOpts, localize = true, localizer, minMatchConfidence, odomWeight = 0.4, stopAtCm = 15 }) {
     // sampler (alias sample): js/motion.js sampler for legs and sweeps; with one,
     // scans default to 'sweep' = continuous rotation, else 'step' = stop-and-measure
     this.scanMode = scanMode;
@@ -85,7 +100,9 @@ export class Navigator {
     // 'straight': blocking gyro straight (default without one, because a
     // time-based leg estimate is worse than the robot's own straight())
     // localizer: a { matchScan, fusePose } object instead of ./localize.js (tests).
-    // odomWeight: trust in odometry for routine scans; after a crash it drops to 0.1.
+    // odomWeight: trust in odometry for routine map matches (the match moves the
+    // pose by confidence * (1 - odomWeight)); after a crash it drops to 0.1,
+    // for anchor matches to 0.
     // stopAtCm: in-leg ultrasonic stop; below safetyCm, which already shortens the leg.
     Object.assign(this, { legMode, legRpm, sample, motionOpts, localize, localizer, minMatchConfidence, odomWeight, stopAtCm });
     this.lastPath = null;
@@ -93,6 +110,35 @@ export class Navigator {
     this.busy = false;
     this.poseUncertain = false;
     this.contacts = []; // crash contact points, for reference; the map owns their state
+    this.anchors = [];  // [{ pose, points, map }]: anchors[0] is the reference scan at the start
+    this.lastFix = null; // the last relocalize result, for the home check
+  }
+
+  // Forget the anchor scans (call when the map is cleared or replaced, e.g. a
+  // loaded map: anchors belong to the frame of the session that took them).
+  resetAnchors() { this.anchors = []; }
+
+  // The first scan of a map becomes the reference anchor.
+  addAnchor(pose, points, mapWasEmpty) {
+    if (mapWasEmpty) this.anchors = [];
+    if (this.anchors.length) return;
+    const beams = (points ?? []).filter((p) => p.cm != null);
+    if (beams.length >= 8) this.anchors.push({ pose: { ...pose }, points: beams, map: null });
+  }
+
+  nearestAnchor(p) {
+    let best = null;
+    for (const a of this.anchors) if (dist(a.pose, p) <= ANCHOR_CM && (!best || dist(a.pose, p) < dist(best.pose, p))) best = a;
+    return best;
+  }
+
+  // A small map of the anchor scan alone, for scan-to-scan matching.
+  anchorMap(a) {
+    if (!a.map) {
+      a.map = new GridMap({ cellCm: this.map.cellCm, sizeCm: this.map.sizeCm });
+      a.map.integrateScan(a.pose, a.points, { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, robotRadiusCm: 0 });
+    }
+    return a.map;
   }
 
   emit(ev) { try { this.onEvent?.(ev); } catch { /* UI errors must not break navigation */ } }
@@ -149,6 +195,7 @@ export class Navigator {
     await this.correctYaw(mk, signal);
     if (this.scanMode === 'sweep' && (this.sweepSample ?? this.sample)) return this.doSweep(mk, signal, reason);
     let at = this.pose.pose;
+    const empty = !this.mapKnown();
     const opts = { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, freeBeamDeg: Math.max(this.beamDeg, 360 / this.steps) };
     // with a known map, match first and integrate at the corrected pose
     const loc = this.localize && this.mapKnown() ? (this.localizer ?? await loadLocalizer()) : null;
@@ -171,6 +218,7 @@ export class Navigator {
     } finally {
       this.map.endScan?.();
     }
+    this.addAnchor(at, res.points, empty);
     // scan() turns a full circle; with steps that do not divide 360 the bus
     // rounds each turn, so apply the residue when the tracker is not attached
     if (this.selfPose) this.pose.applyTurn(Math.round(360 / this.steps) * this.steps - 360);
@@ -186,7 +234,8 @@ export class Navigator {
   // rotation (turnedDeg) is applied here in every wiring.
   async doSweep(mk, signal, reason = 'request') {
     let at = this.pose.pose;
-    const loc = this.localize && this.mapKnown() ? (this.localizer ?? await loadLocalizer()) : null;
+    const empty = !this.mapKnown();
+    const loc = this.localize && !empty ? (this.localizer ?? await loadLocalizer()) : null;
     let res;
     try {
       res = await sweepScan(this.bus, { sample: this.sweepSample ?? this.sample, makeCommand: mk, signal, speedDegS: this.sweepDegS });
@@ -198,8 +247,9 @@ export class Navigator {
       throw e;
     }
     const mapPoints = resampleSweep(res.points, 5);
-    if (loc) at = this.relocalize(loc, at, resampleSweep(res.points, 10)) ?? at;
+    if (loc) at = this.relocalize(loc, at, resampleSweep(res.points, MATCH_BIN_DEG)) ?? at;
     this.map.integrateScan(at, mapPoints, { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, freeBeamDeg: this.beamDeg });
+    this.addAnchor(at, mapPoints, empty);
     this.pose.applyTurn(normDeg(res.turnedDeg ?? 0)); // relocalize() already moved the estimate if it matched
     await this.correctYaw(mk, signal);
     this.scannedAt = at;
@@ -220,35 +270,55 @@ export class Navigator {
   mapKnown() { return (this.map.stats?.().knownM2 ?? 0) > 0.3; }
 
   // Scan matching around the odometry pose (wider when uncertain), fused with
-  // odometry. Returns the new pose, or null if nothing was applied.
+  // odometry. Near an anchor, scan to scan against it (absolute: x, y and
+  // heading, no jump cap); otherwise against the map (x, y; with the gyro the
+  // heading only moves slowly on very confident matches; jumps capped).
+  // Returns the new pose, or null if nothing was applied.
   relocalize(loc, guess, points) {
     const beams = (points ?? []).filter((p) => p.cm != null && p.cm > 0 && p.cm < Math.min(NO_ECHO_CM, this.maxRangeCm));
+    this.lastFix = null;
     if (beams.length < 4) return null;
     try {
       const wide = this.poseUncertain;
-      const m = loc.matchScan(this.map, guess, beams, wide ? { xyWindowCm: 60, angWindowDeg: 30 } : {});
+      const win = wide ? { xyWindowCm: 60, angWindowDeg: 30 } : {};
+      const anchor = this.nearestAnchor(guess);
+      let m = null, ref = 'map';
+      if (anchor) {
+        m = loc.matchScan(this.anchorMap(anchor), guess, beams, wide ? win : { xyWindowCm: 40, angWindowDeg: 20 });
+        if (m?.pose && (m.confidence ?? 0) >= ANCHOR_MIN_CONF) ref = 'anchor';
+        else m = null;
+      }
+      if (!m) m = loc.matchScan(this.map, guess, beams, win);
       if (!m?.pose) return null;
       const minConfidence = this.minMatchConfidence;
-      // With the gyro on, the heading is the gyro's (it was corrected just
-      // before the scan); the match only moves x/y and is vetoed if its
-      // heading disagrees by more than fusePose's yawTolDeg.
-      const yawDeg = this.useYaw && this.pose.yawRef != null ? guess.heading : undefined;
+      // With the gyro on, a map match moves x/y only (the gyro heading was
+      // corrected just before the scan) and is vetoed if its heading disagrees
+      // by more than fusePose's yawTolDeg; an anchor match also fixes gyro drift.
+      const gyro = this.useYaw && this.pose.yawRef != null;
+      const yawDeg = gyro && ref === 'map' ? guess.heading : undefined;
+      const odomWeight = ref === 'anchor' ? 0 : wide ? 0.1 : this.odomWeight;
       const fused = loc.fusePose
-        ? loc.fusePose(guess, m, { yawDeg, odomWeight: wide ? 0.1 : this.odomWeight, ...(minConfidence != null ? { minConfidence } : {}) })
+        ? loc.fusePose(guess, m, { yawDeg, odomWeight, ...(minConfidence != null ? { minConfidence } : {}) })
         : { pose: m.pose, source: (m.confidence ?? 0) >= (minConfidence ?? 0.5) ? 'scan' : 'odom' };
       const p = fused?.pose;
       if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return null;
-      const heading = yawDeg ?? p.heading ?? guess.heading;
+      let heading = yawDeg ?? p.heading ?? guess.heading;
+      // a very confident map match pulls the gyro heading slowly toward it
+      if (yawDeg != null && fused.source !== 'odom' && (m.confidence ?? 0) >= HEADING_CONF && Number.isFinite(m.pose.heading)) {
+        const dh = normDeg(m.pose.heading - guess.heading);
+        heading = normDeg(heading + Math.max(-HEADING_STEP, Math.min(HEADING_STEP, HEADING_GAIN * dh)));
+      }
       const correction = { dx: p.x - guess.x, dy: p.y - guess.y, dh: normDeg(heading - guess.heading) };
       let applied = fused.source !== 'odom', why = fused.reason ?? (applied ? null : 'rejected by fusePose');
-      // a routine scan may nudge the pose, not throw it around
-      if (applied && !wide && Math.hypot(correction.dx, correction.dy) > MAX_FIX_CM) { applied = false; why = `position jump ${Math.round(Math.hypot(correction.dx, correction.dy))} cm`; }
-      if (applied && !wide && Math.abs(correction.dh) > MAX_FIX_DEG) { applied = false; why = `heading jump ${Math.round(correction.dh)} deg`; }
+      // a routine map match may nudge the pose, not throw it around
+      if (ref === 'map' && applied && !wide && Math.hypot(correction.dx, correction.dy) > MAX_FIX_CM) { applied = false; why = `position jump ${Math.round(Math.hypot(correction.dx, correction.dy))} cm`; }
+      if (ref === 'map' && applied && !wide && Math.abs(correction.dh) > MAX_FIX_DEG) { applied = false; why = `heading jump ${Math.round(correction.dh)} deg`; }
       if (applied) {
         this.setPose({ x: p.x, y: p.y, heading });
         this.poseUncertain = false;
       }
-      this.emit({ type: 'localized', correction, confidence: m.confidence, applied, source: applied ? fused.source : 'odom', reason: why, pose: this.pose.pose });
+      this.lastFix = { applied, confidence: m.confidence ?? 0, ref, correction };
+      this.emit({ type: 'localized', correction, confidence: m.confidence, applied, source: applied ? fused.source : 'odom', ref, reason: why, pose: this.pose.pose });
       return applied ? this.pose.pose : null;
     } catch (e) {
       this.emit({ type: 'localized', error: e?.message ?? String(e), confidence: 0, applied: false, source: 'odom' });
@@ -629,11 +699,38 @@ export class Navigator {
     return this.task('goHome', signal, async (mk) => {
       const r = await this.doGoTo(mk, signal, { x: 0, y: 0 }, { tolCm, maxLegs: 12 });
       if (!r.reached) return r;
+      const check = await this.homeCheck(mk, signal);
       // face the start heading; one retry if the turn ended far off (field: -150 for -168)
       await this.turn(mk, signal, -this.pose.pose.heading);
       if (Math.abs(normDeg(this.pose.pose.heading)) > 5) await this.turn(mk, signal, -this.pose.pose.heading);
-      return { ...r, pose: this.pose.pose, note: 'home' };
+      return { ...r, pose: this.pose.pose, note: 'home', homeCheck: check };
     });
+  }
+
+  // At the start: scan, match against the reference scan (via relocalize,
+  // the start anchor is the nearest), and drive a short correction leg while
+  // the residual exceeds HOME_TOL_CM, at most HOME_FIXES times. Emits
+  // { type: 'home-check', attempt, residualCm, confidence, applied, ref }.
+  async homeCheck(mk, signal) {
+    const ref = this.anchors[0];
+    if (!this.localize || !ref || Math.hypot(ref.pose.x, ref.pose.y) > 1) return null;
+    let last = null;
+    for (let attempt = 0; ; attempt++) {
+      await this.doScan(mk, signal, 'home-check');
+      const fix = this.lastFix;
+      const residualCm = Math.round(dist(this.pose.pose, ref.pose) * 10) / 10;
+      last = { type: 'home-check', attempt, residualCm, confidence: fix?.confidence ?? 0, applied: !!fix?.applied, ref: fix?.ref ?? null, pose: this.pose.pose };
+      this.emit(last);
+      // drive only on a trusted fix against the reference
+      if (residualCm <= HOME_TOL_CM || attempt >= HOME_FIXES || !(fix?.applied && fix.ref === 'anchor')) break;
+      const m = pathToMoves(this.pose.pose, [this.pose.pose, ref.pose], { maxSegCm: 100 })[0];
+      if (!m) break;
+      const t = await this.turn(mk, signal, m.turnDeg);
+      if (!t.ok || t.crash) break;
+      const lr = await this.leg(mk, signal, Math.max(1, Math.round(m.cm)));
+      if (lr.reason !== 'done') break;
+    }
+    return last;
   }
 
   describe() {
