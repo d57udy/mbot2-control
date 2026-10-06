@@ -4,6 +4,7 @@
 // The ultrasonic sensor reports 300 cm when nothing is in range.
 
 import { makeCommand as defaultMakeCommand } from './bus.js';
+import { turnInPlace } from './motion.js';
 
 export const NO_ECHO_CM = 300;
 
@@ -275,6 +276,7 @@ export async function sweepScan(bus, {
   sample, makeCommand = defaultMakeCommand, signal, speedDegS = 45, onPoint, maxDurationMs = 20000,
   latencyMs = SWEEP_DEFAULTS.latencyMs, targetDeg = 380, keepaliveMs = 300, rampMs = 300, signDetectDeg = 20,
   sampleTimeoutMs = 2000, minSampleMs = 0, mergeDeg = 1, minCm = 2, wheelCm = WHEEL_DIAMETER_CM, trackCm = TRACK_CM,
+  returnToStart = true,
 } = {}) {
   if (typeof sample !== 'function') throw new Error('sweepScan needs a sample() function');
   const geo = { wheelCm, trackCm };
@@ -410,6 +412,19 @@ export async function sweepScan(bus, {
   const valid = raw.filter((p) => p.cm > minCm);
   const points = mergePoints(valid, mergeDeg);
   const totalTurn = track.length ? sign * track.at(-1).rot : 0;
+  // Turn back to the starting direction (gyro-controlled) so people can orient
+  // themselves; turnedDeg then reports the small remaining net turn.
+  let backDeg = 0, backTurn = null;
+  const net = normAngle(totalTurn);
+  if (returnToStart && method === 'yaw' && Math.abs(net) > 3) {
+    try {
+      backTurn = await turnInPlace(bus, { deg: -net, sample, makeCommand, signal });
+      backDeg = backTurn.achievedDeg ?? 0;
+    } catch (e) {
+      if (e?.name === 'AbortError' || signal?.aborted) throw e;
+      backTurn = { ok: false, note: String(e?.message ?? e) };
+    }
+  }
   return {
     points,
     durationMs: Math.round(now() - t0),
@@ -423,7 +438,8 @@ export async function sweepScan(bus, {
     // measured rotation from the start heading to rest, including the coast
     // after the stop (the robot is not turned back): turnedDeg -180..180 for
     // the pose heading, totalTurnDeg unwrapped (about 380 to 390)
-    turnedDeg: normAngle(totalTurn),
+    turnedDeg: normAngle(totalTurn + backDeg),
+    returned: backTurn ? { ok: backTurn.ok, backDeg, reason: backTurn.reason ?? backTurn.note } : null,
     totalTurnDeg: Math.round(totalTurn * 10) / 10,
     samples: n,
     coverageDeg: Math.round(Math.min(360, rotation)),

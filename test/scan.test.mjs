@@ -323,7 +323,7 @@ const angleErrors = (points) => points
 test('sweepScan: yaw with latency compensation, wrap at ±180, full coverage, stops', async () => {
   const w = sweepWorld({ latencyMs: 20 });
   const seen = [];
-  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 20, onPoint: (p) => seen.push(p) });
+  const r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 20, onPoint: (p) => seen.push(p) });
   assert.equal(r.method, 'sweep');
   assert.equal(r.rotationSource, 'yaw');
   assert.equal(r.yawSign, 1);
@@ -347,7 +347,7 @@ test('sweepScan: yaw with latency compensation, wrap at ±180, full coverage, st
 
 test('sweepScan: without compensation the same latency shifts the angles', async () => {
   const w = sweepWorld({ latencyMs: 20 });
-  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
+  const r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 0 });
   const err = angleErrors(r.points);
   const mean = err.reduce((a, b) => a + b, 0) / err.length;
   assert.ok(mean > 5, `mean error ${mean}`);
@@ -357,7 +357,7 @@ test('sweepScan: trusts the calibrated gyro and reports a spin against the comma
   // gyro and spin disagree (field test 2026-10-04: swapped wheel mapping); the
   // angles follow the gyro, never a guessed flip, and the sweep says so
   const w = sweepWorld({ yawSign: -1, yawOffset: -100 });
-  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
+  const r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 0 });
   assert.equal(r.reversed, true);
   assert.equal(r.yawSign, 1);
   assert.equal(r.coverageDeg, 360);
@@ -365,7 +365,7 @@ test('sweepScan: trusts the calibrated gyro and reports a spin against the comma
 
 test('sweepScan: counterclockwise with negative speed', async () => {
   const w = sweepWorld();
-  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, speedDegS: -45 });
+  const r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 0, speedDegS: -45 });
   assert.ok(w.drives.every((d) => d.left < 0 && d.right === -d.left));
   assert.equal(r.reversed, false);
   assert.ok(r.totalTurnDeg <= -380, `turned ${r.totalTurnDeg}`);
@@ -376,7 +376,7 @@ test('sweepScan: counterclockwise with negative speed', async () => {
 
 test('sweepScan: falls back to encoders, then to commanded rate x time', async () => {
   let w = sweepWorld({ yaw: false, enc: true });
-  let r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0 });
+  let r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 0 });
   assert.equal(r.rotationSource, 'encoder');
   assert.equal(r.coverageDeg, 360);
   let err = angleErrors(r.points);
@@ -384,7 +384,7 @@ test('sweepScan: falls back to encoders, then to commanded rate x time', async (
 
   // time: tell the sweep a track width that matches the faster test world
   w = sweepWorld({ yaw: false, scale: 6 });
-  r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, trackCm: 2, speedDegS: 600 });
+  r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 0, trackCm: 2, speedDegS: 600 });
   assert.equal(r.rotationSource, 'time');
   assert.equal(r.coverageDeg, 360);
   err = angleErrors(r.points);
@@ -396,7 +396,7 @@ test('sweepScan: falls back to encoders, then to commanded rate x time', async (
 test('sweepScan: drops invalid readings, keeps no-echo, merges duplicates', async () => {
   const room = (h) => (pos360(h) < 90 ? 1 : pos360(h) < 180 ? 300 : 120);
   const w = sweepWorld({ room });
-  const r = await sweepScan(w.bus, { sample: w.sample, latencyMs: 0, mergeDeg: 5 });
+  const r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, latencyMs: 0, mergeDeg: 5 });
   assert.ok(r.points.every((p) => p.cm > 2));
   assert.ok(!r.points.some((p) => p.angle > 3 && p.angle < 87), 'invalid sector dropped');
   assert.ok(r.points.some((p) => p.cm === 300));
@@ -432,7 +432,7 @@ test('sweepScan: a failing sample, a bus stop or a timeout still stops the robot
   assert.equal(w.events.at(-1), 'stop');
 
   w = sweepWorld({ scale: 1 });
-  const r = await sweepScan(w.bus, { sample: w.sample, maxDurationMs: 150 });
+  const r = await sweepScan(w.bus, { returnToStart: false, sample: w.sample, maxDurationMs: 150 });
   assert.ok(r.coverageDeg < 360, `coverage ${r.coverageDeg}`);
   assert.equal(w.events.at(-1), 'stop');
   assert.equal(w.stops, 1);
@@ -476,7 +476,7 @@ test('integration: sweepScan with SimRobot and the motion sampler', async (t) =>
   try {
     // facing left (-x) toward the pouf, chair behind (as in the step scan test)
     Object.assign(sim.state, { x: 120, y: 150, heading: 180 });
-    const r = await sweepScan(bus, { sample: motion.makeSimSampler(sim), makeCommand: bus.stamped() });
+    const r = await sweepScan(bus, { returnToStart: false, sample: motion.makeSimSampler(sim), makeCommand: bus.stamped() });
     assert.equal(r.rotationSource, 'yaw');
     assert.ok(r.coverageDeg >= 359, `coverage ${r.coverageDeg}`);
     const near = (a) => Math.min(...r.points.filter((p) => Math.abs(normAngle(p.angle - a)) <= 6).map((p) => p.cm));
@@ -495,4 +495,24 @@ test('findOpenings ignores empty readings inside an open area', () => {
   const o = findOpenings(pts);
   assert.equal(o.length, 1);
   assert.equal(o[0].widthDeg, 360);
+});
+
+test('sweepScan: turns back to the starting direction afterwards (SimRobot)', async () => {
+  const { SimRobot } = await import('../js/robot-sim.js');
+  const { CommandBus } = await import('../js/bus.js');
+  const { makeSimSampler } = await import('../js/motion.js');
+  const stub = () => {};
+  const sim = new SimRobot({ log: stub, onStatus: stub, timeScale: 15 });
+  const bus = new CommandBus({ log: stub });
+  bus.setRobot(sim);
+  await sim.connect();
+  try {
+    const h0 = sim.state.heading;
+    const r = await sweepScan(bus, { sample: makeSimSampler(sim), latencyMs: 0 });
+    assert.ok(r.totalTurnDeg >= 380, 'the sweep itself still covers more than a full turn');
+    assert.ok(r.returned?.ok, `return turn ${JSON.stringify(r.returned)}`);
+    const off = ((sim.state.heading - h0) % 360 + 540) % 360 - 180;
+    assert.ok(Math.abs(off) <= 4, `ends ${off.toFixed(1)}° from the start heading`);
+    assert.ok(Math.abs(r.turnedDeg - off) <= 3, `reported ${r.turnedDeg}, true ${off.toFixed(1)}`);
+  } finally { await sim.disconnect(); }
 });
