@@ -42,7 +42,8 @@ export const MOTION = {
   // Noise at 4 to 6 Hz: integer yaw +-1 deg, encoders +-1 wheel deg (0.5 deg
   // of heading), closed-loop wheels hold a straight line within a few deg.
   twistDeg: 10,       // yaw change on a straight leg
-  wheelDeg: 8,        // encoder-implied heading change on a straight leg
+  wheelDeg: 8,        // encoder-implied heading change on a straight leg (a crash only without a gyro)
+  slipYawDeg: 3,      // gyro rotation below this while the wheels disagree = wheel slip
   settleMs: 150,      // wait after a stop before the final reading, so the coast is counted
   coastGain: 0.7,     // how fast the learned stop distance follows the measured overshoot
   maxCoastCm: 10,
@@ -188,16 +189,25 @@ export function detectCrash(samples, expected = {}) {
   };
   const st = stalled(n - 1);
   if (st && stalled(n - 2)) return { crash: true, reason: 'stall', ...st };
-  if (o.straight && s.yawDelta != null && Math.abs(s.yawDelta) > o.twistDeg) {
+  const gyro = s.yawDelta != null;
+  if (o.straight && gyro && Math.abs(s.yawDelta) > o.twistDeg) {
     return { crash: true, reason: 'twist', value: s.yawDelta };
   }
+  // Wheels disagree. With a gyro that saw no matching rotation this is wheel
+  // slip, not a hit (field v0.7.0: 'wheel' -8 deg with yaw 0 marked a phantom
+  // obstacle). A glancing hit twists the body, which the gyro sees.
+  const slipYaw = gyro && Math.abs(s.yawDelta) < o.slipYawDeg;
   if (o.straight && s.hasEnc && Math.abs(s.encHeading ?? 0) > o.wheelDeg) {
-    return { crash: true, reason: 'wheel', value: s.encHeading };
+    if (!gyro) return { crash: true, reason: 'wheel', value: s.encHeading };
+    if (slipYaw) return { crash: false, reason: null, slip: true, value: s.encHeading };
   }
-  if (s.yawDelta != null) {
+  if (gyro) {
     const div = Math.abs(normDeg(s.yawDelta - (s.encHeading ?? 0)));
     const tol = o.headingDeg + (o.headingFrac ?? 0) * Math.abs(s.yawDelta);
-    if (div > tol) return { crash: true, reason: 'heading', value: div };
+    if (div > tol) {
+      if (o.straight && slipYaw) return { crash: false, reason: null, slip: true, value: s.encHeading };
+      return { crash: true, reason: 'heading', value: div };
+    }
   }
   const v = o.slip && before(o.slipMs);
   const ok = (x) => x != null && x > 0 && x < o.slipMaxRangeCm;
@@ -242,7 +252,7 @@ export async function driveLeg(bus, {
   const target = Math.max(0, Number(cm) || 0);
   const vNom = (speed / 60) * WHEEL_CM;
   const samples = [];
-  let reason = null, detail = null, details = null, note, contactCm = null, backedCm = 0, overshootCm = null;
+  let reason = null, detail = null, details = null, note, contactCm = null, backedCm = 0, overshootCm = null, slip = null;
   let base = null, last = null, cmdCm = 0, tPrev = null, errors = 0, cancelled = false;
 
   const send = async (l, r) => {
@@ -271,6 +281,11 @@ export async function driveLeg(bus, {
       distanceCm: raw.distanceCm, acc: raw.acc, shake: raw.shake,
       yawDelta: raw.yaw != null && base.yaw != null ? normDeg(raw.yaw - base.yaw) * yawSign : undefined,
     };
+    // the gyro says straight but the wheels disagree: one slipped, trust the slower
+    if (hasEnc && s.yawDelta != null && Math.abs(s.yawDelta) < o.slipYawDeg && Math.abs(s.encHeading) > o.slipYawDeg) {
+      s.drivenCm = rpm < 0 ? Math.max(dL, dR) : Math.min(dL, dR);
+      s.slipping = true;
+    }
     samples.push(s);
     last = s;
     try { onSample?.(s); } catch { /* UI errors must not break the leg */ }
@@ -312,6 +327,7 @@ export async function driveLeg(bus, {
       if (signal?.aborted) throw abortError();
       if (s) {
         const c = detectCrash(samples, { ...o, straight: true });
+        if (c.slip && !slip) slip = { encHeading: s.encHeading, yawDelta: s.yawDelta, drivenCm: s.drivenCm };
         if (c.crash) {
           reason = c.reason === 'stall' ? 'stall' : 'crash';
           detail = c.reason;
@@ -359,7 +375,7 @@ export async function driveLeg(bus, {
   return {
     ok: reason === 'done',
     droveCm: last ? last.drivenCm : 0,
-    reason, detail, details, note, cancelled, contactCm, backedCm, overshootCm, samples,
+    reason, detail, details, note, cancelled, contactCm, backedCm, overshootCm, slip, samples,
     encHeading: last?.hasEnc ? last.encHeading : null,
     yawDelta: last?.yawDelta ?? null,
   };

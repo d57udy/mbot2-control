@@ -33,6 +33,15 @@
 // stateOf()/cell() keep the three legacy states (a suspect cell is
 // 'unknown' there). Writes to L from outside (loading a saved map) are
 // imported as evidence on the next touch().
+//
+// Contacts (crashes) are a separate layer: markContact() flags a cell as an
+// obstacle for planning (distanceField, inflated, stateOf 'occupied', kind
+// 'contact') without touching its hit/miss evidence, so a false crash
+// leaves nothing permanent. The ultrasonic never clears a contact (what it
+// cannot see, like a low box, always looks see-through). A contact clears
+// when the robot drives through it without a crash (clearContactsAlong /
+// clearContactsNear, called by the navigator after a good leg), after
+// contactScans scans or contactMs, or on cleanup()/clear(). Not saved.
 
 export const L_THRESH = 0.5;   // |L| above this is known
 export const L_SUSPECT = 0.15; // L above this (and up to L_THRESH) is a suspect cell
@@ -78,7 +87,9 @@ const logit = (p) => Math.log(p / (1 - p));
 export class GridMap {
   // decayAfterScans: evidence of cells not observed for this many scans fades
   // by decayRate per scan toward unknown (0 = off).
-  constructor({ cellCm = 5, sizeCm = 800, decayAfterScans = 0, decayRate = 0.9 } = {}) {
+  // contactScans / contactMs: a contact expires after this many further
+  // scans or this much time, whichever comes first.
+  constructor({ cellCm = 5, sizeCm = 800, decayAfterScans = 0, decayRate = 0.9, contactScans = 20, contactMs = 600000 } = {}) {
     this.cellCm = cellCm;
     this.n = Math.ceil(sizeCm / cellCm);
     this.sizeCm = this.n * cellCm;
@@ -99,6 +110,9 @@ export class GridMap {
     this.openScan = 0;                 // id of the scan opened by beginScan(), or 0
     this.decayAfterScans = decayAfterScans;
     this.decayRate = decayRate;
+    this.contactScans = contactScans;
+    this.contactMs = contactMs;
+    this.contact = new Map();          // cell index -> { sid, t } (scan count and time when marked)
     this.version = 0;
     this.cache = new Map();
   }
@@ -106,6 +120,7 @@ export class GridMap {
   clear() {
     for (const a of [this.L, this.Lw, this.H, this.M, this.S, this.near, this.seen, this.hitSid, this.hitW, this.missSid, this.missW]) a.fill(0);
     this.openScan = 0;
+    this.contact.clear();
     this.touch();
   }
 
@@ -116,6 +131,7 @@ export class GridMap {
     this.hitSid.fill(0); this.missSid.fill(0);
     this.scans = o.scans;
     this.openScan = 0;
+    this.contact.clear();
     this.touch();
   }
 
@@ -163,7 +179,15 @@ export class GridMap {
   confirmed(k) { return this.prob(k) >= P_OCC && (this.S[k] >= 2 || this.near[k] === 1); }
 
   // 'occupied' | 'suspect' | 'free' | 'unknown'
+  // 'contact' | 'occupied' | 'suspect' | 'free' | 'unknown'
   kindOf(k) {
+    if (k < 0) return 'unknown';
+    if (this.contact.has(k)) return 'contact';
+    return this.evidenceKind(k);
+  }
+
+  // The state from hit/miss evidence alone (contacts ignored).
+  evidenceKind(k) {
     if (k < 0) return 'unknown';
     if (this.H[k] + this.M[k] === 0) return 'unknown';
     const p = this.prob(k);
@@ -176,6 +200,7 @@ export class GridMap {
 
   // Legacy three states from the L view: suspect cells are 'unknown'.
   stateOf(k) {
+    if (this.contact.has(k)) return 'occupied';
     const l = this.L[k];
     return l > L_THRESH ? 'occupied' : l < -L_THRESH ? 'free' : 'unknown';
   }
@@ -191,7 +216,7 @@ export class GridMap {
     if (t > EVIDENCE_CAP) { const f = EVIDENCE_CAP / t; this.H[k] *= f; this.M[k] *= f; }
     let l = 0;
     if (this.H[k] + this.M[k] > 0) {
-      const kind = this.kindOf(k), lp = logit(this.prob(k));
+      const kind = this.evidenceKind(k), lp = logit(this.prob(k));
       if (kind === 'occupied') l = Math.max(L_THRESH + 0.01, lp);
       else if (kind === 'suspect') l = Math.min(L_THRESH, Math.max(L_SUSPECT + 0.05, lp));
       else if (kind === 'free') l = Math.min(-L_THRESH - 0.01, lp);
@@ -219,6 +244,53 @@ export class GridMap {
     this.seen[k] = sid;
   }
 
+  // Flags the cell at (x, y) as a crash contact (idempotent: marking it again
+  // only restarts its age). Returns the cell index or -1.
+  markContact(x, y) {
+    const k = this.index(x, y);
+    if (k < 0) return -1;
+    this.contact.set(k, { sid: this.scans, t: Date.now() });
+    this.touch();
+    return k;
+  }
+
+  contactAt(x, y) { return this.contact.has(this.index(x, y)); }
+
+  // For drawing: [{ x, y, ageScans, ageMs }] at cell centres.
+  contacts() {
+    const now = Date.now();
+    return [...this.contact].map(([k, c]) => ({ ...this.centre(k), ageScans: this.scans - c.sid, ageMs: now - c.t }));
+  }
+
+  // The robot drove through these cells without a crash: removes contacts
+  // within radiusCm of the polyline points (one point = a disc). Returns the
+  // number removed.
+  clearContactsAlong(points, radiusCm = 9) {
+    if (!this.contact.size || !points?.length) return 0;
+    const pts = points.length === 1 ? [points[0], points[0]] : points;
+    let n = 0;
+    for (const k of [...this.contact.keys()]) {
+      const c = this.centre(k);
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i], dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+        const t = l2 ? Math.max(0, Math.min(1, ((c.x - a.x) * dx + (c.y - a.y) * dy) / l2)) : 0;
+        if (Math.hypot(c.x - a.x - t * dx, c.y - a.y - t * dy) <= radiusCm) { this.contact.delete(k); n++; break; }
+      }
+    }
+    if (n) this.touch();
+    return n;
+  }
+
+  clearContactsNear(x, y, radiusCm = 9) { return this.clearContactsAlong([{ x, y }], radiusCm); }
+
+  // Drops contacts older than contactScans scans or contactMs.
+  expireContacts() {
+    const now = Date.now();
+    for (const [k, c] of this.contact) {
+      if (this.scans - c.sid >= this.contactScans || now - c.t >= this.contactMs) this.contact.delete(k);
+    }
+  }
+
   // Groups the following integrateScan / markFree calls into one scan.
   beginScan() {
     this.openScan = ++this.scans;
@@ -229,6 +301,7 @@ export class GridMap {
     if (!this.openScan) return;
     this.openScan = 0;
     this.age();
+    this.expireContacts();
     this.touch();
   }
 
@@ -251,7 +324,7 @@ export class GridMap {
     const own = !this.openScan;
     const sid = this.openScan || ++this.scans;
     this.footprint(x, y, rCm, sid);
-    if (own) this.age();
+    if (own) { this.age(); this.expireContacts(); }
     this.touch();
   }
 
@@ -324,7 +397,7 @@ export class GridMap {
     }
     for (const k of touched) this.update(k);
     if (robotRadiusCm > 0) this.footprint(pose.x, pose.y, robotRadiusCm, sid);
-    if (own) this.age();
+    if (own) { this.age(); this.expireContacts(); }
     this.touch();
   }
 
@@ -341,9 +414,11 @@ export class GridMap {
   }
 
   // Removes hit evidence that one scan at most has seen and that is not
-  // confirmed (random reflections). Returns the number of cells cleaned.
+  // confirmed (random reflections), and all contacts. Returns the number of
+  // cells cleaned.
   cleanup() {
-    let n = 0;
+    let n = this.contact.size;
+    this.contact.clear();
     for (let k = 0; k < this.H.length; k++) {
       if (this.H[k] === 0 || this.S[k] > 1 || this.confirmed(k)) continue;
       this.H[k] = 0; this.S[k] = 0; this.near[k] = 0;
@@ -360,14 +435,16 @@ export class GridMap {
     if (k < 0) return null;
     const c = this.centre(k), r = (v) => Math.round(v * 100) / 100;
     return {
-      x: c.x, y: c.y, state: this.kindOf(k), p: r(this.prob(k)),
+      x: c.x, y: c.y, state: this.kindOf(k), evidence: this.evidenceKind(k), p: r(this.prob(k)),
       hits: r(this.H[k]), misses: r(this.M[k]), scans: this.S[k], near: this.near[k] === 1,
       lastSeen: this.seen[k], scansAgo: this.seen[k] ? this.scans - this.seen[k] : null,
+      contact: this.contact.has(k),
+      contactAge: this.contact.has(k) ? { scans: this.scans - this.contact.get(k).sid, ms: Date.now() - this.contact.get(k).t } : null,
     };
   }
 
   // Float32Array: distance in cm from each cell centre to the nearest cell
-  // centre with log-odds above threshold (Infinity if there is none). Exact
+  // centre with log-odds above threshold or a contact (Infinity if none). Exact
   // Euclidean distance transform (Felzenszwalb), cached per map version.
   distanceField(threshold = L_THRESH) {
     const key = `df${threshold}`;
@@ -376,6 +453,7 @@ export class GridMap {
     const n = this.n, INF = 1e20;
     const g = new Float64Array(n * n);
     for (let k = 0; k < g.length; k++) g[k] = this.L[k] > threshold ? 0 : INF;
+    for (const k of this.contact.keys()) g[k] = 0;   // contacts are obstacles for every threshold
     const f = new Float64Array(n), out = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
     const pass = (get, set) => {
       for (let q = 0; q < n; q++) f[q] = get(q);
@@ -454,11 +532,12 @@ export class GridMap {
     return out.sort((a, b) => b.size - a.size);
   }
 
-  // Visits every observed cell with its centre, legacy state, probability and
-  // kind ('occupied' | 'suspect' | 'free' | 'unknown').
+  // Visits every observed cell and every contact with its centre, legacy
+  // state, probability and kind ('contact' | 'occupied' | 'suspect' | 'free'
+  // | 'unknown'); a contact's legacy state is 'occupied'.
   forEachCell(fn) {
     for (let k = 0; k < this.L.length; k++) {
-      if (this.L[k] === 0) continue;
+      if (this.L[k] === 0 && !this.contact.has(k)) continue;
       const c = this.centre(k);
       fn(c.x, c.y, this.stateOf(k), this.prob(k), this.kindOf(k));
     }
@@ -486,7 +565,7 @@ export class GridMap {
       else if (this.L[k] > L_SUSPECT) suspect++;
     }
     const a = (this.cellCm * this.cellCm) / 1e4;
-    return { free, occupied, suspect, freeM2: free * a, knownM2: (free + occupied) * a };
+    return { free, occupied, suspect, contacts: this.contact.size, freeM2: free * a, knownM2: (free + occupied) * a };
   }
 
   // Compact text for the LLM. Directions are relative to the robot heading.

@@ -157,15 +157,21 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
     const { sim, nav, map, pose, events, truth } = await setup({ localize: true, simOpts: { obstacles: [...SIM_OBSTACLES, low] } });
     try {
       const goal = { x: 0, y: 75 };
+      let atCrash = null;
+      const prev = nav.onEvent;
+      nav.onEvent = (e) => {
+        if (e.type === 'crash' && !atCrash) { const c = nav.contacts[3]; atCrash = { c, cell: map.cell(c.x, c.y) }; }
+        prev(e);
+      };
       const r = await nav.goTo(goal, { tolCm: 10 });
       const crash = events.findIndex((e) => e.type === 'crash');
       assert.ok(crash >= 0, 'crash detected');
       assert.match(events[crash].reason, /stall|jolt/);
       assert.ok(events[crash].backedCm > 3, `backed ${events[crash].backedCm}`);
-      // contact remembered in the map between the robot and the box
-      const c = nav.contacts[3]; // middle of the first contact
+      // contact marked in the map between the robot and the box when the crash is reported
+      const c = atCrash.c; // middle of the first contact
       assert.ok(Math.abs(c.x) < 4 && c.y > 30 && c.y < 40, `contact ${JSON.stringify(c)}`);
-      assert.equal(map.cell(c.x, c.y), 'occupied');
+      assert.equal(atCrash.cell, 'occupied');
       assert.ok(events.slice(crash).some((e) => e.type === 'scan'), 'rescanned after the crash');
       assert.ok(events.slice(crash).some((e) => e.type === 'plan'), 'replanned');
       assert.ok(events.slice(crash).some((e) => e.type === 'localized' && !e.error), 'relocalized after the crash (js/localize.js)');
@@ -308,6 +314,20 @@ describe('navigator with SimRobot', { concurrency: true }, () => {
     }
   });
 
+  test('a slipping wheel (encoders disagree, gyro straight) is no crash and leaves no contact', async () => {
+    const { sim, nav, events, pose, truth } = await setup({ simOpts: { encScale: [1, 1.2] } });
+    try {
+      const r = await nav.goTo({ x: 110, y: 70 }, { tolCm: 10 });
+      assert.equal(r.ok, true, r.note);
+      assert.ok(!events.some((e) => e.type === 'crash'), JSON.stringify(events.filter((e) => e.type === 'crash')));
+      assert.ok(events.some((e) => e.type === 'warning' && e.kind === 'slip'));
+      assert.equal(nav.contacts.length, 0);
+      assert.ok(d(truth(), pose.pose) < 8 && angErr(truth().heading, pose.pose.heading) < 3, `est ${JSON.stringify(pose.pose)} truth ${JSON.stringify(truth())}`);
+    } finally {
+      await sim.disconnect();
+    }
+  });
+
   test('yaw correction keeps the heading on the gyro', async () => {
     const { sim, nav, pose, truth } = await setup({ useYaw: true });
     try {
@@ -401,4 +421,35 @@ test('navigator: knownReach stops a leg along an unseen obstacle edge, not in op
   assert.ok(r >= 30 && r <= 45, `reach ${r}`);
   free(-30, 30, 40, 85);
   assert.equal(nav.knownReach({ x: 0, y: 0 }, { x: 0, y: 80 }, 80), 80, 'all known');
+});
+
+test('navigator: crash contacts are marked once, survive the sonar, clear when driven through', () => {
+  const map = new GridMap({});
+  const nav = new Navigator({ bus: fakeBus(), map, pose: new PoseTracker(), scan, settleMs: 0 });
+  assert.equal(typeof map.markContact, 'function', 'gridmap contact layer');
+  const pts = nav.addContact(30); // robot at (0, 0) facing +y: contact row at y = 30
+  const mid = pts[3];
+  const info = () => map.cellInfo(mid.x, mid.y);
+  assert.equal(info().contact, true);
+  assert.equal(map.cell(mid.x, mid.y), 'occupied', 'the planner treats a contact as an obstacle');
+  const hits = info().hits;
+  for (let i = 0; i < 5; i++) nav.plan({ x: 0, y: 80 });
+  assert.equal(info().hits, hits, 'planning does not add evidence');
+  assert.equal(info().contact, true);
+  // a low obstacle looks see-through to the ultrasonic: close pass-through scans must not clear it
+  for (let i = 0; i < 2; i++) {
+    map.beginScan();
+    map.integrateScan({ x: 0, y: 0, heading: 0 }, [{ angle: 0, cm: 120 }], { beamDeg: 25 });
+    map.endScan();
+  }
+  assert.equal(info().contact, true, 'survives sonar pass-through scans');
+  // the robot drove through the cell on a leg that ended normally
+  assert.ok(map.clearContactsAlong([{ x: 0, y: 0 }, { x: 0, y: 50 }], 9) >= 1);
+  assert.equal(info().contact, false, 'cleared by driving through');
+  assert.notEqual(map.cell(mid.x, mid.y), 'occupied');
+  nav.addContact(30);
+  assert.equal(info().contact, true);
+  map.cleanup();
+  assert.equal(info().contact, false, 'cleared by cleanup()');
+  assert.equal(map.contacts().length, 0);
 });

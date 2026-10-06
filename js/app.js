@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.7.0';
+export const APP_VERSION = '0.7.1';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -819,6 +819,11 @@ function navEventText(e) {
     }
     case 'crash': return `! Nav Zusammenstoß: ${e.reason ?? ''}${e.details ? ` ${JSON.stringify(e.details)}` : ''}`;
     case 'blocked': return `Nav Hindernis${e.note ? `: ${e.note}` : ''}, neuer Plan`;
+    case 'warning': return e.kind === 'slip'
+      ? `Nav Radschlupf (kein Zusammenstoß): Räder ${r0(e.slip?.encHeading)}°, Gyro ${r0(e.slip?.yawDelta)}°`
+      : `! Nav Hinweis: ${e.note ?? e.kind ?? ''}`;
+    case 'contacts-cleared': return `Nav: ${e.count} Zusammenstoß-Markierung(en) entfernt (Strecke frei befahren)`;
+    case 'backoff': return `Nav: zurücksetzen und neu scannen${e.note ? ` (${e.note})` : ''}`;
     case 'replan': return `Nav neuer Plan${e.note ? `: ${e.note}` : ''}`;
     case 'arrived': return `Nav angekommen ${poseText(e.pose)}`;
     case 'error': return `! Nav: ${e.note ?? e.message ?? ''}`;
@@ -909,13 +914,23 @@ function resetMap() {
   redrawMap();
 }
 // Evidence per cell (hits vs. beams that passed through): explains why a cell is an obstacle.
-const KIND_DE = { occupied: 'Hindernis (bestätigt)', suspect: 'Hindernis (vermutet)', free: 'frei', unknown: 'unbekannt' };
+const KIND_DE = { occupied: 'Hindernis (bestätigt)', suspect: 'Hindernis (vermutet)', contact: 'Zusammenstoß-Markierung (vorübergehend)', free: 'frei', unknown: 'unbekannt' };
 function showCellInfo({ x, y }) {
   const i = map.cellInfo?.(x, y);
   if (!i) { log(`Stelle ${x}/${y}: keine Daten`); return; }
   const n = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : v ?? '?');
-  log(`Stelle ${x} cm rechts / ${y} cm vorne: ${KIND_DE[i.state] ?? i.state}; Treffer ${n(i.hits)}, durchschaut ${n(i.misses)}, Scans ${n(i.scans)}${i.p != null ? `, p ${n(i.p)}` : ''}`);
+  const why = i.contact ? ' · stammt von einem erkannten Zusammenstoß'
+    : i.near ? ' · bestätigt durch eine Messung aus unter 60 cm' : '';
+  const text = `Stelle ${x} cm rechts / ${y} cm vorne: ${KIND_DE[i.state] ?? i.state}${i.contact ? ' (Zusammenstoß)' : ''}. ` +
+    `Treffer ${n(i.hits)}, durchschaut ${n(i.misses)}, von ${n(i.scans)} Scans getroffen` +
+    `${i.p != null ? `, Wahrscheinlichkeit ${Math.round(i.p * 100)} %` : ''}` +
+    `${i.scansAgo != null ? `, zuletzt vor ${i.scansAgo} Scans gesehen` : ''}` +
+    `${i.contactAge ? `, Markierung seit ${i.contactAge.scans} Scans` : ''}${why}.`;
+  $('map-info').textContent = text;
+  $('map-info').hidden = false;
+  log(text);
 }
+$('opt-tapinfo').onchange = () => { if (!$('opt-tapinfo').checked) $('map-info').hidden = true; };
 $('btn-map-cleanup').onclick = () => {
   const removed = map.cleanup?.() ?? 0;
   log(`Karte aufgeräumt: ${removed} unbestätigte Zellen entfernt.`);

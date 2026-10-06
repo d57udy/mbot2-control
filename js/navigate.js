@@ -23,7 +23,8 @@ import { sweepScan, resampleSweep } from './scan.js';
 const NO_ECHO_CM = 300;
 const FRONT_CM = 10;       // robot centre to front bumper
 const CONTACT_HALF_CM = 8; // half width of the marked contact
-const CONTACT_L = 4;       // log-odds added per contact cell (clamped by the map)
+const CONTACT_CLEAR_CM = 9; // a leg clears contacts within this of its centre track (robot radius)
+const CONTACT_L = 2;       // one confirming hit per contact cell when the map has no contact layer
 const MAX_CRASHES = 4;
 const BACKOFF_CM = 10;     // reverse this far when every heading from here is blocked
 const MAX_BACKOFFS = 2;
@@ -91,7 +92,7 @@ export class Navigator {
     this.goal = null;
     this.busy = false;
     this.poseUncertain = false;
-    this.contacts = []; // map points where the robot hit something; kept occupied
+    this.contacts = []; // crash contact points, for reference; the map owns their state
   }
 
   emit(ev) { try { this.onEvent?.(ev); } catch { /* UI errors must not break navigation */ } }
@@ -170,7 +171,6 @@ export class Navigator {
     } finally {
       this.map.endScan?.();
     }
-    this.markContacts();
     // scan() turns a full circle; with steps that do not divide 360 the bus
     // rounds each turn, so apply the residue when the tracker is not attached
     if (this.selfPose) this.pose.applyTurn(Math.round(360 / this.steps) * this.steps - 360);
@@ -200,7 +200,6 @@ export class Navigator {
     const mapPoints = resampleSweep(res.points, 5);
     if (loc) at = this.relocalize(loc, at, resampleSweep(res.points, 10)) ?? at;
     this.map.integrateScan(at, mapPoints, { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, freeBeamDeg: this.beamDeg });
-    this.markContacts();
     this.pose.applyTurn(normDeg(res.turnedDeg ?? 0)); // relocalize() already moved the estimate if it matched
     await this.correctYaw(mk, signal);
     this.scannedAt = at;
@@ -267,33 +266,33 @@ export class Navigator {
     t.mark?.();
   }
 
-  // Marks a contact in front of the robot (after any back-off) and remembers
-  // it, because the ultrasonic may not see what was hit and free cones from
-  // later scans would erase it.
+  // Marks a crash contact in front of the robot (after any back-off), once
+  // per crash. With map.markContact (gridmap contact layer) the cells are
+  // flagged, not given hit evidence, and the map expires them; re-marking is
+  // idempotent. Without it, each point gets one confirming hit and nothing
+  // re-adds it later (re-adding before every plan made a false crash a
+  // permanent obstacle in the field).
   addContact(aheadCm) {
     const { x, y, heading } = this.pose.pose;
     const h = (heading * Math.PI) / 180, fx = Math.sin(h), fy = Math.cos(h);
     const step = this.map.cellCm / 2;
-    for (let l = -CONTACT_HALF_CM; l <= CONTACT_HALF_CM + 1e-9; l += step) {
-      this.contacts.push({ x: x + fx * aheadCm + fy * l, y: y + fy * aheadCm - fx * l });
-    }
-    this.markContacts();
-  }
-
-  markContacts() {
-    if (!this.contacts.length) return;
     const m = this.map;
-    if (typeof m.add === 'function' && typeof m.index === 'function') {
-      for (const c of this.contacts) { const k = m.index(c.x, c.y); if (k >= 0) m.add(k, CONTACT_L); }
-      m.touch?.();
-    } else {
-      // fallback: a narrow beam at each contact point
-      for (const c of this.contacts) {
-        const p = this.pose.pose;
-        const ang = normDeg((Math.atan2(c.x - p.x, c.y - p.y) * 180) / Math.PI - p.heading);
-        m.integrateScan(p, [{ angle: ang, cm: Math.hypot(c.x - p.x, c.y - p.y) }], { beamDeg: 4, sensorOffsetCm: 0, robotRadiusCm: 0 });
-      }
+    const points = [];
+    for (let l = -CONTACT_HALF_CM; l <= CONTACT_HALF_CM + 1e-9; l += step) {
+      points.push({ x: x + fx * aheadCm + fy * l, y: y + fy * aheadCm - fx * l });
     }
+    if (typeof m.markContact === 'function') {
+      for (const c of points) m.markContact(c.x, c.y);
+    } else if (typeof m.add === 'function' && typeof m.index === 'function') {
+      const seen = new Set();
+      for (const c of points) {
+        const k = m.index(c.x, c.y);
+        if (k >= 0 && !seen.has(k)) { seen.add(k); m.add(k, CONTACT_L); }
+      }
+      m.touch?.();
+    }
+    this.contacts.push(...points);
+    return points;
   }
 
   // Forward reading at the current heading, integrated into the map.
@@ -384,19 +383,29 @@ export class Navigator {
       return { ok, reason: ok ? 'done' : 'error', droveCm: ok ? cm : 0, note: ok ? undefined : 'straight failed' };
     }
     this.checkAbort(signal);
+    const from = this.pose.pose;
     const r = await driveLeg(this.bus, {
       cm, speed: this.legRpm, makeCommand: mk, signal, sample: this.sample, stopAtCm: this.stopAtCm, opts: this.motionOpts, coast: this.legCoast,
     });
     // the drive commands are not seen by the tracker: apply the measured leg here
     if (r.droveCm) {
-      const dh = r.encHeading ?? 0;
+      // the gyro's rotation when there is one: the encoders disagree on wheel slip
+      const dh = r.yawDelta ?? r.encHeading ?? 0;
       if (dh) this.pose.applyTurn(dh / 2);
       this.pose.applyStraight(r.droveCm);
       if (dh) this.pose.applyTurn(dh / 2);
     }
+    if (r.slip) this.emit({ type: 'warning', kind: 'slip', note: `wheel slip: wheels disagree by ${Math.round(r.slip.encHeading)} deg, gyro ${Math.round(r.slip.yawDelta)} deg; not a crash`, slip: r.slip });
     if (r.reason === 'aborted') {
       this.checkAbort(signal);
       throw new Cancelled(r.note ?? 'cancelled by stop');
+    }
+    // The robot itself passed here without a crash: contacts on its track
+    // were wrong (or the obstacle moved). Only this clears a contact; the
+    // ultrasonic cannot, since it sees through low obstacles.
+    if ((r.reason === 'done' || r.reason === 'obstacle') && r.droveCm > 1) {
+      const n = this.map.clearContactsAlong?.([from, this.pose.pose], CONTACT_CLEAR_CM) ?? 0;
+      if (n) this.emit({ type: 'contacts-cleared', count: n, from, to: this.pose.pose });
     }
     const last = r.samples?.at(-1);
     if (last?.distanceCm != null) {
@@ -457,7 +466,6 @@ export class Navigator {
   }
 
   plan(goal) {
-    this.markContacts();
     const opts = { inflateCm: this.inflateCm, allowUnknown: true };
     const raw = planPath(this.map, this.pose.pose, goal, opts);
     return raw ? simplifyPath(raw, this.map, opts) : null;

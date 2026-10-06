@@ -181,7 +181,7 @@ test('gridmap: cellInfo, aging, legacy log-odds writes and add()', () => {
   const m = new GridMap({ decayAfterScans: 2, decayRate: 0.5 });
   m.integrateScan(O, [{ angle: 0, cm: 40 }]);
   const c = m.cellInfo(0, 46);
-  assert.deepEqual(Object.keys(c).sort(), ['hits', 'lastSeen', 'misses', 'near', 'p', 'scans', 'scansAgo', 'state', 'x', 'y'].sort());
+  assert.deepEqual(Object.keys(c).sort(), ['contact', 'contactAge', 'evidence', 'hits', 'lastSeen', 'misses', 'near', 'p', 'scans', 'scansAgo', 'state', 'x', 'y'].sort());
   assert.equal(c.state, 'occupied');
   assert.equal(c.scansAgo, 0);
   assert.equal(m.cellInfo(5000, 0), null);
@@ -428,4 +428,65 @@ test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and 
   m.forEachCell((x, y, s, p, kind) => { if (kind === 'suspect' && surfaceDist(x, y, false) > 20) left++; });
   assert.ok(left <= phantoms.suspect.length / 2, `after cleanup ${left}`);
   assert.equal(m.stats().occupied, before);
+});
+
+test('gridmap: contacts block planning without evidence; only driving through, age or cleanup clear them', () => {
+  const m = new GridMap({});
+  m.integrateScan(O, [{ angle: 0, cm: 200 }], { maxRangeCm: 150 });    // free ahead
+  const before = m.cellInfo(0, 25);
+  assert.equal(m.markContact(0, 25), m.index(0, 25));
+  assert.equal(m.markContact(5000, 0), -1);
+  assert.equal(m.contactAt(0, 25), true);
+  assert.equal(m.kind(0, 25), 'contact');
+  assert.equal(m.cell(0, 25), 'occupied');
+  assert.equal(m.clearance(0, 25), 0);
+  assert.equal(m.isTraversable(0, 15), false);                   // inflated
+  const info = m.cellInfo(0, 25);
+  assert.equal(info.contact, true);
+  assert.equal(info.contactAge.scans, 0);
+  assert.equal(info.evidence, 'free');
+  assert.equal(info.hits, before.hits);                         // evidence untouched
+  assert.equal(info.misses, before.misses);
+  // idempotent: marking again adds nothing
+  for (let i = 0; i < 5; i++) m.markContact(0, 25);
+  assert.equal(m.contacts().length, 1);
+  assert.equal(m.cellInfo(0, 25).hits, before.hits);
+  const kinds = [];
+  m.forEachCell((x, y, s, p, kind) => { if (kind === 'contact') kinds.push([x, y, s]); });
+  assert.deepEqual(kinds, [[2.5, 27.5, 'occupied']]);
+  assert.equal(m.stats().contacts, 1);
+  // the ultrasonic never clears it: many close scans that see through it
+  for (let i = 0; i < 10; i++) m.integrateScan(O, [{ angle: 0, cm: 120 }]);
+  assert.equal(m.contactAt(0, 25), true);
+  // driving past it (path 20 cm to the side) leaves it; driving through clears it
+  assert.equal(m.clearContactsAlong([{ x: 20, y: 0 }, { x: 20, y: 60 }], 9), 0);
+  assert.equal(m.contactAt(0, 25), true);
+  const v = m.version;
+  assert.equal(m.clearContactsAlong([{ x: 0, y: 0 }, { x: 0, y: 60 }], 9), 1);
+  assert.ok(m.version > v);
+  assert.equal(m.kind(0, 25), 'free');
+  m.markContact(-40, 0);
+  assert.equal(m.clearContactsNear(-45, 5, 9), 1);
+  assert.equal(m.clearContactsNear(-45, 5, 9), 0);
+  // age limit in scans (default 20) and in time
+  const e = new GridMap({ contactScans: 3 });
+  e.markContact(30, 30);
+  for (let i = 0; i < 2; i++) e.integrateScan(O, [{ angle: 180, cm: 50 }]);
+  assert.equal(e.contactAt(30, 30), true);
+  e.integrateScan(O, [{ angle: 180, cm: 50 }]);
+  assert.equal(e.contactAt(30, 30), false);
+  assert.equal(new GridMap({}).contactScans, 20);
+  const t = new GridMap({ contactMs: 0 });
+  t.markContact(30, 30);
+  t.integrateScan(O, [{ angle: 180, cm: 50 }]);
+  assert.equal(t.contactAt(30, 30), false);
+  // cleanup and clear remove all contacts; contacts are not saved
+  m.markContact(-40, 0);
+  m.markContact(40, 0);
+  assert.ok(m.cleanup() >= 2);
+  assert.equal(m.contacts().length, 0);
+  m.markContact(-40, 0);
+  assert.equal(GridMap.fromJSON(JSON.parse(JSON.stringify(m))).contacts().length, 0);
+  m.clear();
+  assert.equal(m.contacts().length, 0);
 });

@@ -137,12 +137,14 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
     const free = [];
     const occ = [[], [], [], []];
     const suspect = []; // hit evidence not yet confirmed by a second scan (evidence model v2)
+    const contact = []; // crash contacts: temporary, expire after a few scans
     map.forEachCell((x, y, state, p, kind) => {
       if (state === 'unknown' && kind !== 'suspect') return;
       const q = P(x, y);
       if (q.x < -cpx || q.y < -cpx || q.x > w + cpx || q.y > h + cpx) return;
       if (rot) { q.x -= w / 2; q.y -= h / 2; const u = turn(q.x, -q.y, -rot); q.x = u.x; q.y = -u.y; } // unturned, about the centre
-      if (kind === 'suspect') suspect.push(q);
+      if (kind === 'contact') contact.push(q);
+      else if (kind === 'suspect') suspect.push(q);
       else if (state === 'occupied') {
         const k = finite(p) && p >= 0 && p <= 1 ? Math.min(3, Math.max(0, Math.floor((p - 0.5) * 8))) : 3;
         occ[k].push(q);
@@ -160,6 +162,7 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
     };
     fill(free, c.surface, 1);
     fill(suspect, c.warn, 0.45);
+    fill(contact, c.stop, 0.55);
     occ.forEach((list, k) => fill(list, c.text, 0.4 + k * 0.2));
     ctx.globalAlpha = 1;
     if (rot) ctx.restore();

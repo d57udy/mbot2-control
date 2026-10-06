@@ -375,3 +375,41 @@ test('turnInPlace: large turns across +-180 with a slow link (field: -168 achiev
     await sim.disconnect();
   }
 });
+
+// Field v0.7.0: "wheel {value:-8.13, drivenCm:13.3, yawDelta:0, encHeading:-8.13}"
+// ended a leg as a crash and left a phantom obstacle. One wheel slipped.
+function slipWorld({ gyro = true, twistAt = Infinity } = {}) {
+  const w = { t: 0, x: 0, rpm: 0, cmds: [] };
+  const adv = (ms) => { w.x += ((w.rpm / 60) * WHEEL_CM * ms) / 1000; w.t += ms; };
+  w.bus = { submit: async (c) => { w.cmds.push(c); if (c.cmd === 'drive') w.rpm = c.args.left; if (c.cmd === 'stop') w.rpm = 0; return { ok: true }; } };
+  w.sample = async () => {
+    adv(180);
+    // the right wheel spins 25 % more than the ground it covers after 8 cm
+    const extra = Math.max(0, w.x - 8) * 0.25;
+    const s = { distanceCm: 300, encL: w.x / CM_PER_DEG, encR: (w.x + extra) / CM_PER_DEG, acc: { x: 0.1, y: 0, z: -9.6 }, shake: 2 };
+    if (gyro) s.yaw = w.x > twistAt ? 15 : 0;
+    return s;
+  };
+  w.clock = { now: () => w.t, sleep: async (ms) => adv(ms) };
+  return w;
+}
+
+test('driveLeg: encoder mismatch with the gyro at 0 is wheel slip, not a crash', async () => {
+  const w = slipWorld();
+  const r = await driveLeg(w.bus, { cm: 29, sample: w.sample, clock: w.clock });
+  assert.equal(r.reason, 'done', `${r.reason} ${r.detail} ${JSON.stringify(r.details)}`);
+  assert.ok(r.slip && Math.abs(r.slip.encHeading) > 8 && r.slip.yawDelta === 0, JSON.stringify(r.slip));
+  assert.ok(Math.abs(w.x - 29) < 2, `drove ${w.x.toFixed(1)} (the slower wheel counts)`);
+  assert.equal(r.yawDelta, 0);
+});
+
+test('driveLeg: without a gyro an encoder mismatch is still a glancing hit; with a twist it is a crash', async () => {
+  const n = slipWorld({ gyro: false });
+  const rn = await driveLeg(n.bus, { cm: 29, sample: n.sample, clock: n.clock });
+  assert.equal(rn.reason, 'crash');
+  assert.equal(rn.detail, 'wheel');
+  const t = slipWorld({ twistAt: 12 });
+  const rt = await driveLeg(t.bus, { cm: 29, sample: t.sample, clock: t.clock });
+  assert.equal(rt.reason, 'crash');
+  assert.equal(rt.detail, 'twist');
+});

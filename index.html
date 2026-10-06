@@ -110,6 +110,7 @@
         <button id="btn-home">Nach Hause</button>
       </div>
       <canvas id="map" width="640" height="640" aria-label="Karte, antippen um dorthin zu fahren"></canvas>
+      <p id="map-info" class="small map-info" hidden></p>
       <p id="map-text" class="muted small">Karte: noch leer. Scannen füllt sie; auf die Karte tippen fährt dorthin.</p>
       <div class="row">
         <button id="btn-map-fit">Ganze Karte</button>
@@ -123,7 +124,7 @@
       </div>
       <div class="row">
         <label class="inline"><input id="opt-tapinfo" type="checkbox"> Antippen zeigt Info statt hinzufahren</label>
-        <span class="muted small">Dunkel = bestätigt, orange = vermutet (erst einmal gesehen)</span>
+        <span class="muted small">Dunkel = bestätigt, orange = vermutet (erst einmal gesehen), rot = Zusammenstoß (vorübergehend)</span>
       </div>
       <details class="nested">
         <summary>Karten speichern und laden</summary>
