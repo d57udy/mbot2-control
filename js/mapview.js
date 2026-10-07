@@ -16,16 +16,18 @@ const FALLBACK = {
   '--muted': '#667085', '--accent': '#2f6fde', '--stop': '#d92d20', '--ok': '#12805c', '--warn': '#b54708' };
 
 // Map colours: optional CSS variables, else derived for light or dark mode
-// (from the brightness of --bg). Confirmed obstacles run from occLo at
-// p = OCC_P_LO to occHi at OCC_P_HI: light grey-blue to near-black on a light
+// (from the brightness of --bg). All hit evidence (suspect and confirmed
+// cells) shares one grey scale by probability, from occLo at p = OCC_P_LO to
+// occHi at OCC_P_HI, so confidence growing or shrinking stays visible: very
+// light grey to near-black on a light page, dim grey to near-white on a dark
 // page, dim grey-blue to near-white on a dark one.
 const MAP_FALLBACK = {
-  light: { '--map-occ-lo': '#a9bbd0', '--map-occ-hi': '#11151c', '--map-suspect': '#f79009', '--map-contact': '#d92d20', '--map-pending': '#8a94a6' },
-  dark: { '--map-occ-lo': '#4b5d78', '--map-occ-hi': '#f2f4f7', '--map-suspect': '#fdb022', '--map-contact': '#f04438', '--map-pending': '#7d8799' },
+  light: { '--map-occ-lo': '#cdd0d5', '--map-occ-hi': '#111317', '--map-suspect': '#f79009', '--map-contact': '#d92d20', '--map-pending': '#8a94a6' },
+  dark: { '--map-occ-lo': '#3e434c', '--map-occ-hi': '#f2f4f7', '--map-suspect': '#fdb022', '--map-contact': '#f04438', '--map-pending': '#7d8799' },
 };
-export const OCC_P_LO = 0.65;
+export const OCC_P_LO = 0.5;
 export const OCC_P_HI = 0.95;
-const OCC_STEPS = 12; // gradient buckets, enough to look continuous
+const OCC_STEPS = 16; // gradient buckets, enough to look continuous
 
 function rgbOf(col) {
   const m = /^#([0-9a-f]{6})$/i.exec(String(col).trim());
@@ -73,8 +75,7 @@ export function mapLegend({ css = null } = {}) {
   return [
     { key: 'free', label: 'Frei', colour: c.surface, style: 'fill', css: c.surface },
     { key: 'unknown', label: 'Unbekannt', colour: c.bg, style: 'fill', css: c.bg },
-    { key: 'occupied', label: 'Hindernis (heller = unsicherer)', colour: c.occLo, colour2: c.occHi, style: 'gradient', css: `linear-gradient(90deg, ${c.occLo}, ${c.occHi})` },
-    { key: 'suspect', label: 'Hindernis, einmal gesehen', colour: c.suspect, style: 'fill', alpha: 0.55, css: c.suspect },
+    { key: 'occupied', label: 'Hindernis: hell = unsicher, dunkel = sicher', colour: c.occLo, colour2: c.occHi, style: 'gradient', css: `linear-gradient(90deg, ${c.occLo}, ${c.occHi})` },
     { key: 'contact', label: 'Anstoß (vorübergehend)', colour: c.contact, style: 'fill', alpha: 0.7, css: c.contact },
     { key: 'scan', label: 'Letzter Scan', colour: c.accent, style: 'dot', css: c.accent },
     { key: 'pending', label: 'Scan nicht übernommen', colour: c.pending, style: 'hollow', css: c.pending },
@@ -175,8 +176,9 @@ const dir = (deg) => { const a = (deg * Math.PI) / 180; return { x: Math.sin(a),
 //   lastScan { pose, points, age? }: the latest accepted scan (accent, fades with age 0..2);
 //   recentScans [{ pose, points, age? }]: newest first, instead of lastScan, age defaults to the index;
 //   pendingScans [{ pose, points }]: rejected sweeps, grey hollow points, dashed rays, "nicht übernommen";
-//   frozen: true draws a dashed border and the badge "Karte eingefroren".
-export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastScan, recentScans, pendingScans, frozen = false, view } = {}) {
+//   frozen: true draws a dashed border and the badge "Karte eingefroren";
+//   outlineSuspect: true outlines unconfirmed hit cells thinly in the warn colour.
+export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastScan, recentScans, pendingScans, frozen = false, outlineSuspect = false, view } = {}) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   const c = colours();
@@ -198,7 +200,7 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
   if (map?.forEachCell) {
     const free = [];
     const occ = Array.from({ length: OCC_STEPS + 1 }, () => []); // by p, OCC_P_LO .. OCC_P_HI
-    const suspect = []; // hit evidence not yet confirmed by a second scan (evidence model v2)
+    const suspect = []; // unconfirmed hits, for the optional outline
     const contact = []; // crash contacts: temporary, expire after a few scans
     map.forEachCell((x, y, state, p, kind) => {
       if (state === 'unknown' && kind !== 'suspect') return;
@@ -206,8 +208,8 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
       if (q.x < -cpx || q.y < -cpx || q.x > w + cpx || q.y > h + cpx) return;
       if (rot) { q.x -= w / 2; q.y -= h / 2; const u = turn(q.x, -q.y, -rot); q.x = u.x; q.y = -u.y; } // unturned, about the centre
       if (kind === 'contact') contact.push(q);
-      else if (kind === 'suspect') suspect.push(q);
-      else if (state === 'occupied') {
+      else if (kind === 'suspect' || state === 'occupied') {
+        if (kind === 'suspect') suspect.push(q);
         const t = finite(p) ? (p - OCC_P_LO) / (OCC_P_HI - OCC_P_LO) : 1;
         occ[Math.round(Math.min(1, Math.max(0, t)) * OCC_STEPS)].push(q);
       } else free.push(q);
@@ -224,8 +226,16 @@ export function drawMap(canvas, map, pose, { path, goal, frontiers, trail, lastS
     };
     fill(free, c.surface, 1);
     occ.forEach((list, k) => fill(list, occupiedColour(OCC_P_LO + ((OCC_P_HI - OCC_P_LO) * k) / OCC_STEPS, c), 1));
-    fill(suspect, c.suspect, 0.55);
     fill(contact, c.contact, 0.7);
+    if (outlineSuspect && suspect.length) {
+      ctx.globalAlpha = 0.8;
+      ctx.strokeStyle = c.suspect;
+      ctx.lineWidth = Math.max(0.75, dpr * 0.75);
+      ctx.beginPath();
+      const r = cpx - 1;
+      for (const q of suspect) ctx.rect(q.x - r / 2, q.y - r / 2, r, r);
+      ctx.stroke();
+    }
     ctx.globalAlpha = 1;
     if (rot) ctx.restore();
   }

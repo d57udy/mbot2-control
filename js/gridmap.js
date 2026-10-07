@@ -34,6 +34,12 @@
 // 'unknown' there). Writes to L from outside (loading a saved map) are
 // imported as evidence on the next touch().
 //
+// Weak evidence (v0.8.1): single forward readings during legs (integrateScan
+// with weak: true) add half-weight hits that make a cell 'weak' only (legacy
+// L in [L_WEAK, L_SUSPECT]): a glitched reading must not create an obstacle on
+// its own. A second agreeing reading (another weak one, or a sweep) makes it a
+// suspect; a miss clears it.
+//
 // Contacts (crashes) are a separate layer: markContact() flags a cell as an
 // obstacle for planning (distanceField, inflated, stateOf 'occupied', kind
 // 'contact') without touching its hit/miss evidence, so a false crash
@@ -45,6 +51,7 @@
 
 export const L_THRESH = 0.5;   // |L| above this is known
 export const L_SUSPECT = 0.15; // L above this (and up to L_THRESH) is a suspect cell
+export const L_WEAK = 0.05;    // L in [L_WEAK, L_SUSPECT]: weak evidence (single readings)
 const P_OCC = 0.65;            // confirmed occupied needs at least this
 const P_FREE = 0.4;            // free below this
 const PRIOR = 0.5;             // Beta prior per side
@@ -59,6 +66,7 @@ const CONE_MISS = 0.4;         // miss weight of the cone outside the core (cell
 const WIDE_MISS = 0.12;        // gap filler outside the beam (cells without hits): free after 3 passes
 const WIDE_REACH = 0.7;        // gap filler reach, as a fraction of the range
 const CONTACT_CONFIRMS = 2;    // add(k, dl) with dl >= this is physical contact: confirmed
+const WEAK_HIT = 0.5;          // hit weight of a weak (single forward) reading
 
 // 1D squared distance transform of f (0 at sites, large elsewhere) into d.
 function edt1d(f, n, d, v, z) {
@@ -101,9 +109,12 @@ export class GridMap {
     this.M = new Float32Array(N);      // miss evidence
     this.S = new Uint16Array(N);       // scans with a hit of at least HIT_COUNTS
     this.near = new Uint8Array(N);     // 1 = head-on hit closer than NEAR_CM (informational)
+    this.Hw = new Float32Array(N);     // the part of H from weak readings
+    this.WK = new Uint8Array(N);       // weak readings that hit the cell
     this.seen = new Int32Array(N);     // scan id of the last observation (0 = never)
     this.hitSid = new Int32Array(N);   // per-scan bookkeeping: strongest hit / miss so far
     this.hitW = new Float32Array(N);
+    this.hitC = new Float32Array(N);   // per scan: strongest angular hit weight (for S)
     this.missSid = new Int32Array(N);
     this.missW = new Float32Array(N);
     this.scans = 0;                    // scan ids handed out
@@ -118,7 +129,7 @@ export class GridMap {
   }
 
   clear() {
-    for (const a of [this.L, this.Lw, this.H, this.M, this.S, this.near, this.seen, this.hitSid, this.hitW, this.missSid, this.missW]) a.fill(0);
+    for (const a of [this.L, this.Lw, this.H, this.M, this.S, this.near, this.Hw, this.WK, this.seen, this.hitSid, this.hitW, this.hitC, this.missSid, this.missW]) a.fill(0);
     this.openScan = 0;
     this.contact.clear();
     this.touch();
@@ -127,7 +138,7 @@ export class GridMap {
   // Takes over another map's cells and evidence (same cellCm and sizeCm).
   copyFrom(o) {
     if (o.n !== this.n || o.cellCm !== this.cellCm) throw new Error('map size differs');
-    for (const f of ['L', 'Lw', 'H', 'M', 'S', 'near', 'seen']) this[f].set(o[f]);
+    for (const f of ['L', 'Lw', 'H', 'M', 'S', 'near', 'Hw', 'WK', 'seen']) this[f].set(o[f]);
     this.hitSid.fill(0); this.missSid.fill(0);
     this.scans = o.scans;
     this.openScan = 0;
@@ -150,6 +161,7 @@ export class GridMap {
     const l = this.L[k];
     if (!Number.isFinite(l) || l === 0) {
       this.H[k] = 0; this.M[k] = 0; this.S[k] = 0; this.near[k] = 0;
+      this.Hw[k] = 0; this.WK[k] = 0;
       this.L[k] = 0;
     } else {
       let p = 1 / (1 + Math.exp(-Math.max(-8, Math.min(8, l))));
@@ -159,6 +171,7 @@ export class GridMap {
       this.M[k] = Math.max(0, n - this.H[k]);
       this.S[k] = l > L_THRESH ? 2 : l > 0 ? 1 : 0;
       this.near[k] = 0;
+      this.Hw[k] = 0; this.WK[k] = 0;
     }
     this.Lw[k] = this.L[k];
   }
@@ -179,8 +192,7 @@ export class GridMap {
   // Hits from two scans: one sweep alone (even a bad one) cannot confirm a cell.
   confirmed(k) { return this.prob(k) >= P_OCC && this.S[k] >= 2; }
 
-  // 'occupied' | 'suspect' | 'free' | 'unknown'
-  // 'contact' | 'occupied' | 'suspect' | 'free' | 'unknown'
+  // 'contact' | 'occupied' | 'suspect' | 'weak' | 'free' | 'unknown'
   kindOf(k) {
     if (k < 0) return 'unknown';
     if (this.contact.has(k)) return 'contact';
@@ -193,7 +205,7 @@ export class GridMap {
     if (this.H[k] + this.M[k] === 0) return 'unknown';
     const p = this.prob(k);
     if (this.H[k] > 0 && this.confirmed(k)) return 'occupied';
-    if (this.H[k] > 0 && p >= 0.5) return 'suspect';
+    if (this.H[k] > 0 && p >= 0.5) return this.H[k] - this.Hw[k] < 1e-6 && this.WK[k] < 2 ? 'weak' : 'suspect';
     return p < P_FREE ? 'free' : 'unknown';
   }
 
@@ -214,12 +226,13 @@ export class GridMap {
   // Caps the evidence and rewrites the L view of cell k.
   update(k) {
     const t = this.H[k] + this.M[k];
-    if (t > EVIDENCE_CAP) { const f = EVIDENCE_CAP / t; this.H[k] *= f; this.M[k] *= f; }
+    if (t > EVIDENCE_CAP) { const f = EVIDENCE_CAP / t; this.H[k] *= f; this.M[k] *= f; this.Hw[k] *= f; }
     let l = 0;
     if (this.H[k] + this.M[k] > 0) {
       const kind = this.evidenceKind(k), lp = logit(this.prob(k));
       if (kind === 'occupied') l = Math.max(L_THRESH + 0.01, lp);
       else if (kind === 'suspect') l = Math.min(L_THRESH, Math.max(L_SUSPECT + 0.05, lp));
+      else if (kind === 'weak') l = Math.min(L_SUSPECT - 0.01, Math.max(L_WEAK, lp));   // strictly below suspect (Float32)
       else if (kind === 'free') l = Math.min(-L_THRESH - 0.01, lp);
       else l = Math.min(L_SUSPECT, Math.max(-L_THRESH, lp)) || -1e-3; // observed, undecided: never exactly 0
     }
@@ -228,11 +241,19 @@ export class GridMap {
   }
 
   // One scan's hit / miss on cell k: only the strongest of each per scan counts.
-  hitCell(k, w, sid, near = false) {
-    if (this.hitSid[k] !== sid) { this.hitSid[k] = sid; this.hitW[k] = 0; }
+  // countW (the hit's weight by its angle in the beam, without the range
+  // factor) decides whether the scan counts toward confirmation: far walls
+  // must be confirmable too. Weak readings never count; they tally in WK.
+  hitCell(k, w, sid, near = false, countW = w, weak = false) {
+    if (this.hitSid[k] !== sid) {
+      this.hitSid[k] = sid; this.hitW[k] = 0; this.hitC[k] = 0;
+      if (weak) this.WK[k] = Math.min(255, this.WK[k] + 1);
+    }
+    if (!weak && this.hitC[k] < HIT_COUNTS && countW >= HIT_COUNTS) this.S[k] = Math.min(65535, this.S[k] + 1);
+    if (!weak) this.hitC[k] = Math.max(this.hitC[k], countW);
     if (w > this.hitW[k]) {
-      if (this.hitW[k] < HIT_COUNTS && w >= HIT_COUNTS) this.S[k] = Math.min(65535, this.S[k] + 1);
       this.H[k] += w - this.hitW[k];
+      if (weak) this.Hw[k] += w - this.hitW[k];
       this.hitW[k] = w;
     }
     if (near) this.near[k] = 1;
@@ -347,7 +368,8 @@ export class GridMap {
   // sensor sits sensorOffsetCm along each beam's direction. Readings at or
   // beyond maxRangeCm mean nothing in range: misses up to maxRangeCm.
   // freeBeamDeg (default beamDeg) widens the free cone for coarse step scans.
-  integrateScan(pose, points, { sensorOffsetCm = 6, beamDeg = 16, maxRangeCm = 250, freeBeamDeg = beamDeg, robotRadiusCm = 9, scanId } = {}) {
+  // weak: a single forward reading (see 'Weak evidence' above).
+  integrateScan(pose, points, { sensorOffsetCm = 6, beamDeg = 16, maxRangeCm = 250, freeBeamDeg = beamDeg, robotRadiusCm = 9, scanId, weak = false } = {}) {
     const own = !scanId && !this.openScan;
     const sid = scanId || this.openScan || ++this.scans;
     const hb = beamDeg / 2, hc = beamDeg / 4, hf = Math.max(freeBeamDeg, beamDeg) / 2;
@@ -383,7 +405,8 @@ export class GridMap {
           if (off > hf) continue;
           const inBeam = off <= hb;
           if (hit && inBeam && Math.abs(d - R) <= arc) {
-            this.hitCell(k, (1 - (1 - HIT_EDGE) * (hb ? off / hb : 0)) * missW(d), sid, off <= hc && R < NEAR_CM);
+            const ang = 1 - (1 - HIT_EDGE) * (hb ? off / hb : 0);
+            this.hitCell(k, ang * missW(d) * (weak ? WEAK_HIT : 1), sid, off <= hc && R < NEAR_CM, ang, weak);
             touched.add(k);
             continue;
           }
@@ -437,7 +460,7 @@ export class GridMap {
     const c = this.centre(k), r = (v) => Math.round(v * 100) / 100;
     return {
       x: c.x, y: c.y, state: this.kindOf(k), evidence: this.evidenceKind(k), p: r(this.prob(k)),
-      hits: r(this.H[k]), misses: r(this.M[k]), scans: this.S[k], near: this.near[k] === 1,
+      hits: r(this.H[k]), misses: r(this.M[k]), scans: this.S[k], near: this.near[k] === 1, weakHits: r(this.Hw[k]), weakReadings: this.WK[k],
       lastSeen: this.seen[k], scansAgo: this.seen[k] ? this.scans - this.seen[k] : null,
       contact: this.contact.has(k),
       contactAge: this.contact.has(k) ? { scans: this.scans - this.contact.get(k).sid, ms: Date.now() - this.contact.get(k).t } : null,

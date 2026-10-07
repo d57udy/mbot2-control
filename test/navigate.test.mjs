@@ -356,7 +356,7 @@ function fakeBus({ wallY = 1e9, failTurn = false } = {}) {
     if (c.cmd === 'straight') { bus.y += c.args.cm * Math.cos((bus.heading * Math.PI) / 180); return { ok: true }; }
     if (c.cmd === 'read') {
       const cos = Math.cos((bus.heading * Math.PI) / 180);
-      return { ok: true, value: cos > 0.9 ? Math.min(300, (wallY - bus.y) / cos - 6) : 300 };
+      return { ok: true, value: cos > 0.5 ? Math.min(300, (wallY - bus.y) / cos - 6) : 300 };   // a 25 deg cone sees a wall well off its axis
     }
     return { ok: true };
   };
@@ -375,8 +375,10 @@ test('navigator: shortens a leg to keep safetyCm, then reports blocked', async (
   assert.equal(r.reached, false);
   const straights = bus.cmds.filter((c) => c.cmd === 'straight').map((c) => c.args.cm);
   assert.ok(straights.length >= 1);
-  // never closer than safetyCm (20) to the reading: wall at 80, sensor 6 ahead
-  assert.ok(bus.y <= 80 - 6 - 20 + 0.5, `y ${bus.y}`);
+  // never closer than safetyCm (20) to the reading: wall at 80, sensor 6 ahead,
+  // measured along the beam (the last legs may run at an angle to the wall)
+  const along = (80 - bus.y) / Math.cos((bus.heading * Math.PI) / 180) - 6;
+  assert.ok(along >= 20 - 0.5, `y ${bus.y}, heading ${bus.heading}: ${along} cm along the beam`);
   assert.ok(Math.abs(pose.pose.y - bus.y) < 1e-6, 'self-applied pose');
   assert.ok(bus.cmds.every((c) => c.gen === 7 && c.src === 'agent'), 'one stamped makeCommand');
   assert.ok(events.some((e) => e.type === 'blocked'));

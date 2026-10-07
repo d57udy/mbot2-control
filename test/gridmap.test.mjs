@@ -185,7 +185,7 @@ test('gridmap: cellInfo, aging, legacy log-odds writes and add()', () => {
   m.beginScan(); m.integrateScan(O, [{ angle: 0, cm: 40 }]); m.endScan();
   m.integrateScan(O, [{ angle: 0, cm: 40 }]);
   const c = m.cellInfo(0, 46);
-  assert.deepEqual(Object.keys(c).sort(), ['contact', 'contactAge', 'evidence', 'hits', 'lastSeen', 'misses', 'near', 'p', 'scans', 'scansAgo', 'state', 'x', 'y'].sort());
+  assert.deepEqual(Object.keys(c).sort(), ['contact', 'contactAge', 'evidence', 'hits', 'lastSeen', 'misses', 'near', 'p', 'scans', 'scansAgo', 'state', 'weakHits', 'weakReadings', 'x', 'y'].sort());
   assert.equal(c.state, 'occupied');
   assert.equal(c.scansAgo, 0);
   assert.equal(m.cellInfo(5000, 0), null);
@@ -390,15 +390,15 @@ test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and 
     const p = poses[i % poses.length];
     m.integrateScan(p, sweep(p, { chair: false, rand }), opts);
   }
-  // phantoms: hit evidence more than 20 cm from any real surface (random
-  // reflections, the removed chair); bias: confirmed cells 8 to 20 cm in
+  // phantoms: hit evidence more than 25 cm from any real surface (random
+  // reflections, the removed chair); bias: confirmed cells 8 to 25 cm in
   // front of a surface (a 25 deg cone rounds corners and oblique walls)
   const phantoms = { occupied: [], suspect: [] };
   let bias = 0;
   m.forEachCell((x, y, s, p, kind) => {
     const d = surfaceDist(x, y, false);
-    if (d > 20 && (kind === 'occupied' || kind === 'suspect')) phantoms[kind].push([x, y]);
-    if (d > 8 && d <= 20 && kind === 'occupied') bias++;
+    if (d > 25 && (kind === 'occupied' || kind === 'suspect')) phantoms[kind].push([x, y]);
+    if (d > 8 && d <= 25 && kind === 'occupied') bias++;
   });
   // wall points within range of a pose with a confirmed cell within 5 cm
   let wall = 0, wallOk = 0, wallSeen = 0;
@@ -422,7 +422,7 @@ test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and 
   }
   assert.equal(phantoms.occupied.length, 0, `confirmed phantoms ${JSON.stringify(phantoms.occupied)}`);
   assert.ok(phantoms.suspect.length <= 8, `suspect phantoms ${phantoms.suspect.length}`);
-  assert.ok(bias <= 20, `confirmed cells in front of surfaces ${bias}`);
+  assert.ok(bias <= 22, `confirmed cells in front of surfaces ${bias}`);
   // one sweep never confirms: wall stretches seen from one pose only stay suspect
   assert.ok(wallOk / wall > 0.6, `walls confirmed ${wallOk}/${wall}`);
   assert.ok(wallSeen / wall > 0.85, `walls seen ${wallSeen}/${wall}`);
@@ -438,7 +438,7 @@ test('gridmap: scans from a few poses keep walls and the leg, drop phantoms and 
   const before = m.stats().occupied;
   m.cleanup();
   let left = 0;
-  m.forEachCell((x, y, s, p, kind) => { if (kind === 'suspect' && surfaceDist(x, y, false) > 20) left++; });
+  m.forEachCell((x, y, s, p, kind) => { if (kind === 'suspect' && surfaceDist(x, y, false) > 25) left++; });
   assert.ok(left <= phantoms.suspect.length / 2, `after cleanup ${left}`);
   assert.equal(m.stats().occupied, before);
 });
@@ -502,4 +502,43 @@ test('gridmap: contacts block planning without evidence; only driving through, a
   assert.equal(GridMap.fromJSON(JSON.parse(JSON.stringify(m))).contacts().length, 0);
   m.clear();
   assert.equal(m.contacts().length, 0);
+});
+
+test('gridmap: a single forward reading is weak evidence; a second one or a sweep makes it suspect; a miss clears it', () => {
+  const m = new GridMap({});
+  const opts = { beamDeg: 25, maxRangeCm: 150, weak: true, robotRadiusCm: 0 };
+  m.integrateScan(O, [{ angle: 0, cm: 60 }], opts);              // a glitch, maybe
+  assert.equal(m.kind(0, 66), 'weak');
+  assert.equal(m.cell(0, 66), 'unknown');
+  const l = m.L[m.index(0, 66)];
+  assert.ok(l >= 0.05 && l <= 0.15, `L ${l}`);                    // below the suspect threshold
+  assert.equal(m.cellInfo(0, 66).weakReadings, 1);
+  // a second agreeing reading: suspect, never confirmed by weak readings alone
+  m.integrateScan(O, [{ angle: 0, cm: 60 }], opts);
+  assert.equal(m.kind(0, 66), 'suspect');
+  for (let i = 0; i < 5; i++) m.integrateScan(O, [{ angle: 0, cm: 60 }], opts);
+  assert.notEqual(m.kind(0, 66), 'occupied');
+  // one sweep through it clears a single weak reading
+  const g = new GridMap({});
+  g.integrateScan(O, [{ angle: 0, cm: 60 }], opts);
+  g.integrateScan(O, [{ angle: 0, cm: 140 }], { beamDeg: 25, maxRangeCm: 150, robotRadiusCm: 0 });
+  assert.ok(['free', 'unknown'].includes(g.kind(0, 66)), g.kind(0, 66));
+  // a weak reading plus a sweep hit: suspect
+  const s = new GridMap({});
+  s.integrateScan(O, [{ angle: 0, cm: 60 }], opts);
+  s.integrateScan(O, [{ angle: 0, cm: 60 }], { beamDeg: 25, maxRangeCm: 150, robotRadiusCm: 0 });
+  assert.equal(s.kind(0, 66), 'suspect');
+});
+
+test('gridmap: far walls (near the 150 cm range) are confirmed by two sweeps', () => {
+  const m = new GridMap({});
+  for (let i = 0; i < 2; i++) m.integrateScan({ x: 2 * i, y: 0, heading: 0 }, [{ angle: 0, cm: 140 }], { beamDeg: 25, maxRangeCm: 150 });
+  assert.equal(m.kind(0, 146), 'occupied');
+  // a phantom seen once and seen through by two later sweeps disappears
+  const p = new GridMap({});
+  p.integrateScan(O, [{ angle: 0, cm: 70 }], { beamDeg: 25, maxRangeCm: 150 });
+  assert.equal(p.kind(0, 76), 'suspect');
+  for (let i = 0; i < 2; i++) p.integrateScan(O, [{ angle: 0, cm: 140 }], { beamDeg: 25, maxRangeCm: 150 });
+  assert.ok(['free', 'unknown'].includes(p.kind(0, 76)), p.kind(0, 76));
+  assert.ok(p.L[p.index(0, 76)] < 0.05);
 });

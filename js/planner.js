@@ -5,10 +5,11 @@
 // near it (up to CLEAR_CM further) cost extra, so paths keep their distance
 // where there is room and still fit through narrow gaps. Suspect cells (hit
 // evidence that is not confirmed yet) and their inflation zone cost a lot,
-// rising toward the cell, so they are crossed only as a last resort. Unknown
-// cells cost UNKNOWN_COST times a free one.
+// rising toward the cell, so they are crossed only as a last resort; weak
+// evidence (a single forward reading) costs only a little. Unknown cells
+// cost UNKNOWN_COST times a free one.
 
-import { L_SUSPECT } from './gridmap.js';
+import { L_SUSPECT, L_WEAK } from './gridmap.js';
 
 const SQRT2 = Math.SQRT2;
 const UNKNOWN_COST = 3;   // unknown cells cost this much more than free ones
@@ -18,6 +19,7 @@ const CLEAR_CM = 15;      // soft margin beyond the inflation
 const CLEAR_COST = 2;     // extra cost at the inflation edge, falling to 0 over CLEAR_CM
 const SUSPECT_COST = 4;   // extra cost within inflateCm of a suspect cell ...
 const SUSPECT_CORE_COST = 20; // ... plus up to this much more toward the cell itself
+const WEAK_COST = 1.5;    // single forward readings: a small extra cost near them only
 
 // The real mBot2 is about 18 cm wide with its wheels. Inflation is measured
 // between cell centres, so an obstacle surface can sit up to half a cell
@@ -74,6 +76,10 @@ function cellCost(map, k, { inflateCm, allowUnknown }, start) {
   const d = map.distanceField()[k], ds = map.distanceField(L_SUSPECT)[k];
   if (ds < inflateCm + CLEAR_CM) cost += CLEAR_COST * Math.min(1, (inflateCm + CLEAR_CM - ds) / CLEAR_CM);
   if (ds <= inflateCm && d > inflateCm) cost += SUSPECT_COST + SUSPECT_CORE_COST * (1 - ds / Math.max(1, inflateCm));
+  else if (ds > inflateCm) {
+    const dw = map.distanceField(L_WEAK - 0.01)[k];
+    if (dw <= inflateCm) cost += WEAK_COST * (1 - dw / Math.max(1, inflateCm));
+  }
   if (!map.inflated(inflateCm)[k]) return cost;
   if (start) {
     const c = map.centre(k);

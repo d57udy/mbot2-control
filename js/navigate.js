@@ -21,13 +21,16 @@
 // match sets x, y and the heading (gyro drift) fully. goHome ends with such a
 // check at the start and drives a short correction leg if needed.
 //
-// Map update gating (v0.8): a scan is written into the map only after its
-// match was accepted, at the corrected pose. A rejected scan goes to a small
-// pending buffer (pendingScans) and is retried after the next accepted scan;
-// it never paints a second copy of a door at a drifted pose. Over unknown
-// ground (exploring) a scan with too little mapped structure to match is
-// integrated at the odometry pose. While the map is frozen (goHome, or
-// mapFrozen = true) only localization runs.
+// Map update gating (v0.8.1): a scan with an accepted match is written at
+// the corrected pose. A scan whose match is rejected or ambiguous is still
+// written at the odometry pose while that pose is trustworthy (small sigma,
+// or little driving since the last accepted match): hits confirm real
+// obstacles and misses clear phantoms. It is held back (pendingScans, retried
+// after the next accepted scan, then dropped) only when the pose is not
+// trustworthy or a determined match contradicts odometry by more than 2
+// sigma; then it never paints a second copy of a door at a drifted pose.
+// While the map is frozen (goHome, or mapFrozen = true) only localization
+// runs. Single forward readings are written as weak evidence (gridmap.js).
 //
 // Pose uncertainty (unc: sigma xy cm, heading deg) grows with distance,
 // turning and time (gyro drift) and sets the match window (3 sigma, clamped)
@@ -76,8 +79,7 @@ const KNOWN_FRAC = 0.3;     // below this share of known cells around the robot 
 const SNAP_SIGMA_DEG = 2;   // heading sigma after an applied wall snap
 const MAP_HEAD_STEP = 3;    // a map match moves the heading at most this much per scan ...
 const MAP_HEAD_MOVE_CM = 10; // ... and only after this much driving since the last accepted map match
-const WRITE_TOL = { cm: 6, deg: 3 }; // a scan is written only where the fused pose agrees with its match
-const SINGLE_MAX = { xy: 10, th: 5 }; // single readings are written only within this pose sigma
+const TRUST = { xy: 8, th: 4, cm: 60, deg: 90 }; // pose trusted: sigma within xy/th, or driven/turned less since the last accepted match
 const ANCHOR_UNC = { xy: 10, th: 10 }; // odometry sigma floor when fusing an anchor match (it carries no drift)
 const HOME_TOL_CM = 3;     // home check: drive a correction leg beyond this residual
 const HOME_FIXES = 2;      // at most this many correction legs
@@ -151,6 +153,7 @@ export class Navigator {
     this.lastFix = null; // the last relocalize result, for the home check
     this.pendingScans = []; // [{ pose, points, reason, tries }]: rejected scans waiting for a retry
     this.unc = { ...UNC_MIN }; // pose sigma (cm, deg) since the last accepted match
+    this.sinceFix = { cm: 0, deg: 0 }; // driven and turned since the last accepted match
     this.uncT = null;
     this._mapFrozen = false;
     this.frozenTasks = 0;
@@ -178,8 +181,16 @@ export class Navigator {
   // Odometry uncertainty of a leg (cm) or a turn (deg).
   growUnc({ cm = 0, deg = 0 } = {}) {
     this.ageUnc();
+    this.sinceFix.cm += Math.abs(cm);
+    this.sinceFix.deg += Math.abs(deg);
     if (deg) this.unc.th = Math.hypot(this.unc.th, TURN_FRAC * Math.abs(deg));
     if (cm) this.unc.xy = Math.hypot(this.unc.xy, SLIP_FRAC * Math.abs(cm), Math.abs(cm) * Math.sin((this.unc.th * Math.PI) / 180));
+  }
+
+  // Trustworthy odometry pose: a scan may be written there without a match.
+  poseTrusted() {
+    if (this.poseUncertain) return false;
+    return (this.unc.xy <= TRUST.xy && this.unc.th <= TRUST.th) || (this.sinceFix.cm < TRUST.cm && this.sinceFix.deg < TRUST.deg);
   }
 
   // Match window: 3 sigma, clamped; at least 60 cm / 30 deg after a crash.
@@ -229,6 +240,7 @@ export class Navigator {
     this.anchors = [];
     this.pendingScans = [];
     this.unc = { ...UNC_MIN };
+    this.sinceFix = { cm: 0, deg: 0 };
     this.heading?.reset();
   }
 
@@ -419,9 +431,13 @@ export class Navigator {
       this.retryPending();
       return true;
     }
-    // too little mapped structure to match: fine to map at the odometry pose
-    // while exploring new ground, never next to known structure
-    if (r.outcome === 'uninformative' && this.knownAround(pose) < KNOWN_FRAC) return !this.frozen;
+    // no accepted match, but the pose is trustworthy (or the robot explores
+    // unknown ground): write at the odometry pose
+    const exploring = r.outcome === 'uninformative' && this.knownAround(pose) < KNOWN_FRAC;
+    if (!this.frozen && r.outcome !== 'contradicted' && (this.poseTrusted() || exploring)) {
+      this.emit({ type: 'scan-odometry', reason: r.why ?? r.outcome, pose, exploring });
+      return true;
+    }
     if (!this.frozen) {
       this.pendingScans.push({ pose: { ...pose }, points, reason, tries: 0, unc: { ...this.unc } });
       if (this.pendingScans.length > PENDING_MAX) this.pendingScans.shift();
@@ -482,19 +498,13 @@ export class Navigator {
         this.setPose(p);
         this.poseUncertain = false;
         if (ref === 'map') this.lastMapFixAt = { x: p.x, y: p.y };
+        if (!fused.contradicts) this.sinceFix = { cm: 0, deg: 0 };
       }
-      // written only where the fused pose agrees with the scan's own best fit
-      // (along an open corridor axis only the cross-track part counts)
-      let off = Math.hypot(p.x - m.pose.x, p.y - m.pose.y);
-      if (m.cov && !m.axes?.along) {
-        const t = (m.cov.axisDeg * Math.PI) / 180;
-        off = Math.abs((p.x - m.pose.x) * Math.cos(t) - (p.y - m.pose.y) * Math.sin(t));
-      }
-      const agrees = !m.cov || (off <= WRITE_TOL.cm && Math.abs(normDeg(p.heading - m.pose.heading)) <= WRITE_TOL.deg);
       this.lastFix = { applied, confidence: m.confidence ?? 0, ref, correction, cov: m.cov ?? null };
       this.emit({ type: 'localized', correction, confidence: m.confidence, applied, source: applied ? 'scan' : 'odom', ref, reason: fused.why ?? null, cov: m.cov ?? null, axes: fused.axes ?? null, window: win, guess, match: m.pose, pose: this.pose.pose });
       if (applied) this.emit({ type: 'scan-accepted', correction, confidence: m.confidence ?? 0, cov: m.cov ?? null, axes: fused.axes ?? null, ref });
-      if (applied && !agrees) return out('rejected', 'pose corrected, but not yet where the scan fits', this.pose.pose);
+      // a determined match far from odometry: the pose moves, the scan waits
+      if (applied && fused.contradicts) return out('contradicted', 'match contradicts odometry (> 2 sigma)', this.pose.pose);
       return applied ? out('accepted', null) : out(fused.uninformative ? 'uninformative' : 'rejected', fused.why, guess);
     } catch (e) {
       this.emit({ type: 'localized', error: e?.message ?? String(e), confidence: 0, applied: false, source: 'odom' });
@@ -514,6 +524,12 @@ export class Navigator {
     // raise the odometry sigma to the disagreement instead of averaging
     // (position only: a wrong map in the heading would feed itself, see below)
     const r0 = Math.hypot(m.pose.x - g.x, m.pose.y - g.y);
+    // contradiction (before any inflation): heading, or cross-track (all of
+    // the position when along-track is determined too), beyond 2 sigma
+    const ta = (c.axisDeg * Math.PI) / 180;
+    const cross = axes.along ? r0 : Math.abs((m.pose.x - g.x) * Math.cos(ta) - (m.pose.y - g.y) * Math.sin(ta));
+    const contradicts = (axes.cross && cross > 2 * Math.hypot(this.unc.xy, c.minor))
+      || (axes.heading && Math.abs(normDeg(m.pose.heading - g.heading)) > 2 * Math.hypot(this.unc.th, c.sigmaDeg));
     if (axes.cross && r0 > 2 * Math.hypot(this.unc.xy, c.minor)) this.unc.xy = r0;
     // Heading: the gyro pipeline (heading.js) and anchor scans own heading
     // drift. A map built during that drift agrees with it, and scans written
@@ -548,7 +564,7 @@ export class Navigator {
       // posterior (I - K) O: keep the larger of its diagonal
       this.unc.xy = Math.max(UNC_MIN.xy, Math.sqrt(Math.max((1 - kxx) * o, (1 - kyy) * o)));
     }
-    return { pose: { x, y, heading }, applied: true, axes };
+    return { pose: { x, y, heading }, applied: true, axes, contradicts };
   }
 
   // A match without covariance (test localizers): fusePose with odomWeight,
@@ -613,14 +629,15 @@ export class Navigator {
   async readAhead(mk, signal) {
     const r = await this.cmd(mk, signal, 'read', { sensor: 'distance' });
     const cm = r.ok && Number.isFinite(Number(r.value)) ? Number(r.value) : null;
-    if (cm != null && this.mayWriteSingle()) this.map.integrateScan(this.pose.pose, [{ angle: 0, cm }], { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm });
+    if (cm != null && this.mayWriteSingle()) this.map.integrateScan(this.pose.pose, [{ angle: 0, cm }], { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, weak: true });
     return cm;
   }
 
   // Single readings (before and after legs) are not matched: they go into the
-  // map only while the pose is well known and the map is not frozen (without
-  // localization there is nothing to wait for).
-  mayWriteSingle() { return !this.frozen && (!this.localize || (this.unc.xy <= SINGLE_MAX.xy && this.unc.th <= SINGLE_MAX.th)); }
+  // map as weak evidence (a glitch alone makes no obstacle), and only while
+  // the pose is trustworthy and the map is not frozen (without localization
+  // there is nothing to wait for).
+  mayWriteSingle() { return !this.frozen && (!this.localize || this.poseTrusted()); }
 
   // Raw gyro reads would undo the estimator's bias correction: while it owns
   // the heading this only runs when forced (blocking turns measure with it),
@@ -751,7 +768,7 @@ export class Navigator {
     }
     const last = r.samples?.at(-1);
     if (last?.distanceCm != null && this.mayWriteSingle()) {
-      this.map.integrateScan(this.pose.pose, [{ angle: 0, cm: last.distanceCm }], { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm });
+      this.map.integrateScan(this.pose.pose, [{ angle: 0, cm: last.distanceCm }], { beamDeg: this.beamDeg, maxRangeCm: this.maxRangeCm, weak: true });
     }
     if (r.reason !== 'error') await this.correctYaw(mk, signal);
     return r;

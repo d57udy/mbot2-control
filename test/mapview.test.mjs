@@ -429,7 +429,7 @@ const fillsOf = (calls) => {
 test('colours: light and dark fallbacks, CSS variables win, gradient is monotonic', () => {
   const light = colours(fakeCss({}));
   assert.equal(isDark(light.bg), false);
-  const dark = colours(fakeCss({ '--bg': '#14181f' }));
+  const dark = colours(fakeCss({ '--bg': '#14181f', '--surface': '#1e242e' }));
   assert.equal(isDark(dark.bg), true);
   assert.notEqual(light.occHi, dark.occHi);
   assert.equal(colours(fakeCss({ '--map-suspect': '#123456' })).suspect, '#123456');
@@ -441,32 +441,47 @@ test('colours: light and dark fallbacks, CSS variables win, gradient is monotoni
     prev = l;
   }
   assert.ok(lum(occupiedColour(0.95, light)) < 40);
-  assert.ok(lum(occupiedColour(0.65, light)) > 150);
+  assert.ok(lum(occupiedColour(0.5, light)) > 180);
+  assert.ok(lum(occupiedColour(0.5, light)) < lum(light.bg)); // still visible on the unknown background
+  assert.ok(lum(occupiedColour(0.5, dark)) > lum(dark.surface)); // and on dark free cells
+  // grey, not tinted: equal channels at the ends
+  for (const col of [light.occLo, light.occHi]) { const n = parseInt(col.slice(1), 16); assert.ok(Math.abs((n >> 16) - (n & 255)) <= 12, col); }
   assert.ok(lum(occupiedColour(0.95, dark)) > lum(occupiedColour(0.65, dark)));
   assert.equal(occupiedColour(0.2, light), occupiedColour(OCC_P_LO, light)); // clamped
   assert.equal(occupiedColour(NaN, light), occupiedColour(OCC_P_HI, light));
   assert.equal(occupiedColour(0.8, colours(fakeCss({ '--map-occ-lo': 'rgb(0, 0, 0)', '--map-occ-hi': '#ffffff' }))).length, 7);
 });
 
-test('drawMap: confirmed cells by confidence, suspect and contact in their own colours', () => {
+test('drawMap: suspect and confirmed hits share one grey scale by p, contacts stay red', () => {
   const canvas = fakeCanvas();
   const c = colours();
   const cells = [
-    { x: 0, y: 0, state: 'occupied', p: 0.65, kind: 'occupied' }, { x: 5, y: 0, state: 'occupied', p: 0.95, kind: 'occupied' },
-    { x: 10, y: 0, state: 'unknown', p: 0.55, kind: 'suspect' }, { x: 15, y: 0, state: 'occupied', p: 0.9, kind: 'contact' },
-    { x: 20, y: 0, state: 'free', p: 0.1, kind: 'free' },
+    { x: 0, y: 0, state: 'unknown', p: 0.5, kind: 'suspect' }, { x: 5, y: 0, state: 'unknown', p: 0.6125, kind: 'suspect' },
+    { x: 10, y: 0, state: 'occupied', p: 0.78125, kind: 'occupied' }, { x: 15, y: 0, state: 'occupied', p: 0.95, kind: 'occupied' },
+    { x: 20, y: 0, state: 'occupied', p: 0.9, kind: 'contact' }, { x: 25, y: 0, state: 'free', p: 0.1, kind: 'free' },
   ];
   const map = { cellCm: 5, bounds: null, forEachCell(fn) { for (const q of cells) fn(q.x, q.y, q.state, q.p, q.kind); } };
   drawMap(canvas, map, null, { view: { cx: 0, cy: 0, cmPerPx: 1 } });
   const fills = fillsOf(canvas.ctx.calls);
   const styles = fills.map(([st]) => st);
-  assert.ok(styles.includes(occupiedColour(0.65, c)));
-  assert.ok(styles.includes(occupiedColour(0.95, c)));
-  assert.notEqual(occupiedColour(0.65, c), occupiedColour(0.95, c));
-  assert.ok(styles.includes(c.suspect) && styles.includes(c.contact) && styles.includes(c.surface));
-  assert.equal(fills.reduce((n, f) => n + f[2], 0), 5);
-  // suspect and contact are drawn after (over) the confirmed cells
-  assert.ok(styles.indexOf(c.contact) > styles.indexOf(occupiedColour(0.95, c)));
+  // four distinct greys, lighter for lower p, no orange anywhere
+  const greys = [0.5, 0.6125, 0.78125, 0.95].map((p) => occupiedColour(p, c));
+  assert.equal(new Set(greys).size, 4);
+  for (let i = 1; i < greys.length; i++) assert.ok(lum(greys[i]) < lum(greys[i - 1]));
+  for (const g of greys) assert.ok(styles.includes(g), g);
+  assert.ok(!styles.includes(c.suspect));
+  assert.ok(styles.includes(c.contact) && styles.includes(c.surface));
+  assert.equal(fills.reduce((n, f) => n + f[2], 0), 6);
+  assert.ok(styles.indexOf(c.contact) > styles.indexOf(greys[3])); // contacts on top
+  assert.ok(!canvas.ctx.calls.some(([k, a, b]) => k === 'set' && a === 'strokeStyle' && b === c.suspect));
+  // optional thin outline marks the two unconfirmed cells
+  const c2 = fakeCanvas();
+  drawMap(c2, map, null, { view: { cx: 0, cy: 0, cmPerPx: 1 }, outlineSuspect: true });
+  const calls = c2.ctx.calls;
+  const i = calls.findIndex(([k, a, b]) => k === 'set' && a === 'strokeStyle' && b === c.suspect);
+  assert.ok(i > 0);
+  const j = calls.findIndex(([k], n) => n > i && k === 'stroke');
+  assert.equal(calls.slice(i, j).filter(([k]) => k === 'rect').length, 2);
 });
 
 function scanCalls(opts) {
@@ -487,7 +502,10 @@ test('drawMap: latest scan in the accent colour, fading with age', () => {
     }
     return out;
   };
-  assert.deepEqual(alphaOfDots(scanCalls({ lastScan: scan(0) })), [1, 1, 1]);
+  // only the current scan: drawn fully, nothing else
+  const only = scanCalls({ lastScan: scan(0) });
+  assert.deepEqual(alphaOfDots(only), [1, 1, 1]);
+  assert.ok(!only.some(([k, t]) => k === 'fillText' && t === 'nicht übernommen'));
   assert.deepEqual(alphaOfDots(scanCalls({ lastScan: { ...scan(0), age: 1 } })), [0.55, 0.55, 0.55]);
   assert.deepEqual(alphaOfDots(scanCalls({ lastScan: { ...scan(0), age: 3 } })), []);
   // recentScans: newest first, older ones drawn first and fainter
@@ -522,7 +540,8 @@ test('drawMap: frozen draws a dashed border and a badge; legend lists every map 
   assert.ok(!off.some(([k, t]) => k === 'fillText' && t === 'Karte eingefroren'));
   const legend = mapLegend({ css: fakeCss({ '--bg': '#14181f' }) });
   const keys = legend.map((e) => e.key);
-  for (const k of ['free', 'unknown', 'occupied', 'suspect', 'contact', 'scan', 'pending', 'frozen']) assert.ok(keys.includes(k), k);
+  assert.deepEqual(keys, ['free', 'unknown', 'occupied', 'contact', 'scan', 'pending', 'frozen']);
+  assert.match(legend.find((e) => e.key === 'occupied').label, /hell = unsicher, dunkel = sicher/);
   for (const e of legend) {
     assert.equal(typeof e.label, 'string');
     assert.match(e.colour, /^#|^rgb/);

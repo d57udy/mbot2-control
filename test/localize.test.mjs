@@ -363,12 +363,23 @@ test('localize: map gating: a rejected scan is pending, not written; frozen maps
   await nav.scanHere({});                                   // empty map: bootstrap, written
   const v0 = map.version, H0 = map.H.reduce((a, b) => a + b, 0);
   assert.ok(H0 > 0 && nav.anchors.length === 1);
-  // an ambiguous match (nothing determined): pending, no hits written
+  // an ambiguous match (nothing determined) at a trusted pose: written at the
+  // odometry pose (hits confirm obstacles, misses clear phantoms)
   reply = (g) => ({ pose: g, confidence: 0, cov: { major: 40, minor: 30, sigmaDeg: 20, axisDeg: 0 }, axes: { heading: false, cross: false, along: false } });
   nav.pose.x += 30;                                         // far from the anchor
   setScript(room.map((c) => c - 20));
   await nav.scanHere({});
-  assert.equal(map.H.reduce((a, b) => a + b, 0), H0, 'no hits written');
+  assert.ok(map.H.reduce((a, b) => a + b, 0) > H0, 'trusted pose: written');
+  assert.ok(events.some((e) => e.type === 'scan-odometry'));
+  assert.equal(nav.pendingScans.length, 0);
+  // the same at an untrusted pose (sigma large, driven far since the last match): pending, nothing written
+  const H0b = map.H.reduce((a, b) => a + b, 0);
+  nav.unc = { xy: 25, th: 9 };
+  nav.sinceFix = { cm: 200, deg: 400 };
+  nav.pose.x += 20;
+  setScript(room.map((c) => c - 20));
+  await nav.scanHere({});
+  assert.equal(map.H.reduce((a, b) => a + b, 0), H0b, 'no hits written');
   assert.equal(nav.pendingScans.length, 1);
   const pend = events.find((e) => e.type === 'scan-pending');
   assert.ok(pend && /ambiguous/.test(pend.reason) && pend.pose, JSON.stringify(pend));
@@ -377,7 +388,7 @@ test('localize: map gating: a rejected scan is pending, not written; frozen maps
   reply = (g) => { calls++; return { pose: { ...g, x: g.x - 2 }, confidence: 0.9, cov: { major: 3, minor: 2, sigmaDeg: 1, axisDeg: 0, xx: 9, yy: 4, xy: 0, hh: 1 }, axes: { heading: true, cross: true, along: true } }; };
   setScript(room.map((c) => c - 20));
   await nav.scanHere({});
-  assert.ok(map.H.reduce((a, b) => a + b, 0) > H0, 'accepted scan written');
+  assert.ok(map.H.reduce((a, b) => a + b, 0) > H0b, 'accepted scan written');
   assert.ok(events.some((e) => e.type === 'scan-accepted' && !e.pending && e.cov));
   assert.ok(events.some((e) => e.type === 'scan-accepted' && e.pending), 'pending scan retried and written');
   assert.equal(nav.pendingScans.length, 0);
@@ -510,4 +521,92 @@ test('localize: drifted sweeps at a known door are corrected or held back, never
   }
   assert.equal(ghosts(map), 0, `ghosts ${ghosts(map)}`);
   assert.ok(events.filter((e) => e.type === 'scan-accepted').length >= 4, 'most drifted sweeps are corrected');
+});
+
+// Field (v0.8.0): one glitched forward reading during a leg became an
+// obstacle that later sweeps never cleared (their matches were rejected and
+// the sweeps thrown away), and the robot kept detouring around it.
+test('localize: a single glitched forward reading causes no lasting detour', async () => {
+  const rand = rng(4);
+  const sim = new SimRobot({ log: () => {}, onStatus: () => {}, timeScale: 20 });
+  fieldErrors(sim, { rand });
+  realisticSensor(sim, { rand, falseRate: 0 });
+  // the first forward read (before the first leg) returns a phantom at 45 cm
+  const distance = sim.distance.bind(sim);
+  let glitched = false;
+  sim.distance = async () => { const v = await distance(); if (!glitched) { glitched = true; return 45; } return v; };
+  const bus = new CommandBus({ log: () => {} });
+  bus.setRobot(sim);
+  await sim.connect();
+  const map = new GridMap({});
+  const pose = new PoseTracker();
+  const events = [];
+  // as on the real robot: the matcher rejects the sweeps (all ambiguous)
+  const real = await import('../js/localize.js');
+  const rejectAll = { ...real, matchScan: (...a) => ({ ...real.matchScan(...a), confidence: 0, axes: { heading: false, cross: false, along: false } }) };
+  const nav = new Navigator({ bus, map, pose, scan, settleMs: 0, sample: makeSimSampler(sim), useYaw: true, beamDeg: 25, maxRangeCm: 150, sweepLatencyMs: 0,
+    localizer: rejectAll, onEvent: (e) => events.push(e) });
+  try {
+    await nav.scanHere({});
+    const goal = { x: 0, y: -80 };                       // straight behind the start, open floor
+    const r = await nav.goTo(goal);
+    assert.equal(r.reached, true, r.note);
+    assert.ok(glitched);
+    // the phantom (45 cm ahead of the first leg) is not an obstacle in the map
+    const leg = events.find((e) => e.type === 'leg');
+    assert.ok(leg);
+    let phantom = 0;
+    map.forEachCell((x, y, s, p, kind) => { if ((kind === 'suspect' || kind === 'occupied') && Math.abs(x) < 25 && y < -30 && y > -75) phantom++; });
+    assert.equal(phantom, 0, 'phantom cells left on the way');
+    // no lasting detour: the driven path is close to the straight line
+    const plans = events.filter((e) => e.type === 'plan');
+    const lastLen = plans.at(-1).path.slice(1).reduce((s, q, i) => s + Math.hypot(q.x - plans.at(-1).path[i].x, q.y - plans.at(-1).path[i].y), 0);
+    assert.ok(lastLen < 60, `last plan ${lastLen} cm`);
+    const driven = events.filter((e) => e.type === 'leg').reduce((s, e) => s + Math.abs(e.droveCm ?? 0), 0);
+    assert.ok(driven < 80 * 1.35, `driven ${driven} cm for 80 cm`);
+  } finally {
+    await sim.disconnect();
+  }
+});
+
+// Field (v0.8.0): on hardware most sweeps were rejected by the matcher and
+// thrown away; the map stayed suspect and avoidance got worse. With the pose
+// still trustworthy, rejected sweeps are written at the odometry pose.
+test('localize: with most matches rejected the map still confirms obstacles and the robot avoids them', async () => {
+  const rand = rng(6);
+  const sim = new SimRobot({ log: () => {}, onStatus: () => {}, timeScale: 20 });
+  fieldErrors(sim, { rand });
+  realisticSensor(sim, { rand });
+  const bus = new CommandBus({ log: () => {} });
+  bus.setRobot(sim);
+  await sim.connect();
+  const real = await import('../js/localize.js');
+  let calls = 0;
+  const rejectMost = {
+    ...real,
+    // three of four matches come back ambiguous, as on the real robot
+    matchScan: (...a) => { const m = real.matchScan(...a); return ++calls % 4 ? { ...m, confidence: 0, axes: { heading: false, cross: false, along: false } } : m; },
+  };
+  const map = new GridMap({});
+  const events = [];
+  let impacts = 0, last = null;
+  sim.onChange = () => { if (sim.impact && sim.impact !== last) { last = sim.impact; impacts++; } };
+  const nav = new Navigator({ bus, map, pose: new PoseTracker(), scan, settleMs: 0, sample: makeSimSampler(sim), useYaw: true, beamDeg: 25, maxRangeCm: 150, sweepLatencyMs: 0,
+    localizer: rejectMost, onEvent: (e) => events.push(e) });
+  try {
+    await nav.scanHere({});
+    for (const g of [{ x: 60, y: -70 }, { x: -120, y: -20 }]) {   // below the chair, then past the pouf
+      const r = await nav.goTo(g);
+      assert.equal(r.reached, true, r.note);
+    }
+    assert.equal(impacts, 0, 'no collision');
+    // the chair (sim x 228..262, y 118..152 = map x 78..112, y -52..-18) and the pouf are confirmed
+    const near = (cx, cy, r) => { let n = 0; map.forEachCell((x, y, s, p, kind) => { if (kind === 'occupied' && Math.hypot(x - cx, y - cy) < r) n++; }); return n; };
+    assert.ok(near(95, -35, 25) > 0, 'chair confirmed');
+    assert.ok(near(-80, -50, 22) > 0, 'pouf confirmed');
+    assert.ok(events.some((e) => e.type === 'scan-odometry'), 'rejected sweeps written at the odometry pose');
+    assert.ok(nav.pendingScans.length <= 3);
+  } finally {
+    await sim.disconnect();
+  }
 });

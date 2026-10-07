@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.8.0';
+export const APP_VERSION = '0.8.1';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -827,6 +827,7 @@ function navEventText(e) {
       return `Nav Scan übernommen${e.ref === 'anchor' ? ' (gegen Startscan)' : ''}: Korrektur dx ${r0(c.dx)} cm, dy ${r0(c.dy)} cm, dh ${r0(c.dh)}°, Sicherheit ${Math.round((e.confidence ?? 0) * 100)} %${e.axes ? `, bestimmt: ${[].concat(e.axes).join('/')}` : ''}`;
     }
     case 'scan-pending': return `Nav Scan nicht übernommen (${e.reason ?? '?'}), ${e.pending ?? '?'} wartend${e.frozen ? ', Karte eingefroren' : ''}`;
+    case 'scan-odometry': return `Nav Scan übernommen (Position aus Rädern/Gyro, ${e.reason ?? 'kein sicherer Abgleich'})`;
     case 'map-frozen': return e.frozen ? 'Nav: Karte eingefroren (nur Ortung, keine Einträge)' : 'Nav: Karte wieder offen';
     case 'heading-snap': return `Nav Wandausrichtung: ${r0(e.correctionDeg)}° (${e.walls?.length ?? e.walls ?? '?'} Wände)${e.applied === false ? ' (nicht angewandt)' : ''}`;
     case 'heading-axes': return `Nav Raumachsen festgelegt${e.axisDeg != null ? `: ${r0(e.axisDeg)}°` : ''}`;
@@ -876,7 +877,7 @@ const nav = new Navigator({
   onEvent: (e) => {
     if (e.type === 'scan') {
       mapScan = { pose: e.pose, points: e.points };
-      recentScans = [{ pose: e.pose, points: e.points }, ...recentScans].slice(0, 3);
+      recentScans = [{ pose: e.pose, points: e.points }]; // only the current scan: the next one replaces it
     }
     if (e.type === 'map-frozen') mapFrozen = !!e.frozen;
     record(e);
@@ -920,7 +921,7 @@ function redrawMap() {
     goal: nav.goal,
     frontiers: map.frontiers({ minCells: 4 }),
     recentScans: recentScans.length ? recentScans : (mapScan ? [mapScan] : []),
-    pendingScans: nav.pendingScans ?? [],
+    pendingScans: (nav.pendingScans ?? []).slice(-1), // only the latest held-back scan
     frozen: mapFrozen || !!nav.mapFrozen,
   });
   $('map-text').textContent = map.bounds ? map.describe(pose) : 'Karte: noch leer. Scannen füllt sie; auf die Karte tippen fährt dorthin.';
@@ -973,7 +974,7 @@ function resetMap() {
   redrawMap();
 }
 // Evidence per cell (hits vs. beams that passed through): explains why a cell is an obstacle.
-const KIND_DE = { occupied: 'Hindernis (bestätigt)', suspect: 'Hindernis (vermutet)', contact: 'Zusammenstoß-Markierung (vorübergehend)', free: 'frei', unknown: 'unbekannt' };
+const KIND_DE = { occupied: 'Hindernis (bestätigt)', suspect: 'Hindernis (vermutet)', weak: 'einzelne Messung (noch kein Hindernis)', contact: 'Zusammenstoß-Markierung (vorübergehend)', free: 'frei', unknown: 'unbekannt' };
 function showCellInfo({ x, y }) {
   const i = map.cellInfo?.(x, y);
   if (!i) { log(`Stelle ${x}/${y}: keine Daten`); return; }
