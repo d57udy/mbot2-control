@@ -4,7 +4,28 @@
 
 Drive a Makeblock mBot2 from a phone browser over Web Bluetooth, with German or English voice commands. Static site, intended for GitHub Pages. No code is uploaded to the robot; the page uses CyberPi's Live Mode protocol.
 
-Status: v0.5 (continuous scans, crash detection, scan matching, saved maps, installable app; simulator-tested, UAT in `docs/UAT-v0.5.md`). Earlier: Basic Bluetooth driving confirmed on a real mBot2. Joystick, watchdog, lights, floor sensor, environment scan and AI conversation are tested with unit and simulator integration tests; hardware acceptance tests are in `docs/UAT-v0.3.md`.
+Status: **v0.8.3**, tested on a real mBot2 (firmware 44.01.013). In the owner's room the robot navigates to several goals, across a parquet/carpet transition, and returns to the start within about 2 cm after its home check. Hardware findings: `research/07-hardware-session.md`; localization research: `reports/Sonar localization for mBot2.md`.
+
+### What the robot does
+
+- Drive with buttons, joystick (smooth, gyro-aware) or voice; talk to it with Claude (tool calling).
+- Continuous 360° ultrasonic sweeps (about 70 to 85 readings, timing-corrected) build an occupancy map with hit/miss evidence: obstacles get darker with every confirming scan and fade when later scans see through them; single glitches and crash contacts are temporary.
+- Localization: wheel encoders (calibrated 6.7 cm wheel) plus gyro with bias estimation and gyro/odometry cross-check, wall-direction heading snap, scan matching against the map with an uncertainty-sized search window, and a home check against the first scan.
+- Route planning (A*) with short legs, obstacle and crash detection (stall, jolt, twist), automatic back-off and replanning.
+- Calibration and diagnostics in the app: automatic direction calibration, Scan-Labor (sensor latency, beam width), Strecken-Test (wheel vs ultrasonic), run recording export.
+
+### Calibration found on the test robot
+
+| Setting | Value | How it was found |
+|---|---|---|
+| Gyro direction | counterclockwise positive (Gyro umgekehrt) | joystick right = right, sweep yaw falling |
+| `mbot2.turn` | as documented (+ = clockwise) | Dreh-Test with corrected gyro |
+| Wheel mapping | EM1 left, EM2 mirrored | Automatisch erkennen |
+| Sensor latency | 120 ms | Scan-Labor, cw/ccw bottle test |
+| Beam width | about 25° | Scan-Labor |
+| Ultrasonic range | 150 cm (no echo reads about 190 cm) | field scans |
+| Wheel diameter | 6.7 cm | Strecken-Test |
+| Script length limit | 200 bytes per Bluetooth frame | Verbindungstest |
 
 ## Use
 

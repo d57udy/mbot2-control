@@ -4,7 +4,7 @@ Measured with the page's connection test and step-by-step Live Mode queries from
 
 | Finding | Evidence |
 |---|---|
-| Advertised name `Makeblock_LE345F45DD03BA`, service `0000ffe1-...`, characteristics ffe2 (notify) / ffe3 (write) | log "Using service 0000ffe1" |
+| Advertised name `Makeblock_LE…` (followed by the device address), service `0000ffe1-...`, characteristics ffe2 (notify) / ffe3 (write) | log "Using service 0000ffe1" |
 | Firmware **44.01.013** | `cyberpi.get_firmware_version()` |
 | Round trip of a short query about **90 ms** (20-byte chunks) | connection test |
 | Scripts up to **200 bytes** work; **300 bytes are silently dropped** (no reply, robot stays responsive) | connection test |
@@ -49,3 +49,18 @@ The hand test above ("0 to 90 after turning clockwise") was wrong; the robot was
 Defaults now: `wheels = { swap: false, mirrored: true, turnSign: 1, yawSign: -1 }`. "Automatisch erkennen" takes the wheel mapping (checked by the joystick) as its reference instead of the gyro. Continuous scans made before v0.6.8 were mirrored; delete maps saved before.
 
 Scan-Labor measurements (bottle at 37 cm, cw/ccw pair): sensor latency about 120 ms (the two directions agree within 0.2°), distance exact, beam about 25 to 30° wide, bottle about 5° off the robot's start heading (placement by eye).
+
+## Wheel calibration and navigation result 2026-10-07
+
+Strecken-Test (Scan-Labor): the robot faces a wall 70 to 100 cm away, measures it (median of 5, spread ≤ 0.4 cm), drives 30 cm with `mbot2.straight`, measures again, and compares with the encoders.
+
+| Run | Assumed wheel | Wheels | Ultrasonic | Effective diameter |
+|---|---|---|---|---|
+| forward, before | 6.5 cm | 30.1 cm (530°) | 31.0 cm | 6.69 cm |
+| backward, before | 6.5 cm | 30.1 cm | 31.0 cm | 6.70 cm |
+| forward, after | 6.7 cm | 30.1 cm (514°) | 29.8 cm | 6.64 cm |
+| backward, after | 6.7 cm | 30.1 cm | 30.2 cm | 6.73 cm |
+
+Wheels and ultrasonic disagreed by 3 % with the nominal 6.5 cm wheel; with 6.7 cm they agree within 1 %. Whether the absolute scale belongs to the wheel or the sensor was not measured with a tape; for localization the agreement between both is what matters. No heading change during the runs (0 to 1°).
+
+Navigation in the room with v0.8.3 (owner): driving to several goals including a parquet/carpet transition, then "Nach Hause". The robot arrived about 10 cm from the start, ran the home check (sweep matched against the start scan), corrected its pose and drove to within about 2 cm of the start.
