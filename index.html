@@ -161,6 +161,13 @@
           <label class="inline">Zeitkorrektur (ms) <input id="opt-latency" type="number" min="-100" max="400" step="5" value="120" inputmode="numeric"></label>
           <button id="btn-lab-apply" class="small-btn">Gemessenen Wert übernehmen</button>
         </div>
+        <h3>Strecken-Test (Rad gegen Ultraschall)</h3>
+        <p class="muted small">Roboter gerade vor eine Wand stellen, 80 bis 100 cm entfernt, Weg frei. Er misst den Wandabstand, fährt 30 cm und misst wieder. Vergleich: was die Räder zählen und was der Ultraschall sieht.</p>
+        <div class="row">
+          <button id="btn-dist-fwd">30 cm vorwärts testen</button>
+          <button id="btn-dist-back">30 cm rückwärts testen</button>
+        </div>
+        <pre id="dist-text" class="small"></pre>
         <div class="row">
           <button id="btn-lab-copy">Scan-Daten kopieren</button>
           <button id="btn-lab-clear" class="small-btn">Leeren</button>

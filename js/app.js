@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.8.1';
+export const APP_VERSION = '0.8.2';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -1177,6 +1177,66 @@ async function labSweep(dir) {
     redrawMap();
   });
 }
+// --- Strecken-Test: wheel odometry vs. ultrasonic distance to a wall ---------
+
+const distResults = [];
+const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+
+async function wallDistance(n = 5) {
+  const v = [];
+  for (let i = 0; i < n; i++) {
+    const d = Number(await robot.query('cyberpi.ultrasonic2.get(1)', 2000));
+    if (Number.isFinite(d) && d > 2 && d < 150) v.push(d);
+    await sleep(120);
+  }
+  return v.length >= 3 ? { cm: median(v), spread: Math.max(...v) - Math.min(...v), n: v.length } : null;
+}
+
+// Encoder angles in wheel degrees, forward-positive, using the calibration.
+async function wheelAngles() {
+  const [e1, e2] = await robot.query('[mbot2.EM_get_angle("EM1"),mbot2.EM_get_angle("EM2")]', 2000);
+  const w = robot.wheels ?? {};
+  let a = Number(e1), b = Number(e2);
+  if (w.mirrored !== false) b = -b;
+  if (w.swap) [a, b] = [b, a];
+  return { l: a, r: b };
+}
+
+async function distanceTest(dir) {
+  if (!robot?.connected || robot.kind !== 'ble') { log('! Strecken-Test: nur mit dem echten Roboter'); return; }
+  const cm = 30 * dir;
+  await runScanTask(async () => {
+    const d0 = await wallDistance();
+    if (!d0) { $('dist-text').textContent = 'Keine stabile Wandmessung (unter 150 cm, gerade davor?)'; return; }
+    const y0 = await robot.yaw(), e0 = await wheelAngles();
+    const r = await bus.submit(bus.stamped()('straight', { cm, wait: true }, 'ui', 20000));
+    await sleep(600);
+    const d1 = await wallDistance(), y1 = await robot.yaw(), e1 = await wheelAngles();
+    if (!r.ok || !d1) { $('dist-text').textContent = `Abgebrochen: ${r.ok ? 'keine Wandmessung danach' : r.error}`; return; }
+    const degL = e1.l - e0.l, degR = e1.r - e0.r;
+    const wheelCm = ((degL + degR) / 2) * (Math.PI * 6.5 / 360);
+    const sonarCm = d0.cm - d1.cm;
+    const ratio = wheelCm ? sonarCm / wheelCm : NaN;
+    const res = {
+      dir, commandCm: cm, wall0: d0.cm, wall1: d1.cm, spread: Math.max(d0.spread, d1.spread),
+      wheelDegL: Math.round(degL), wheelDegR: Math.round(degR), wheelCm: Math.round(wheelCm * 10) / 10,
+      sonarCm: Math.round(sonarCm * 10) / 10, ratio: Math.round(ratio * 1000) / 1000,
+      wheelDiameterCm: Math.round(6.5 * ratio * 100) / 100, yawChange: Math.round(((y1 - y0 + 540) % 360) - 180),
+    };
+    distResults.push(res);
+    const avg = distResults.reduce((s, x) => s + x.ratio, 0) / distResults.length;
+    $('dist-text').textContent = [
+      `Wand vorher ${res.wall0} cm, nachher ${res.wall1} cm (Streuung ±${(res.spread / 2).toFixed(1)} cm) → Ultraschall: ${res.sonarCm} cm`,
+      `Räder: links ${res.wheelDegL}°, rechts ${res.wheelDegR}° → ${res.wheelCm} cm (bei 6,5 cm Raddurchmesser); befohlen ${Math.abs(cm)} cm`,
+      `Verhältnis Ultraschall/Räder: ${res.ratio} → wirksamer Raddurchmesser ≈ ${res.wheelDiameterCm} cm; Drehung unterwegs ${res.yawChange}°`,
+      `Mittel aus ${distResults.length} Test(s): Verhältnis ${avg.toFixed(3)} → Raddurchmesser ≈ ${(6.5 * avg).toFixed(2)} cm`,
+    ].join('\n');
+    log(`Strecken-Test: ${JSON.stringify(res)}`);
+  });
+}
+$('btn-dist-fwd').onclick = () => distanceTest(1);
+$('btn-dist-back').onclick = () => distanceTest(-1);
+
 $('btn-lab-cw').onclick = () => labSweep(1);
 $('btn-lab-ccw').onclick = () => labSweep(-1);
 $('btn-lab-clear').onclick = () => { labScans.length = 0; renderLab(); };
@@ -1191,6 +1251,7 @@ $('btn-lab-copy').onclick = async () => {
     app: APP_VERSION, at: new Date().toISOString(), latencyMs: latency(), rangeCm: maxRange(),
     calibration: robot?.wheels ?? null,
     scans: labScans.map((s) => ({ dir: s.dir, durationMs: s.durationMs, samples: s.samples, log: s.log })),
+    distanceTests: distResults,
   };
   const text = JSON.stringify(data);
   try { await navigator.clipboard.writeText(text); log(`Scan-Daten kopiert (${Math.round(text.length / 1024)} kB).`); }
