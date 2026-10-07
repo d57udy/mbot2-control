@@ -3,7 +3,9 @@
 
 import { LIMITS } from './bus.js';
 
-const WHEEL_CM = Math.PI * 6.5;
+import { ODOMETRY } from './motion.js';
+
+const wheelCm = () => Math.PI * ODOMETRY.wheelDiameterCm; // calibrated in the app (Strecken-Test)
 const TRACK_CM = 12;
 const TRAIL_MAX = 500;
 
@@ -44,7 +46,7 @@ export class PoseTracker {
 
   // Differential drive, wheel RPM forward-positive; left faster turns right (clockwise).
   applyDrive(leftRpm, rightRpm, dtSec) {
-    const vl = (leftRpm / 60) * WHEEL_CM, vr = (rightRpm / 60) * WHEEL_CM;
+    const vl = (leftRpm / 60) * wheelCm(), vr = (rightRpm / 60) * wheelCm();
     const v = (vl + vr) / 2;
     const dh = ((vl - vr) / TRACK_CM) * (180 / Math.PI) * dtSec;
     const mid = rad(this.heading + dh / 2); // midpoint heading for the arc

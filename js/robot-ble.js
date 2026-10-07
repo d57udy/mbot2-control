@@ -484,8 +484,10 @@ export class BleRobot {
   }
 
   // Drive straight for cm (negative = backward), gyro-corrected on the robot.
+  // straightScale: the firmware assumes a 6.5 cm wheel; with a measured
+  // effective diameter D the app sets 6.5 / D so the real travel matches cm.
   straight(cm, { wait = false, speed = 50 } = {}) {
-    const s = `mbot2.straight(${cm},${speed})`;
+    const s = `mbot2.straight(${Math.round(cm * (this.straightScale ?? 1) * 10) / 10},${speed})`;
     return wait ? this.query(s, 2000 + Math.abs(cm) * 150 * (50 / speed)) : this.run(s);
   }
 

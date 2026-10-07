@@ -9,9 +9,9 @@
 //      modulo 90 deg; small heading errors are snapped back to them
 // Frames: degrees, clockwise positive, like `turn` and the pose heading.
 
-const WHEEL_CM = Math.PI * 6.5;
+import { calibratedCmPerDeg } from './motion.js';
+
 const TRACK_CM = 12;
-const CM_PER_DEG = WHEEL_CM / 360;
 
 export const HEADING = {
   // standstill and bias
@@ -53,7 +53,7 @@ export const wrap45 = (a) => ((((a + 45) % 90) + 90) % 90) - 45;
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 
 // Encoder heading change in degrees (clockwise) from wheel angle changes.
-export function encoderHeadingDeg(dEncL, dEncR, { cmPerDeg = CM_PER_DEG, trackCm = TRACK_CM } = {}) {
+export function encoderHeadingDeg(dEncL, dEncR, { cmPerDeg = calibratedCmPerDeg(), trackCm = TRACK_CM } = {}) {
   return (((dEncL - dEncR) * cmPerDeg) / trackCm) * (180 / Math.PI);
 }
 
@@ -277,7 +277,7 @@ export class HeadingEstimator {
     return {
       gyroDeg,
       encDeg: ok ? encoderHeadingDeg(dL, dR) : null,
-      cm: ok ? ((dL + dR) / 2) * CM_PER_DEG : null,
+      cm: ok ? ((dL + dR) / 2) * calibratedCmPerDeg() : null,
     };
   }
 

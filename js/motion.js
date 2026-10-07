@@ -13,9 +13,14 @@
 
 import { makeCommand as defaultMakeCommand } from './bus.js';
 
-const WHEEL_CM = Math.PI * 6.5;
+// Effective wheel diameter: the app sets it from the Strecken-Test (field
+// 2026-10-07: 6.7 cm makes wheel odometry agree with the ultrasonic); the
+// simulator and the tests keep the nominal 6.5 cm.
+export const ODOMETRY = { wheelDiameterCm: 6.5 };
+const wheelCm = () => Math.PI * ODOMETRY.wheelDiameterCm;
+export const calibratedCmPerDeg = () => wheelCm() / 360;
 const TRACK_CM = 12;
-export const CM_PER_DEG = WHEEL_CM / 360;
+export const CM_PER_DEG = (Math.PI * 6.5) / 360; // nominal; use cmPerDeg() for the calibrated value
 const NO_ECHO_CM = 300;
 
 export const MOTION = {
@@ -232,7 +237,7 @@ function abortError(msg = 'leg aborted') {
 // caller checks signal itself.
 export async function driveLeg(bus, {
   cm, speed = 40, makeCommand = defaultMakeCommand, signal, sample, sensors, onSample,
-  stopAtCm = 20, clock, yawSign = 1, cmPerDeg = CM_PER_DEG, opts = {}, coast,
+  stopAtCm = 20, clock, yawSign = 1, cmPerDeg = calibratedCmPerDeg(), opts = {}, coast,
 } = {}) {
   // coast: { cm } learned stop distance, shared across legs by the caller.
   // The leg aims coast.cm short of the target; after each completed leg the
@@ -250,7 +255,7 @@ export async function driveLeg(bus, {
   }
   clock ??= sample.clock ?? realClock;
   const target = Math.max(0, Number(cm) || 0);
-  const vNom = (speed / 60) * WHEEL_CM;
+  const vNom = (speed / 60) * wheelCm();
   const samples = [];
   let reason = null, detail = null, details = null, note, contactCm = null, backedCm = 0, overshootCm = null, slip = null;
   let base = null, last = null, cmdCm = 0, tPrev = null, errors = 0, cancelled = false;
@@ -268,7 +273,7 @@ export async function driveLeg(bus, {
   const read = async (rpm) => {
     const raw = await sample();
     const t = clock.now();
-    if (tPrev != null) cmdCm += (rpm / 60) * WHEEL_CM * ((t - tPrev) / 1000);
+    if (tPrev != null) cmdCm += (rpm / 60) * wheelCm() * ((t - tPrev) / 1000);
     tPrev = t;
     base ??= raw;
     const hasEnc = raw.encL != null && raw.encR != null && base.encL != null && base.encR != null;
@@ -350,7 +355,7 @@ export async function driveLeg(bus, {
       // back off so the robot can turn without scraping the obstacle
       const from = last.drivenCm;
       const tb = clock.now();
-      const vBack = (o.backoffRpm / 60) * WHEEL_CM;
+      const vBack = (o.backoffRpm / 60) * wheelCm();
       const limit = (o.backoffCm / vBack) * 1000 * (last.hasEnc ? 3 : 1);
       while (from - last.drivenCm < o.backoffCm && clock.now() - tb < limit) {
         if (signal?.aborted) throw abortError();
@@ -402,7 +407,7 @@ export const TURN = {
 // detail, details, spinSign, reversed, passes, samples, note }. Always ends with a stop.
 export async function turnInPlace(bus, {
   deg, sample, makeCommand = defaultMakeCommand, signal, clock, spinSign = 1, yawSign = 1,
-  cmPerDeg = CM_PER_DEG, opts = {},
+  cmPerDeg = calibratedCmPerDeg(), opts = {},
 } = {}) {
   const o = { ...MOTION, ...TURN, ...opts };
   const mk = makeCommand;
@@ -411,7 +416,7 @@ export async function turnInPlace(bus, {
   const samples = [];
   let reason = null, detail = null, details = null, note, cancelled = false, reversed = false, passes = 0;
   let base = null, prevYaw = null, yawAcc = 0, last = null, tPrev = null, cmdL = 0, cmdR = 0, errors = 0;
-  const rate = (rpm) => (rpm * 360 * WHEEL_CM) / (60 * Math.PI * TRACK_CM); // deg/s of the body
+  const rate = (rpm) => (rpm * 360 * wheelCm()) / (60 * Math.PI * TRACK_CM); // deg/s of the body
 
   const send = async (l, r) => {
     const res = await bus.submit(mk('drive', { left: l, right: r, leg: true }, 'agent', 500));
@@ -428,8 +433,8 @@ export async function turnInPlace(bus, {
     const t = clock.now();
     if (tPrev != null) {
       const dt = (t - tPrev) / 1000;
-      cmdL += (l / 60) * WHEEL_CM * dt;
-      cmdR += (r / 60) * WHEEL_CM * dt;
+      cmdL += (l / 60) * wheelCm() * dt;
+      cmdR += (r / 60) * wheelCm() * dt;
     }
     tPrev = t;
     base ??= raw;

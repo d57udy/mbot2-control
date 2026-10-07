@@ -9,7 +9,7 @@ import { drawRadar } from './radar.js';
 import { GridMap } from './gridmap.js';
 import { PoseTracker } from './pose.js';
 import { Navigator } from './navigate.js';
-import { makeBleSampler, makeSimSampler, BLE_SENSORS, BLE_SENSORS_MIN } from './motion.js';
+import { makeBleSampler, makeSimSampler, BLE_SENSORS, BLE_SENSORS_MIN, ODOMETRY } from './motion.js';
 import { drawMap, fitView, screenToWorld, mapLegend } from './mapview.js';
 import { attachMapControls } from './mapcontrols.js';
 import { saveMap, listMaps, loadMap, deleteMap, exportMap, importMap } from './mapstore.js';
@@ -30,7 +30,7 @@ const store = {
 
 // --- log ---------------------------------------------------------------
 
-export const APP_VERSION = '0.8.2';
+export const APP_VERSION = '0.8.3';
 const logEl = $('log');
 function log(msg, detail) {
   const t = new Date().toLocaleTimeString('de-DE');
@@ -954,6 +954,7 @@ function attachSampler() {
   nav.sweepLatencyMs = robot.kind === 'sim' ? 0 : undefined;
   // sweeps need speed more than detail: distance + yaw is one ~120 ms round trip
   nav.sweepSample = robot.kind === 'sim' ? nav.sample : makeBleSampler(robot, BLE_SENSORS_MIN, { log });
+  applyWheelDiameter();
   // the navigator picks its leg mode at construction; it is created before any robot connects
   nav.legMode = nav.sample ? 'drive' : 'straight';
 }
@@ -1214,26 +1215,46 @@ async function distanceTest(dir) {
     const d1 = await wallDistance(), y1 = await robot.yaw(), e1 = await wheelAngles();
     if (!r.ok || !d1) { $('dist-text').textContent = `Abgebrochen: ${r.ok ? 'keine Wandmessung danach' : r.error}`; return; }
     const degL = e1.l - e0.l, degR = e1.r - e0.r;
-    const wheelCm = ((degL + degR) / 2) * (Math.PI * 6.5 / 360);
+    const dia = ODOMETRY.wheelDiameterCm;
+    const wheelCm = ((degL + degR) / 2) * (Math.PI * dia / 360);
     const sonarCm = d0.cm - d1.cm;
     const ratio = wheelCm ? sonarCm / wheelCm : NaN;
     const res = {
       dir, commandCm: cm, wall0: d0.cm, wall1: d1.cm, spread: Math.max(d0.spread, d1.spread),
       wheelDegL: Math.round(degL), wheelDegR: Math.round(degR), wheelCm: Math.round(wheelCm * 10) / 10,
       sonarCm: Math.round(sonarCm * 10) / 10, ratio: Math.round(ratio * 1000) / 1000,
-      wheelDiameterCm: Math.round(6.5 * ratio * 100) / 100, yawChange: Math.round(((y1 - y0 + 540) % 360) - 180),
+      assumedDiameterCm: dia, wheelDiameterCm: Math.round(dia * ratio * 100) / 100, yawChange: Math.round(((y1 - y0 + 540) % 360) - 180),
     };
     distResults.push(res);
-    const avg = distResults.reduce((s, x) => s + x.ratio, 0) / distResults.length;
+    const avg = distResults.reduce((s, x) => s + x.wheelDiameterCm, 0) / distResults.length;
     $('dist-text').textContent = [
       `Wand vorher ${res.wall0} cm, nachher ${res.wall1} cm (Streuung ±${(res.spread / 2).toFixed(1)} cm) → Ultraschall: ${res.sonarCm} cm`,
-      `Räder: links ${res.wheelDegL}°, rechts ${res.wheelDegR}° → ${res.wheelCm} cm (bei 6,5 cm Raddurchmesser); befohlen ${Math.abs(cm)} cm`,
+      `Räder: links ${res.wheelDegL}°, rechts ${res.wheelDegR}° → ${res.wheelCm} cm (bei ${dia} cm Raddurchmesser); befohlen ${Math.abs(cm)} cm`,
       `Verhältnis Ultraschall/Räder: ${res.ratio} → wirksamer Raddurchmesser ≈ ${res.wheelDiameterCm} cm; Drehung unterwegs ${res.yawChange}°`,
-      `Mittel aus ${distResults.length} Test(s): Verhältnis ${avg.toFixed(3)} → Raddurchmesser ≈ ${(6.5 * avg).toFixed(2)} cm`,
+      `Mittel aus ${distResults.length} Test(s): Raddurchmesser ≈ ${avg.toFixed(2)} cm (eingestellt: ${dia} cm)`,
     ].join('\n');
     log(`Strecken-Test: ${JSON.stringify(res)}`);
   });
 }
+// Effective wheel diameter (Strecken-Test, 2026-10-07: 6.7 cm). Applies to the
+// real robot only; the simulator keeps its nominal 6.5 cm wheels.
+function wheelDiameter() {
+  const v = Number($('opt-wheel').value);
+  return Number.isFinite(v) && v >= 6 && v <= 7.5 ? v : 6.7;
+}
+function applyWheelDiameter() {
+  const real = robot?.kind === 'ble';
+  ODOMETRY.wheelDiameterCm = real ? wheelDiameter() : 6.5;
+  if (real) robot.straightScale = 6.5 / wheelDiameter();
+}
+$('opt-wheel').value = store.get('cal.wheel', '6.7');
+$('opt-wheel').onchange = () => {
+  $('opt-wheel').value = wheelDiameter();
+  store.set('cal.wheel', String(wheelDiameter()));
+  applyWheelDiameter();
+  log(`Raddurchmesser ${wheelDiameter()} cm gesetzt.`);
+};
+
 $('btn-dist-fwd').onclick = () => distanceTest(1);
 $('btn-dist-back').onclick = () => distanceTest(-1);
 

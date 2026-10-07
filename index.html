@@ -256,6 +256,10 @@
       <label><input id="opt-swap" type="checkbox"> Linkes/rechtes Rad tauschen (wenn Joystick rechts nach links dreht)</label>
       <label><input id="opt-turnrev" type="checkbox"> Eingebaute Drehung umgekehrt (mbot2.turn)</label>
       <label><input id="opt-yawrev" type="checkbox" checked> Gyro umgekehrt (mBot2 Firmware 44.01.013: zählt gegen den Uhrzeigersinn)</label>
+      <label>Raddurchmesser (cm)
+        <input id="opt-wheel" type="number" min="6" max="7.5" step="0.05" value="6.7" inputmode="decimal">
+      </label>
+      <p class="muted small">Gemessen mit dem Strecken-Test (Scan-Labor): 6,7 cm lässt Räder und Ultraschall übereinstimmen. Neu messen, wenn sich der Untergrund stark ändert.</p>
       <label>Ultraschall-Reichweite (cm)
         <input id="opt-maxrange" type="number" min="60" max="300" step="10" value="150" inputmode="numeric">
       </label>
